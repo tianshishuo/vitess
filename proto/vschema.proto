@@ -45,6 +45,25 @@ message Keyspace {
   map<string, Table> tables = 3;
   // If require_explicit_routing is true, vindexes and tables are not added to global routing
   bool require_explicit_routing = 4;
+  // foreign_key_mode dictates how Vitess should handle foreign keys for this keyspace.
+  ForeignKeyMode foreign_key_mode = 5;
+
+  enum ForeignKeyMode {
+    unspecified = 0;
+    disallow = 1;
+    unmanaged = 2;
+    managed = 3;
+  }
+
+  // multi_tenant_mode specifies that the keyspace is multi-tenant. Currently used during migrations with MoveTables.
+  MultiTenantSpec multi_tenant_spec = 6;
+}
+
+message MultiTenantSpec {
+  // tenant_column is the name of the column that specifies the tenant id.
+  string tenant_id_column_name = 1;
+  // tenant_column_type is the type of the column that specifies the tenant id.
+  query.Type tenant_id_column_type = 2;
 }
 
 // Vindex is the vindex info for a Keyspace.
@@ -91,6 +110,9 @@ message Table {
   // an authoritative list for the table. This allows
   // us to expand 'select *' expressions.
   bool column_list_authoritative = 6;
+
+  // reference tables may optionally indicate their source table.
+  string source = 7;
 }
 
 // ColumnVindex is used to associate a column to a vindex.
@@ -114,11 +136,58 @@ message AutoIncrement {
 message Column {
   string name = 1;
   query.Type type = 2;
+  bool invisible = 3;
+  string default = 4;
+  string collation_name = 5;
+  int32 size = 6;
+  int32 scale = 7;
+  optional bool nullable = 8;
+  // values contains the list of values for an enum or set column.
+  repeated string values = 9;
 }
 
 // SrvVSchema is the roll-up of all the Keyspace schema for a cell.
 message SrvVSchema {
   // keyspaces is a map of keyspace name -> Keyspace object.
   map<string, Keyspace> keyspaces = 1;
-  RoutingRules routing_rules = 2;
+  RoutingRules routing_rules = 2; // table routing rules
+  ShardRoutingRules shard_routing_rules = 3;
+  KeyspaceRoutingRules keyspace_routing_rules = 4;
+  MirrorRules mirror_rules = 5; // mirror rules
+}
+
+// ShardRoutingRules specify the shard routing rules for the VSchema.
+message ShardRoutingRules {
+  repeated ShardRoutingRule rules = 1;
+}
+
+// ShardRoutingRule specifies a routing rule.
+message ShardRoutingRule {
+  string from_keyspace = 1;
+  string to_keyspace = 2;
+  string shard = 3;
+}
+
+message KeyspaceRoutingRules {
+  repeated KeyspaceRoutingRule rules = 1;
+}
+
+message KeyspaceRoutingRule {
+  string from_keyspace = 1;
+  string to_keyspace = 2;
+}
+
+// MirrorRules specify the high level mirror rules for the VSchema.
+message MirrorRules {
+  // rules should ideally be a map. However protos dont't allow
+  // repeated fields as elements of a map. So, we use a list
+  // instead.
+  repeated MirrorRule rules = 1;
+}
+
+// MirrorRule specifies a mirror rule.
+message MirrorRule {
+  string from_table = 1;
+  string to_table = 2;
+  float percent = 3;
 }

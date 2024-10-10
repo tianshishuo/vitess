@@ -19,9 +19,8 @@ package framework
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
-
-	"google.golang.org/protobuf/proto"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/callerid"
@@ -36,11 +35,13 @@ import (
 // It's not thread safe, but you can create multiple clients that point to the
 // same server.
 type QueryClient struct {
-	ctx           context.Context
-	target        *querypb.Target
-	server        *tabletserver.TabletServer
-	transactionID int64
-	reservedID    int64
+	ctx                 context.Context
+	target              *querypb.Target
+	server              *tabletserver.TabletServer
+	transactionID       int64
+	reservedIDMu        sync.Mutex
+	reservedID          int64
+	sessionStateChanges string
 }
 
 // NewClient creates a new client for Server.
@@ -56,9 +57,22 @@ func NewClient() *QueryClient {
 	}
 }
 
+// NewClientWithServer creates a new client for a given server.
+func NewClientWithServer(server *tabletserver.TabletServer) *QueryClient {
+	return &QueryClient{
+		ctx: callerid.NewContext(
+			context.Background(),
+			&vtrpcpb.CallerID{},
+			&querypb.VTGateCallerID{Username: "dev"},
+		),
+		target: Target,
+		server: server,
+	}
+}
+
 // NewClientWithTabletType creates a new client for Server with the provided tablet type.
 func NewClientWithTabletType(tabletType topodatapb.TabletType) *QueryClient {
-	targetCopy := proto.Clone(Target).(*querypb.Target)
+	targetCopy := Target.CloneVT()
 	targetCopy.TabletType = tabletType
 	return &QueryClient{
 		ctx: callerid.NewContext(
@@ -89,11 +103,12 @@ func (client *QueryClient) Begin(clientFoundRows bool) error {
 	if clientFoundRows {
 		options = &querypb.ExecuteOptions{ClientFoundRows: clientFoundRows}
 	}
-	transactionID, _, err := client.server.Begin(client.ctx, client.target, options)
+	state, err := client.server.Begin(client.ctx, client.target, options)
 	if err != nil {
 		return err
 	}
-	client.transactionID = transactionID
+	client.transactionID = state.TransactionID
+	client.sessionStateChanges = state.SessionStateChanges
 	return nil
 }
 
@@ -112,6 +127,8 @@ func (client *QueryClient) Commit() error {
 func (client *QueryClient) Rollback() error {
 	defer func() { client.transactionID = 0 }()
 	rID, err := client.server.Rollback(client.ctx, client.target, client.transactionID)
+	client.reservedIDMu.Lock()
+	defer client.reservedIDMu.Unlock()
 	client.reservedID = rID
 	if err != nil {
 		return err
@@ -130,7 +147,7 @@ func (client *QueryClient) CommitPrepared(dtid string) error {
 	return client.server.CommitPrepared(client.ctx, client.target, dtid)
 }
 
-// RollbackPrepared rollsback a prepared transaction.
+// RollbackPrepared rolls back a prepared transaction.
 func (client *QueryClient) RollbackPrepared(dtid string, originalID int64) error {
 	return client.server.RollbackPrepared(client.ctx, client.target, dtid, originalID)
 }
@@ -161,12 +178,15 @@ func (client *QueryClient) ReadTransaction(dtid string) (*querypb.TransactionMet
 	return client.server.ReadTransaction(client.ctx, client.target, dtid)
 }
 
+// UnresolvedTransactions invokes the UnresolvedTransactions API of TabletServer.
+func (client *QueryClient) UnresolvedTransactions() ([]*querypb.TransactionMetadata, error) {
+	return client.server.UnresolvedTransactions(client.ctx, client.target, 0 /* abandonAgeSeconds */)
+}
+
 // SetServingType is for testing transitions.
 // It currently supports only primary->replica and back.
 func (client *QueryClient) SetServingType(tabletType topodatapb.TabletType) error {
 	err := client.server.SetServingType(tabletType, time.Time{}, true /* serving */, "" /* reason */)
-	// Wait for TwoPC transition, if necessary
-	client.server.TwoPCEngineWait()
 	return err
 }
 
@@ -182,7 +202,7 @@ func (client *QueryClient) BeginExecute(query string, bindvars map[string]*query
 	if client.transactionID != 0 {
 		return nil, errors.New("already in transaction")
 	}
-	qr, transactionID, _, err := client.server.BeginExecute(
+	state, qr, err := client.server.BeginExecute(
 		client.ctx,
 		client.target,
 		preQueries,
@@ -191,7 +211,8 @@ func (client *QueryClient) BeginExecute(query string, bindvars map[string]*query
 		client.reservedID,
 		&querypb.ExecuteOptions{IncludedFields: querypb.ExecuteOptions_ALL},
 	)
-	client.transactionID = transactionID
+	client.transactionID = state.TransactionID
+	client.sessionStateChanges = state.SessionStateChanges
 	if err != nil {
 		return nil, err
 	}
@@ -242,7 +263,7 @@ func (client *QueryClient) StreamExecuteWithOptions(query string, bindvars map[s
 // StreamBeginExecuteWithOptions starts a tx and executes a query using 'options', returning the results .
 func (client *QueryClient) StreamBeginExecuteWithOptions(query string, preQueries []string, bindvars map[string]*querypb.BindVariable, options *querypb.ExecuteOptions) (*sqltypes.Result, error) {
 	result := &sqltypes.Result{}
-	txID, _, err := client.server.BeginStreamExecute(
+	state, err := client.server.BeginStreamExecute(
 		client.ctx,
 		client.target,
 		preQueries,
@@ -258,7 +279,8 @@ func (client *QueryClient) StreamBeginExecuteWithOptions(query string, preQuerie
 			return nil
 		},
 	)
-	client.transactionID = txID
+	client.transactionID = state.TransactionID
+	client.sessionStateChanges = state.SessionStateChanges
 	if err != nil {
 		return nil, err
 	}
@@ -289,15 +311,38 @@ func (client *QueryClient) MessageAck(name string, ids []string) (int64, error) 
 
 // ReserveExecute performs a ReserveExecute.
 func (client *QueryClient) ReserveExecute(query string, preQueries []string, bindvars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
+	client.reservedIDMu.Lock()
+	defer client.reservedIDMu.Unlock()
 	if client.reservedID != 0 {
 		return nil, errors.New("already reserved a connection")
 	}
-	qr, reservedID, _, err := client.server.ReserveExecute(client.ctx, client.target, preQueries, query, bindvars, client.transactionID, &querypb.ExecuteOptions{IncludedFields: querypb.ExecuteOptions_ALL})
-	client.reservedID = reservedID
+	state, qr, err := client.server.ReserveExecute(client.ctx, client.target, preQueries, query, bindvars, client.transactionID, &querypb.ExecuteOptions{IncludedFields: querypb.ExecuteOptions_ALL})
+	client.reservedID = state.ReservedID
 	if err != nil {
 		return nil, err
 	}
 	return qr, nil
+}
+
+// ReserveStreamExecute performs a ReserveStreamExecute.
+func (client *QueryClient) ReserveStreamExecute(query string, preQueries []string, bindvars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
+	if client.reservedID != 0 {
+		return nil, errors.New("already reserved a connection")
+	}
+	result := &sqltypes.Result{}
+	state, err := client.server.ReserveStreamExecute(client.ctx, client.target, preQueries, query, bindvars, client.transactionID, &querypb.ExecuteOptions{IncludedFields: querypb.ExecuteOptions_ALL},
+		func(res *sqltypes.Result) error {
+			if result.Fields == nil {
+				result.Fields = res.Fields
+			}
+			result.Rows = append(result.Rows, res.Rows...)
+			return nil
+		})
+	client.reservedID = state.ReservedID
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // ReserveBeginExecute performs a ReserveBeginExecute.
@@ -308,13 +353,40 @@ func (client *QueryClient) ReserveBeginExecute(query string, preQueries []string
 	if client.transactionID != 0 {
 		return nil, errors.New("already in transaction")
 	}
-	qr, transactionID, reservedID, _, err := client.server.ReserveBeginExecute(client.ctx, client.target, preQueries, postBeginQueries, query, bindvars, &querypb.ExecuteOptions{IncludedFields: querypb.ExecuteOptions_ALL})
-	client.transactionID = transactionID
-	client.reservedID = reservedID
+	state, qr, err := client.server.ReserveBeginExecute(client.ctx, client.target, preQueries, postBeginQueries, query, bindvars, &querypb.ExecuteOptions{IncludedFields: querypb.ExecuteOptions_ALL})
+	client.transactionID = state.TransactionID
+	client.reservedID = state.ReservedID
+	client.sessionStateChanges = state.SessionStateChanges
 	if err != nil {
 		return nil, err
 	}
 	return qr, nil
+}
+
+// ReserveBeginStreamExecute performs a ReserveBeginStreamExecute.
+func (client *QueryClient) ReserveBeginStreamExecute(query string, preQueries []string, postBeginQueries []string, bindvars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
+	if client.reservedID != 0 {
+		return nil, errors.New("already reserved a connection")
+	}
+	if client.transactionID != 0 {
+		return nil, errors.New("already in transaction")
+	}
+	result := &sqltypes.Result{}
+	state, err := client.server.ReserveBeginStreamExecute(client.ctx, client.target, preQueries, postBeginQueries, query, bindvars, &querypb.ExecuteOptions{IncludedFields: querypb.ExecuteOptions_ALL},
+		func(res *sqltypes.Result) error {
+			if result.Fields == nil {
+				result.Fields = res.Fields
+			}
+			result.Rows = append(result.Rows, res.Rows...)
+			return nil
+		})
+	client.transactionID = state.TransactionID
+	client.reservedID = state.ReservedID
+	client.sessionStateChanges = state.SessionStateChanges
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // Release performs a Release.
@@ -351,4 +423,28 @@ func (client *QueryClient) SetReservedID(id int64) {
 // StreamHealth receives the health response
 func (client *QueryClient) StreamHealth(sendFunc func(*querypb.StreamHealthResponse) error) error {
 	return client.server.StreamHealth(client.ctx, sendFunc)
+}
+
+// StreamHealthWithContext receives the health response
+func (client *QueryClient) StreamHealthWithContext(ctx context.Context, sendFunc func(*querypb.StreamHealthResponse) error) error {
+	return client.server.StreamHealth(ctx, sendFunc)
+}
+
+func (client *QueryClient) UpdateContext(ctx context.Context) {
+	client.ctx = ctx
+}
+
+func (client *QueryClient) GetSchema(
+	tableType querypb.SchemaTableType,
+	tableNames ...string,
+) (schemaDef map[string]string, udfs []*querypb.UDFInfo, err error) {
+	schemaDef = make(map[string]string)
+	err = client.server.GetSchema(client.ctx, client.target, tableType, tableNames, func(schemaRes *querypb.GetSchemaResponse) error {
+		for tableName, schemaDefinition := range schemaRes.TableDefinition {
+			schemaDef[tableName] = schemaDefinition
+		}
+		udfs = append(udfs, schemaRes.Udfs...)
+		return nil
+	})
+	return
 }

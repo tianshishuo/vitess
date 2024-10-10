@@ -17,14 +17,17 @@ limitations under the License.
 package mysql
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 
-	"context"
-
+	"vitess.io/vitess/go/mysql/capabilities"
+	"vitess.io/vitess/go/mysql/replication"
+	"vitess.io/vitess/go/mysql/sqlerror"
 	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/proto/replicationdata"
 	"vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/vterrors"
 )
@@ -32,7 +35,7 @@ import (
 var (
 	// ErrNotReplica means there is no replication status.
 	// Returned by ShowReplicationStatus().
-	ErrNotReplica = NewSQLError(ERNotReplica, SSUnknownSQLState, "no replication status")
+	ErrNotReplica = sqlerror.NewSQLError(sqlerror.ERNotReplica, sqlerror.SSUnknownSQLState, "no replication status")
 
 	// ErrNoPrimaryStatus means no status was returned by ShowPrimaryStatus().
 	ErrNoPrimaryStatus = errors.New("no master status")
@@ -44,21 +47,29 @@ const (
 	mariaDBReplicationHackPrefix = "5.5.5-"
 	// mariaDBVersionString is present in
 	mariaDBVersionString = "MariaDB"
-	// mysql57VersionPrefix is the prefix for 5.7 mysql version, such as 5.7.31-log
-	mysql57VersionPrefix = "5.7."
-	// mysql80VersionPrefix is the prefix for 8.0 mysql version, such as 8.0.19
-	mysql80VersionPrefix = "8.0."
+	// mysql8VersionPrefix is the prefix for 8.x mysql version, such as 8.0.19,
+	// but also newer ones like 8.4.0.
+	mysql8VersionPrefix = "8."
 )
 
 // flavor is the abstract interface for a flavor.
 // Flavors are auto-detected upon connection using the server version.
 // We have two major implementations (the main difference is the GTID
 // handling):
-// 1. Oracle MySQL 5.6, 5.7, 8.0, ...
+// 1. Oracle MySQL 5.7, 8.0, ...
 // 2. MariaDB 10.X
 type flavor interface {
 	// primaryGTIDSet returns the current GTIDSet of a server.
-	primaryGTIDSet(c *Conn) (GTIDSet, error)
+	primaryGTIDSet(c *Conn) (replication.GTIDSet, error)
+
+	// purgedGTIDSet returns the purged GTIDSet of a server.
+	purgedGTIDSet(c *Conn) (replication.GTIDSet, error)
+
+	// gtidMode returns the gtid mode of a server.
+	gtidMode(c *Conn) (string, error)
+
+	// serverUUID returns the UUID of a server.
+	serverUUID(c *Conn) (string, error)
 
 	// startReplicationCommand returns the command to start the replication.
 	startReplicationCommand() string
@@ -66,22 +77,32 @@ type flavor interface {
 	// restartReplicationCommands returns the commands to stop, reset and start the replication.
 	restartReplicationCommands() []string
 
-	// startReplicationUntilAfter will restart replication, but only allow it
+	// startReplicationUntilAfter will start replication, but only allow it
 	// to run until `pos` is reached. After reaching pos, replication will be stopped again
-	startReplicationUntilAfter(pos Position) string
+	startReplicationUntilAfter(pos replication.Position) string
+
+	// startSQLThreadUntilAfter will start replication's sql thread(s), but only allow it
+	// to run until `pos` is reached. After reaching pos, it will be stopped again
+	startSQLThreadUntilAfter(pos replication.Position) string
 
 	// stopReplicationCommand returns the command to stop the replication.
 	stopReplicationCommand() string
 
-	// stopIOThreadCommand returns the command to stop the replica's io thread only.
+	// resetReplicationCommand returns the command to reset the replication.
+	resetReplicationCommand() string
+
+	// stopIOThreadCommand returns the command to stop the replica's IO thread only.
 	stopIOThreadCommand() string
 
-	// startSQLThreadCommand returns the command to start the replica's sql thread only.
+	// stopSQLThreadCommand returns the command to stop the replica's SQL thread(s) only.
+	stopSQLThreadCommand() string
+
+	// startSQLThreadCommand returns the command to start the replica's SQL thread only.
 	startSQLThreadCommand() string
 
 	// sendBinlogDumpCommand sends the packet required to start
 	// dumping binlogs from the specified location.
-	sendBinlogDumpCommand(c *Conn, serverID uint32, startPos Position) error
+	sendBinlogDumpCommand(c *Conn, serverID uint32, binlogFilename string, startPos replication.Position) error
 
 	// readBinlogEvent reads the next BinlogEvent from the connection.
 	readBinlogEvent(c *Conn) (BinlogEvent, error)
@@ -90,69 +111,102 @@ type flavor interface {
 	// replication on the host.
 	resetReplicationCommands(c *Conn) []string
 
+	// resetReplicationParametersCommands returns the commands to reset
+	// replication parameters on the host.
+	resetReplicationParametersCommands(c *Conn) []string
+
 	// setReplicationPositionCommands returns the commands to set the
 	// replication position at which the replica will resume.
-	setReplicationPositionCommands(pos Position) []string
+	setReplicationPositionCommands(pos replication.Position) []string
 
-	// changeReplicationSourceArg returns the specific parameter to add to
-	// a "change primary" command.
-	changeReplicationSourceArg() string
+	// setReplicationSourceCommand returns the command to use the provided host/port
+	// as the new replication source (without changing any GTID position).
+	setReplicationSourceCommand(params *ConnParams, host string, port int32, heartbeatInterval float64, connectRetry int) string
+
+	// resetBinaryLogsCommand returns the command to reset the binary logs.
+	resetBinaryLogsCommand() string
 
 	// status returns the result of the appropriate status command,
 	// with parsed replication position.
-	status(c *Conn) (ReplicationStatus, error)
+	status(c *Conn) (replication.ReplicationStatus, error)
 
-	// primaryStatus returns the result of 'SHOW MASTER STATUS',
+	// primaryStatus returns the result of 'SHOW BINARY LOG STATUS',
 	// with parsed executed position.
-	primaryStatus(c *Conn) (PrimaryStatus, error)
+	primaryStatus(c *Conn) (replication.PrimaryStatus, error)
 
-	// waitUntilPositionCommand returns the SQL command to issue
-	// to wait until the given position, until the context
-	// expires.  The command returns -1 if it times out. It
-	// returns NULL if GTIDs are not enabled.
-	waitUntilPositionCommand(ctx context.Context, pos Position) (string, error)
+	// replicationConfiguration reads the right global variables and performance schema information.
+	replicationConfiguration(c *Conn) (*replicationdata.Configuration, error)
 
-	// enableBinlogPlaybackCommand and disableBinlogPlaybackCommand return an
-	// optional command to run to enable or disable binlog
-	// playback. This is used internally in Google, as the
-	// timestamp cannot be set by regular clients.
-	enableBinlogPlaybackCommand() string
-	disableBinlogPlaybackCommand() string
+	replicationNetTimeout(c *Conn) (int32, error)
 
+	// waitUntilPosition waits until the given position is reached or
+	// until the context expires. It returns an error if we did not
+	// succeed.
+	waitUntilPosition(ctx context.Context, c *Conn, pos replication.Position) error
+	// catchupToGTIDCommands returns the command to catch up to a given GTID.
+	catchupToGTIDCommands(params *ConnParams, pos replication.Position) []string
+
+	// binlogReplicatedUpdates returns the field to use to check replica updates.
+	binlogReplicatedUpdates() string
+
+	baseShowTables() string
 	baseShowTablesWithSizes() string
 
-	// SupportsFastDropTable checks if the database server supports fast DROP TABLE operations that do not
-	// lock the buffer pool and other queries.
-	// Specifically, this is supported in MySQL 8.0.23 and above: https://dev.mysql.com/doc/relnotes/mysql/8.0/en/news-8-0-23.html
-	supportsFastDropTable(c *Conn) (bool, error)
+	supportsCapability(capability capabilities.FlavorCapability) (bool, error)
 }
 
-// flavors maps flavor names to their implementation.
+// flavorFuncs maps flavor names to their implementation.
 // Flavors need to register only if they support being specified in the
 // connection parameters.
-var flavors = make(map[string]func() flavor)
+var flavorFuncs = make(map[string]func(serverVersion string) flavor)
 
-// serverVersionAtLeast returns true if current server is at least given value.
-// Example: if input is []int{8, 0, 23}... the function returns 'true' if we're on MySQL 8.0.23, 8.0.24, ...
-func serverVersionAtLeast(serverVersion string, parts ...int) (bool, error) {
-	versionPrefix := strings.Split(serverVersion, "-")[0]
-	versionTokens := strings.Split(versionPrefix, ".")
-	for i, part := range parts {
-		if len(versionTokens) <= i {
-			return false, nil
+// GetFlavor fills in c.Flavor. If the params specify the flavor,
+// that is used. Otherwise, we auto-detect.
+//
+// This is the same logic as the ConnectorJ java client. We try to recognize
+// MariaDB as much as we can, but default to MySQL.
+//
+// MariaDB note: the server version returned here might look like:
+// 5.5.5-10.0.21-MariaDB-...
+// If that is the case, we are removing the 5.5.5- prefix.
+// Note on such servers, 'select version()' would return 10.0.21-MariaDB-...
+// as well (not matching what c.ServerVersion is, but matching after we remove
+// the prefix).
+func GetFlavor(serverVersion string, flavorFunc func(serverVersion string) flavor) (f flavor, capableOf capabilities.CapableOf, canonicalVersion string) {
+	canonicalVersion = serverVersion
+	switch {
+	case flavorFunc != nil:
+		f = flavorFunc(serverVersion)
+	case strings.HasPrefix(serverVersion, mariaDBReplicationHackPrefix):
+		canonicalVersion = serverVersion[len(mariaDBReplicationHackPrefix):]
+		f = mariadbFlavor101{mariadbFlavor{serverVersion: canonicalVersion}}
+	case strings.Contains(serverVersion, mariaDBVersionString):
+		mariadbVersion, err := strconv.ParseFloat(serverVersion[:4], 64)
+		if err != nil || mariadbVersion < 10.2 {
+			f = mariadbFlavor101{mariadbFlavor{serverVersion: fmt.Sprintf("%f", mariadbVersion)}}
+		} else {
+			f = mariadbFlavor102{mariadbFlavor{serverVersion: fmt.Sprintf("%f", mariadbVersion)}}
 		}
-		tokenValue, err := strconv.Atoi(versionTokens[i])
-		if err != nil {
-			return false, err
+	case strings.HasPrefix(serverVersion, mysql8VersionPrefix):
+		if latest, _ := capabilities.ServerVersionAtLeast(serverVersion, 8, 2, 0); latest {
+			f = mysqlFlavor82{mysqlFlavor{serverVersion: serverVersion}}
+		} else if recent, _ := capabilities.MySQLVersionHasCapability(serverVersion, capabilities.ReplicaTerminologyCapability); recent {
+			f = mysqlFlavor8{mysqlFlavor{serverVersion: serverVersion}}
+		} else {
+			f = mysqlFlavor8Legacy{mysqlFlavorLegacy{mysqlFlavor{serverVersion: serverVersion}}}
 		}
-		if tokenValue > part {
-			return true, nil
-		}
-		if tokenValue < part {
-			return false, nil
-		}
+	default:
+		// If unknown, return the most basic flavor: MySQL 57.
+		f = mysqlFlavor57{mysqlFlavorLegacy{mysqlFlavor{serverVersion: serverVersion}}}
 	}
-	return true, nil
+	return f, f.supportsCapability, canonicalVersion
+}
+
+// ServerVersionCapableOf is a convenience function that returns a CapableOf function given a server version.
+// It is a shortcut for GetFlavor(serverVersion, nil).
+func ServerVersionCapableOf(serverVersion string) (capableOf capabilities.CapableOf) {
+	_, capableOf, _ = GetFlavor(serverVersion, nil)
+	return capableOf
 }
 
 // fillFlavor fills in c.Flavor. If the params specify the flavor,
@@ -168,33 +222,14 @@ func serverVersionAtLeast(serverVersion string, parts ...int) (bool, error) {
 // as well (not matching what c.ServerVersion is, but matching after we remove
 // the prefix).
 func (c *Conn) fillFlavor(params *ConnParams) {
-	flavorFunc := flavors[params.Flavor]
-
-	switch {
-	case flavorFunc != nil:
-		c.flavor = flavorFunc()
-	case strings.HasPrefix(c.ServerVersion, mariaDBReplicationHackPrefix):
-		c.ServerVersion = c.ServerVersion[len(mariaDBReplicationHackPrefix):]
-		c.flavor = mariadbFlavor101{}
-	case strings.Contains(c.ServerVersion, mariaDBVersionString):
-		mariadbVersion, err := strconv.ParseFloat(c.ServerVersion[:4], 64)
-		if err != nil || mariadbVersion < 10.2 {
-			c.flavor = mariadbFlavor101{}
-		}
-		c.flavor = mariadbFlavor102{}
-	case strings.HasPrefix(c.ServerVersion, mysql57VersionPrefix):
-		c.flavor = mysqlFlavor57{}
-	case strings.HasPrefix(c.ServerVersion, mysql80VersionPrefix):
-		c.flavor = mysqlFlavor80{}
-	default:
-		c.flavor = mysqlFlavor56{}
-	}
+	flavorFunc := flavorFuncs[params.Flavor]
+	c.flavor, _, c.ServerVersion = GetFlavor(c.ServerVersion, flavorFunc)
 }
 
 // ServerVersionAtLeast returns 'true' if server version is equal or greater than given parts. e.g.
 // "8.0.14-log" is at least [8, 0, 13] and [8, 0, 14], but not [8, 0, 15]
 func (c *Conn) ServerVersionAtLeast(parts ...int) (bool, error) {
-	return serverVersionAtLeast(c.ServerVersion, parts...)
+	return capabilities.ServerVersionAtLeast(c.ServerVersion, parts...)
 }
 
 //
@@ -214,41 +249,69 @@ func (c *Conn) IsMariaDB() bool {
 }
 
 // PrimaryPosition returns the current primary's replication position.
-func (c *Conn) PrimaryPosition() (Position, error) {
+func (c *Conn) PrimaryPosition() (replication.Position, error) {
 	gtidSet, err := c.flavor.primaryGTIDSet(c)
 	if err != nil {
-		return Position{}, err
+		return replication.Position{}, err
 	}
-	return Position{
+	return replication.Position{
 		GTIDSet: gtidSet,
 	}, nil
+}
+
+// GetGTIDPurged returns the tablet's GTIDs which are purged.
+func (c *Conn) GetGTIDPurged() (replication.Position, error) {
+	gtidSet, err := c.flavor.purgedGTIDSet(c)
+	if err != nil {
+		return replication.Position{}, err
+	}
+	return replication.Position{
+		GTIDSet: gtidSet,
+	}, nil
+}
+
+// GetGTIDMode returns the tablet's GTID mode. Only available in MySQL flavour
+func (c *Conn) GetGTIDMode() (string, error) {
+	return c.flavor.gtidMode(c)
+}
+
+// GetServerUUID returns the server's UUID.
+func (c *Conn) GetServerUUID() (string, error) {
+	return c.flavor.serverUUID(c)
 }
 
 // PrimaryFilePosition returns the current primary's file based replication position.
-func (c *Conn) PrimaryFilePosition() (Position, error) {
-	filePosFlavor := filePosFlavor{}
+func (c *Conn) PrimaryFilePosition() (replication.Position, error) {
+	filePosFlavor := filePosFlavor{serverVersion: c.ServerVersion}
 	gtidSet, err := filePosFlavor.primaryGTIDSet(c)
 	if err != nil {
-		return Position{}, err
+		return replication.Position{}, err
 	}
-	return Position{
+	return replication.Position{
 		GTIDSet: gtidSet,
 	}, nil
 }
 
-// StartReplicationCommand returns the command to start the replication.
+// StartReplicationCommand returns the command to start replication.
 func (c *Conn) StartReplicationCommand() string {
 	return c.flavor.startReplicationCommand()
 }
 
-// RestartReplicationCommands returns the commands to stop, reset and start the replication.
+// RestartReplicationCommands returns the commands to stop, reset and start replication.
 func (c *Conn) RestartReplicationCommands() []string {
 	return c.flavor.restartReplicationCommands()
 }
 
-// StartReplicationUntilAfterCommand returns the command to start the replication.
-func (c *Conn) StartReplicationUntilAfterCommand(pos Position) string {
+// StartReplicationUntilAfterCommand returns the command to start replication.
+func (c *Conn) StartReplicationUntilAfterCommand(pos replication.Position) string {
 	return c.flavor.startReplicationUntilAfter(pos)
+}
+
+// StartSQLThreadUntilAfterCommand returns the command to start the replica's SQL
+// thread(s) and have it run until it has reached the given position, at which point
+// it will stop.
+func (c *Conn) StartSQLThreadUntilAfterCommand(pos replication.Position) string {
+	return c.flavor.startSQLThreadUntilAfter(pos)
 }
 
 // StopReplicationCommand returns the command to stop the replication.
@@ -256,9 +319,18 @@ func (c *Conn) StopReplicationCommand() string {
 	return c.flavor.stopReplicationCommand()
 }
 
+func (c *Conn) ResetReplicationCommand() string {
+	return c.flavor.resetReplicationCommand()
+}
+
 // StopIOThreadCommand returns the command to stop the replica's io thread.
 func (c *Conn) StopIOThreadCommand() string {
 	return c.flavor.stopIOThreadCommand()
+}
+
+// StopSQLThreadCommand returns the command to stop the replica's SQL thread(s).
+func (c *Conn) StopSQLThreadCommand() string {
+	return c.flavor.stopSQLThreadCommand()
 }
 
 // StartSQLThreadCommand returns the command to start the replica's SQL thread.
@@ -269,8 +341,8 @@ func (c *Conn) StartSQLThreadCommand() string {
 // SendBinlogDumpCommand sends the flavor-specific version of
 // the COM_BINLOG_DUMP command to start dumping raw binlog
 // events over a server connection, starting at a given GTID.
-func (c *Conn) SendBinlogDumpCommand(serverID uint32, startPos Position) error {
-	return c.flavor.sendBinlogDumpCommand(c, serverID, startPos)
+func (c *Conn) SendBinlogDumpCommand(serverID uint32, binlogFilename string, startPos replication.Position) error {
+	return c.flavor.sendBinlogDumpCommand(c, serverID, binlogFilename, startPos)
 }
 
 // ReadBinlogEvent reads the next BinlogEvent. This must be used
@@ -285,10 +357,16 @@ func (c *Conn) ResetReplicationCommands() []string {
 	return c.flavor.resetReplicationCommands(c)
 }
 
+// ResetReplicationParametersCommands returns the commands to reset
+// replication parameters on the host.
+func (c *Conn) ResetReplicationParametersCommands() []string {
+	return c.flavor.resetReplicationParametersCommands(c)
+}
+
 // SetReplicationPositionCommands returns the commands to set the
 // replication position at which the replica will resume
 // when it is later reparented with SetReplicationSourceCommand.
-func (c *Conn) SetReplicationPositionCommands(pos Position) []string {
+func (c *Conn) SetReplicationPositionCommands(pos replication.Position) []string {
 	return c.flavor.setReplicationPositionCommands(pos)
 }
 
@@ -296,31 +374,8 @@ func (c *Conn) SetReplicationPositionCommands(pos Position) []string {
 // as the new replication source (without changing any GTID position).
 // It is guaranteed to be called with replication stopped.
 // It should not start or stop replication.
-func (c *Conn) SetReplicationSourceCommand(params *ConnParams, host string, port int, connectRetry int) string {
-	args := []string{
-		fmt.Sprintf("MASTER_HOST = '%s'", host),
-		fmt.Sprintf("MASTER_PORT = %d", port),
-		fmt.Sprintf("MASTER_USER = '%s'", params.Uname),
-		fmt.Sprintf("MASTER_PASSWORD = '%s'", params.Pass),
-		fmt.Sprintf("MASTER_CONNECT_RETRY = %d", connectRetry),
-	}
-	if params.SslEnabled() {
-		args = append(args, "MASTER_SSL = 1")
-	}
-	if params.SslCa != "" {
-		args = append(args, fmt.Sprintf("MASTER_SSL_CA = '%s'", params.SslCa))
-	}
-	if params.SslCaPath != "" {
-		args = append(args, fmt.Sprintf("MASTER_SSL_CAPATH = '%s'", params.SslCaPath))
-	}
-	if params.SslCert != "" {
-		args = append(args, fmt.Sprintf("MASTER_SSL_CERT = '%s'", params.SslCert))
-	}
-	if params.SslKey != "" {
-		args = append(args, fmt.Sprintf("MASTER_SSL_KEY = '%s'", params.SslKey))
-	}
-	args = append(args, c.flavor.changeReplicationSourceArg())
-	return "CHANGE MASTER TO\n  " + strings.Join(args, ",\n  ")
+func (c *Conn) SetReplicationSourceCommand(params *ConnParams, host string, port int32, heartbeatInterval float64, connectRetry int) string {
+	return c.flavor.setReplicationSourceCommand(params, host, port, heartbeatInterval, connectRetry)
 }
 
 // resultToMap is a helper function used by ShowReplicationStatus.
@@ -343,126 +398,67 @@ func resultToMap(qr *sqltypes.Result) (map[string]string, error) {
 	return result, nil
 }
 
-// parseReplicationStatus parses the common (non-flavor-specific) fields of ReplicationStatus
-func parseReplicationStatus(fields map[string]string) ReplicationStatus {
-	// The field names in the map are identical to what we receive from the database
-	// Hence the names still contain Master
-	status := ReplicationStatus{
-		SourceHost: fields["Master_Host"],
-		// These fields are returned from the underlying DB and cannot be renamed
-		IOThreadRunning:  fields["Slave_IO_Running"] == "Yes" || fields["Slave_IO_Running"] == "Connecting",
-		SQLThreadRunning: fields["Slave_SQL_Running"] == "Yes",
-	}
-	parseInt, _ := strconv.ParseInt(fields["Master_Port"], 10, 0)
-	status.SourcePort = int(parseInt)
-	parseInt, _ = strconv.ParseInt(fields["Connect_Retry"], 10, 0)
-	status.ConnectRetry = int(parseInt)
-	parseUint, err := strconv.ParseUint(fields["Seconds_Behind_Master"], 10, 0)
-	if err != nil {
-		// we could not parse the value into a valid uint -- most commonly because the value is NULL from the
-		// database -- so let's reflect that the underlying value was unknown on our last check
-		status.ReplicationLagUnknown = true
-	} else {
-		status.ReplicationLagUnknown = false
-		status.ReplicationLagSeconds = uint(parseUint)
-	}
-	parseUint, _ = strconv.ParseUint(fields["Master_Server_Id"], 10, 0)
-	status.SourceServerID = uint(parseUint)
-
-	executedPosStr := fields["Exec_Master_Log_Pos"]
-	file := fields["Relay_Master_Log_File"]
-	if file != "" && executedPosStr != "" {
-		filePos, err := strconv.Atoi(executedPosStr)
-		if err == nil {
-			status.FilePosition.GTIDSet = filePosGTID{
-				file: file,
-				pos:  filePos,
-			}
-		}
-	}
-
-	readPosStr := fields["Read_Master_Log_Pos"]
-	file = fields["Master_Log_File"]
-	if file != "" && readPosStr != "" {
-		fileRelayPos, err := strconv.Atoi(readPosStr)
-		if err == nil {
-			status.FileRelayLogPosition.GTIDSet = filePosGTID{
-				file: file,
-				pos:  fileRelayPos,
-			}
-		}
-	}
-	return status
-}
-
 // ShowReplicationStatus executes the right command to fetch replication status,
 // and returns a parsed Position with other fields.
-func (c *Conn) ShowReplicationStatus() (ReplicationStatus, error) {
+func (c *Conn) ShowReplicationStatus() (replication.ReplicationStatus, error) {
 	return c.flavor.status(c)
 }
 
-// parsePrimaryStatus parses the common fields of SHOW MASTER STATUS.
-func parsePrimaryStatus(fields map[string]string) PrimaryStatus {
-	status := PrimaryStatus{}
-
-	fileExecPosStr := fields["Position"]
-	file := fields["File"]
-	if file != "" && fileExecPosStr != "" {
-		filePos, err := strconv.Atoi(fileExecPosStr)
-		if err == nil {
-			status.FilePosition.GTIDSet = filePosGTID{
-				file: file,
-				pos:  filePos,
-			}
-		}
-	}
-
-	return status
-}
-
-// ShowPrimaryStatus executes the right SHOW MASTER STATUS command,
+// ShowPrimaryStatus executes the right SHOW BINARY LOG STATUS command,
 // and returns a parsed executed Position, as well as file based Position.
-func (c *Conn) ShowPrimaryStatus() (PrimaryStatus, error) {
+func (c *Conn) ShowPrimaryStatus() (replication.PrimaryStatus, error) {
 	return c.flavor.primaryStatus(c)
 }
 
-// WaitUntilPositionCommand returns the SQL command to issue
-// to wait until the given position, until the context
-// expires.  The command returns -1 if it times out. It
-// returns NULL if GTIDs are not enabled.
-func (c *Conn) WaitUntilPositionCommand(ctx context.Context, pos Position) (string, error) {
-	return c.flavor.waitUntilPositionCommand(ctx, pos)
+// ReplicationConfiguration reads the right global variables and performance schema information.
+func (c *Conn) ReplicationConfiguration() (*replicationdata.Configuration, error) {
+	replConfiguration, err := c.flavor.replicationConfiguration(c)
+	// We don't want to fail this call if it called on a primary tablet.
+	// There just isn't any replication configuration to return since it is a primary tablet.
+	if err == ErrNotReplica {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	replNetTimeout, err := c.flavor.replicationNetTimeout(c)
+	replConfiguration.ReplicaNetTimeout = replNetTimeout
+	return replConfiguration, err
 }
 
-// WaitUntilFilePositionCommand returns the SQL command to issue
-// to wait until the given position, until the context
-// expires for the file position flavor.  The command returns -1 if it times out. It
-// returns NULL if GTIDs are not enabled.
-func (c *Conn) WaitUntilFilePositionCommand(ctx context.Context, pos Position) (string, error) {
-	filePosFlavor := filePosFlavor{}
-	return filePosFlavor.waitUntilPositionCommand(ctx, pos)
+// WaitUntilPosition waits until the given position is reached or until the
+// context expires. It returns an error if we did not succeed.
+func (c *Conn) WaitUntilPosition(ctx context.Context, pos replication.Position) error {
+	return c.flavor.waitUntilPosition(ctx, c, pos)
 }
 
-// EnableBinlogPlaybackCommand returns a command to run to enable
-// binlog playback.
-func (c *Conn) EnableBinlogPlaybackCommand() string {
-	return c.flavor.enableBinlogPlaybackCommand()
+func (c *Conn) CatchupToGTIDCommands(params *ConnParams, pos replication.Position) []string {
+	return c.flavor.catchupToGTIDCommands(params, pos)
 }
 
-// DisableBinlogPlaybackCommand returns a command to run to disable
-// binlog playback.
-func (c *Conn) DisableBinlogPlaybackCommand() string {
-	return c.flavor.disableBinlogPlaybackCommand()
+// WaitUntilFilePosition waits until the given position is reached or until
+// the context expires for the file position flavor. It returns an error if
+// we did not succeed.
+func (c *Conn) WaitUntilFilePosition(ctx context.Context, pos replication.Position) error {
+	filePosFlavor := filePosFlavor{serverVersion: c.ServerVersion}
+	return filePosFlavor.waitUntilPosition(ctx, c, pos)
 }
 
-// BaseShowTables returns a query that shows tables and their sizes
+// BaseShowTables returns a query that shows tables
 func (c *Conn) BaseShowTables() string {
+	return c.flavor.baseShowTables()
+}
+
+// BaseShowTablesWithSizes returns a query that shows tables and their sizes
+func (c *Conn) BaseShowTablesWithSizes() string {
 	return c.flavor.baseShowTablesWithSizes()
 }
 
-// SupportsFastDropTable checks if the database server supports fast DROP TABLE operations that do not
-// lock the buffer pool and other queries.
-// Specifically, this is supported in MySQL 8.0.23 and above: https://dev.mysql.com/doc/relnotes/mysql/8.0/en/news-8-0-23.html
-func (c *Conn) SupportsFastDropTable() (bool, error) {
-	return c.flavor.supportsFastDropTable(c)
+// SupportsCapability checks if the database server supports the given capability
+func (c *Conn) SupportsCapability(capability capabilities.FlavorCapability) (bool, error) {
+	return c.flavor.supportsCapability(capability)
+}
+
+func init() {
+	flavorFuncs[replication.FilePosFlavorID] = newFilePosFlavor
 }

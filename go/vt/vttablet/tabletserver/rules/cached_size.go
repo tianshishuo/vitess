@@ -45,7 +45,7 @@ func (cached *Rule) CachedSize(alloc bool) int64 {
 	}
 	size := int64(0)
 	if alloc {
-		size += int64(240)
+		size += int64(256)
 	}
 	// field Description string
 	size += hack.RuntimeAllocSize(int64(len(cached.Description)))
@@ -108,7 +108,7 @@ func (cached *bvcre) CachedSize(alloc bool) int64 {
 	}
 	// field re *regexp.Regexp
 	if cached.re != nil {
-		size += hack.RuntimeAllocSize(int64(153))
+		size += hack.RuntimeAllocSize(int64(160))
 	}
 	return size
 }
@@ -124,7 +124,7 @@ func (cached *namedRegexp) CachedSize(alloc bool) int64 {
 	size += hack.RuntimeAllocSize(int64(len(cached.name)))
 	// field Regexp *regexp.Regexp
 	if cached.Regexp != nil {
-		size += hack.RuntimeAllocSize(int64(153))
+		size += hack.RuntimeAllocSize(int64(160))
 	}
 	return size
 }

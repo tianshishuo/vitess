@@ -23,7 +23,10 @@ import (
 
 	"github.com/gorilla/mux"
 
+	"vitess.io/vitess/go/vt/topo/topoproto"
 	"vitess.io/vitess/go/vt/vtadmin/errors"
+
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 // Request wraps an *http.Request to provide some convenience functions for
@@ -32,7 +35,7 @@ type Request struct{ *http.Request }
 
 // Vars returns the route variables in a request, if any, as defined by
 // gorilla/mux.
-func (r Request) Vars() map[string]string {
+func (r Request) Vars() Vars {
 	return mux.Vars(r.Request)
 }
 
@@ -72,4 +75,71 @@ func (r Request) ParseQueryParamAsUint32(name string, defaultVal uint32) (uint32
 	}
 
 	return defaultVal, nil
+}
+
+// ParseQueryParamAsInt32 attempts to parse the query parameter of the given
+// name into a int32 value. If the parameter is not set, the provided default
+// value is returned.
+func (r Request) ParseQueryParamAsInt32(name string, defaultVal int32) (int32, error) {
+	if param := r.URL.Query().Get(name); param != "" {
+		val, err := strconv.ParseInt(param, 10, 32)
+		if err != nil {
+			return defaultVal, &errors.BadRequest{
+				Err:        err,
+				ErrDetails: fmt.Sprintf("could not parse query parameter %s (= %v) into int32 value", name, param),
+			}
+		}
+
+		return int32(val), nil
+	}
+
+	return defaultVal, nil
+}
+
+// ParseQueryParamAsInt64 attempts to parse the query parameter of the given
+// name into a int64 value. If the parameter is not set, the provided default
+// value is returned.
+func (r Request) ParseQueryParamAsInt64(name string, defaultVal int64) (int64, error) {
+	if param := r.URL.Query().Get(name); param != "" {
+		val, err := strconv.ParseInt(param, 10, 64)
+		if err != nil {
+			return defaultVal, &errors.BadRequest{
+				Err:        err,
+				ErrDetails: fmt.Sprintf("could not parse query parameter %s (= %v) into int64 value", name, param),
+			}
+		}
+
+		return val, nil
+	}
+
+	return defaultVal, nil
+}
+
+// Vars is a mapping of the route variable values in a given request.
+//
+// See (gorilla/mux).Vars for details. We define a type here to add some
+// additional behavior for extracting non-string values.
+type Vars map[string]string
+
+// GetTabletAlias returns the route named `key` as a TabletAlias.
+//
+// It returns an error if the route has no variable with that name, or if it
+// cannot be parsed as a TabletAlias.
+func (v Vars) GetTabletAlias(key string) (*topodatapb.TabletAlias, error) {
+	aliasStr, ok := v[key]
+	if !ok {
+		return nil, &errors.Internal{
+			Err: fmt.Errorf("no route variable found with name %s", key),
+		}
+	}
+
+	alias, err := topoproto.ParseTabletAlias(aliasStr)
+	if err != nil {
+		return nil, &errors.BadRequest{
+			Err:        err,
+			ErrDetails: fmt.Sprintf("could not parse route variable %s (= %v) as tablet alias", key, aliasStr),
+		}
+	}
+
+	return alias, nil
 }

@@ -17,7 +17,10 @@ limitations under the License.
 package sqltypes
 
 import (
+	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
 )
@@ -125,6 +128,9 @@ func TestTypeValues(t *testing.T) {
 	}, {
 		defined:  HexVal,
 		expected: 33 | flagIsText,
+	}, {
+		defined:  BitNum,
+		expected: 34 | flagIsText,
 	}}
 	for _, tcase := range testcases {
 		if int(tcase.defined) != tcase.expected {
@@ -170,6 +176,7 @@ func TestCategory(t *testing.T) {
 		Expression,
 		HexNum,
 		HexVal,
+		BitNum,
 	}
 	for _, typ := range alltypes {
 		matched := false
@@ -200,7 +207,8 @@ func TestCategory(t *testing.T) {
 			}
 			matched = true
 		}
-		if typ == Null || typ == Decimal || typ == Expression || typ == Bit || typ == HexNum || typ == HexVal {
+		if typ == Null || typ == Decimal || typ == Expression || typ == Bit ||
+			typ == HexNum || typ == HexVal || typ == BitNum {
 			if matched {
 				t.Errorf("%v matched more than one category", typ)
 			}
@@ -279,7 +287,7 @@ func TestTypeToMySQL(t *testing.T) {
 
 func TestMySQLToType(t *testing.T) {
 	testcases := []struct {
-		intype  int64
+		intype  byte
 		inflags int64
 		outtype querypb.Type
 	}{{
@@ -439,5 +447,155 @@ func TestTypeEquivalenceCheck(t *testing.T) {
 	}
 	if AreTypesEquivalent(Uint16, Int16) {
 		t.Errorf("Uint16 in binlog and Int16 in schema are not equivalent types.")
+	}
+}
+
+func TestPrintTypeChecks(t *testing.T) {
+	var funcs = []struct {
+		name string
+		f    func(p Type) bool
+	}{
+		{"IsSigned", IsSigned},
+		{"IsFloat", IsFloat},
+		{"IsUnsigned", IsUnsigned},
+		{"IsIntegral", IsIntegral},
+		{"IsText", IsText},
+		{"IsNumber", IsNumber},
+		{"IsQuoted", IsQuoted},
+		{"IsBinary", IsBinary},
+		{"IsDate", IsDate},
+		{"IsNull", IsNull},
+	}
+	var types = []Type{
+		Null,
+		Int8,
+		Uint8,
+		Int16,
+		Uint16,
+		Int24,
+		Uint24,
+		Int32,
+		Uint32,
+		Int64,
+		Uint64,
+		Float32,
+		Float64,
+		Timestamp,
+		Date,
+		Time,
+		Datetime,
+		Year,
+		Decimal,
+		Text,
+		Blob,
+		VarChar,
+		VarBinary,
+		Char,
+		Binary,
+		Bit,
+		Enum,
+		Set,
+		Geometry,
+		TypeJSON,
+		Expression,
+		HexNum,
+		HexVal,
+		Tuple,
+		BitNum,
+	}
+
+	for _, f := range funcs {
+		var match []string
+		for _, tt := range types {
+			if f.f(tt) {
+				match = append(match, tt.String())
+			}
+		}
+		t.Logf("%s(): %s", f.name, strings.Join(match, ", "))
+	}
+}
+
+func TestIsTextOrBinary(t *testing.T) {
+	tests := []struct {
+		name           string
+		ty             querypb.Type
+		isTextorBinary bool
+	}{
+		{
+			name:           "null type",
+			ty:             querypb.Type_NULL_TYPE,
+			isTextorBinary: false,
+		},
+		{
+			name:           "blob type",
+			ty:             querypb.Type_BLOB,
+			isTextorBinary: true,
+		},
+		{
+			name:           "text type",
+			ty:             querypb.Type_TEXT,
+			isTextorBinary: true,
+		},
+		{
+			name:           "binary type",
+			ty:             querypb.Type_BINARY,
+			isTextorBinary: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.isTextorBinary, IsTextOrBinary(tt.ty))
+		})
+	}
+}
+
+func TestIsDateOrTime(t *testing.T) {
+	tests := []struct {
+		name         string
+		ty           querypb.Type
+		isDateOrTime bool
+	}{
+		{
+			name:         "null type",
+			ty:           querypb.Type_NULL_TYPE,
+			isDateOrTime: false,
+		},
+		{
+			name:         "blob type",
+			ty:           querypb.Type_BLOB,
+			isDateOrTime: false,
+		},
+		{
+			name:         "timestamp type",
+			ty:           querypb.Type_TIMESTAMP,
+			isDateOrTime: true,
+		},
+		{
+			name:         "date type",
+			ty:           querypb.Type_DATE,
+			isDateOrTime: true,
+		},
+		{
+			name:         "time type",
+			ty:           querypb.Type_TIME,
+			isDateOrTime: true,
+		},
+		{
+			name:         "date time type",
+			ty:           querypb.Type_DATETIME,
+			isDateOrTime: true,
+		},
+		{
+			name:         "year type",
+			ty:           querypb.Type_YEAR,
+			isDateOrTime: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.isDateOrTime, IsDateOrTime(tt.ty))
+		})
 	}
 }

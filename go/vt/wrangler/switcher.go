@@ -40,8 +40,16 @@ func (r *switcher) deleteRoutingRules(ctx context.Context) error {
 	return r.ts.deleteRoutingRules(ctx)
 }
 
+func (r *switcher) deleteShardRoutingRules(ctx context.Context) error {
+	return r.ts.deleteShardRoutingRules(ctx)
+}
+
 func (r *switcher) dropSourceDeniedTables(ctx context.Context) error {
 	return r.ts.dropSourceDeniedTables(ctx)
+}
+
+func (r *switcher) dropTargetDeniedTables(ctx context.Context) error {
+	return r.ts.dropTargetDeniedTables(ctx)
 }
 
 func (r *switcher) validateWorkflowHasCompleted(ctx context.Context) error {
@@ -101,7 +109,7 @@ func (r *switcher) stopSourceWrites(ctx context.Context) error {
 }
 
 func (r *switcher) stopStreams(ctx context.Context, sm *workflow.StreamMigrator) ([]string, error) {
-	return sm.StopStreams(ctx)
+	return sm.LegacyStopStreams(ctx)
 }
 
 func (r *switcher) cancelMigration(ctx context.Context, sm *workflow.StreamMigrator) {
@@ -135,4 +143,12 @@ func (r *switcher) dropTargetShards(ctx context.Context) error {
 
 func (r *switcher) logs() *[]string {
 	return nil
+}
+
+func (r *switcher) resetSequences(ctx context.Context) error {
+	return r.ts.resetSequences(ctx)
+}
+
+func (r *switcher) initializeTargetSequences(ctx context.Context, sequencesByBackingTable map[string]*sequenceMetadata) error {
+	return r.ts.initializeTargetSequences(ctx, sequencesByBackingTable)
 }

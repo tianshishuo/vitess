@@ -19,15 +19,20 @@ package vreplication
 import (
 	"reflect"
 	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"vitess.io/vitess/go/vt/sqlparser"
 )
 
 type testControllerPlan struct {
-	query        string
-	opcode       int
-	numInserts   int
-	selector     string
-	applier      string
-	delCopyState string
+	query             string
+	opcode            int
+	numInserts        int
+	selector          string
+	applier           string
+	delCopyState      string
+	delPostCopyAction string
 }
 
 func TestControllerPlan(t *testing.T) {
@@ -78,7 +83,7 @@ func TestControllerPlan(t *testing.T) {
 		err: "unsupported construct: insert ignore into _vt.vreplication values (null)",
 	}, {
 		in:  "insert into other values(null)",
-		err: "invalid table name: other",
+		err: "invalid database name: ",
 	}, {
 		in:  "insert into _vt.vreplication partition(a) values(null)",
 		err: "unsupported construct: insert into _vt.vreplication partition (a) values (null)",
@@ -108,13 +113,25 @@ func TestControllerPlan(t *testing.T) {
 			applier:  "update _vt.vreplication set state = 'Running' where id in ::ids",
 		},
 	}, {
-		in: "update _vt.vreplication set state='Running'",
+		in:  "update _vt.vreplication set state='Running'",
+		err: "unsafe WHERE clause in update without the /*vt+ ALLOW_UNSAFE_VREPLICATION_WRITE */ comment directive: ; should be using = or in with at least one of the following columns: id, workflow",
+	}, {
+		in: "update /*vt+ ALLOW_UNSAFE_VREPLICATION_WRITE */ _vt.vreplication set state='Running'",
 		plan: &testControllerPlan{
-			query:    "update _vt.vreplication set state='Running'",
+			query:    "update /*vt+ ALLOW_UNSAFE_VREPLICATION_WRITE */ _vt.vreplication set state='Running'",
 			opcode:   updateQuery,
 			selector: "select id from _vt.vreplication",
-			applier:  "update _vt.vreplication set state = 'Running' where id in ::ids",
+			applier:  "update /*vt+ ALLOW_UNSAFE_VREPLICATION_WRITE */ _vt.vreplication set state = 'Running' where id in ::ids",
 		},
+	}, {
+		in:  "update _vt.vreplication set state='Running', message='' where id >= 1",
+		err: "unsafe WHERE clause in update without the /*vt+ ALLOW_UNSAFE_VREPLICATION_WRITE */ comment directive:  where id >= 1; should be using = or in with at least one of the following columns: id, workflow",
+	}, {
+		in:  "update _vt.vreplication set state = 'Running' where state in ('Stopped', 'Error')",
+		err: "unsafe WHERE clause in update without the /*vt+ ALLOW_UNSAFE_VREPLICATION_WRITE */ comment directive:  where state in ('Stopped', 'Error'); should be using = or in with at least one of the following columns: id, workflow",
+	}, {
+		in:  "update _vt.vreplication set state='Running', message='' where state='Stopped'",
+		err: "unsafe WHERE clause in update without the /*vt+ ALLOW_UNSAFE_VREPLICATION_WRITE */ comment directive:  where state = 'Stopped'; should be using = or in with at least one of the following columns: id, workflow",
 	}, {
 		in: "update _vt.vreplication set state='Running' where a = 1",
 		plan: &testControllerPlan{
@@ -123,6 +140,7 @@ func TestControllerPlan(t *testing.T) {
 			selector: "select id from _vt.vreplication where a = 1",
 			applier:  "update _vt.vreplication set state = 'Running' where id in ::ids",
 		},
+		err: "unsafe WHERE clause in update without the /*vt+ ALLOW_UNSAFE_VREPLICATION_WRITE */ comment directive:  where a = 1; should be using = or in with at least one of the following columns: id, workflow",
 	}, {
 		in: "update _vt.resharding_journal set col = 1",
 		plan: &testControllerPlan{
@@ -130,7 +148,7 @@ func TestControllerPlan(t *testing.T) {
 			opcode: reshardingJournalQuery,
 		},
 	}, {
-		in:  "update a set state='Running' where id = 1",
+		in:  "update _vt.a set state='Running' where id = 1",
 		err: "invalid table name: a",
 	}, {
 		in:  "update _vt.vreplication set state='Running' where id = 1 order by id",
@@ -146,30 +164,40 @@ func TestControllerPlan(t *testing.T) {
 	}, {
 		in: "delete from _vt.vreplication where id = 1",
 		plan: &testControllerPlan{
-			query:        "delete from _vt.vreplication where id = 1",
-			opcode:       deleteQuery,
-			selector:     "select id from _vt.vreplication where id = 1",
-			applier:      "delete from _vt.vreplication where id in ::ids",
-			delCopyState: "delete from _vt.copy_state where vrepl_id in ::ids",
+			query:             "delete from _vt.vreplication where id = 1",
+			opcode:            deleteQuery,
+			selector:          "select id from _vt.vreplication where id = 1",
+			applier:           "delete from _vt.vreplication where id in ::ids",
+			delCopyState:      "delete from _vt.copy_state where vrepl_id in ::ids",
+			delPostCopyAction: "delete from _vt.post_copy_action where vrepl_id in ::ids",
 		},
 	}, {
-		in: "delete from _vt.vreplication",
+		in:  "delete from _vt.vreplication",
+		err: "unsafe WHERE clause in delete without the /*vt+ ALLOW_UNSAFE_VREPLICATION_WRITE */ comment directive: ; should be using = or in with at least one of the following columns: id, workflow",
+	}, {
+		in: "delete /*vt+ ALLOW_UNSAFE_VREPLICATION_WRITE */ from _vt.vreplication",
 		plan: &testControllerPlan{
-			query:        "delete from _vt.vreplication",
-			opcode:       deleteQuery,
-			selector:     "select id from _vt.vreplication",
-			applier:      "delete from _vt.vreplication where id in ::ids",
-			delCopyState: "delete from _vt.copy_state where vrepl_id in ::ids",
+			query:             "delete /*vt+ ALLOW_UNSAFE_VREPLICATION_WRITE */ from _vt.vreplication",
+			opcode:            deleteQuery,
+			selector:          "select id from _vt.vreplication",
+			applier:           "delete /*vt+ ALLOW_UNSAFE_VREPLICATION_WRITE */ from _vt.vreplication where id in ::ids",
+			delCopyState:      "delete from _vt.copy_state where vrepl_id in ::ids",
+			delPostCopyAction: "delete from _vt.post_copy_action where vrepl_id in ::ids",
 		},
+	}, {
+		in:  "delete from _vt.vreplication where state='Stopped'",
+		err: "unsafe WHERE clause in delete without the /*vt+ ALLOW_UNSAFE_VREPLICATION_WRITE */ comment directive:  where state = 'Stopped'; should be using = or in with at least one of the following columns: id, workflow",
 	}, {
 		in: "delete from _vt.vreplication where a = 1",
 		plan: &testControllerPlan{
-			query:        "delete from _vt.vreplication where a = 1",
-			opcode:       deleteQuery,
-			selector:     "select id from _vt.vreplication where a = 1",
-			applier:      "delete from _vt.vreplication where id in ::ids",
-			delCopyState: "delete from _vt.copy_state where vrepl_id in ::ids",
+			query:             "delete from _vt.vreplication where a = 1",
+			opcode:            deleteQuery,
+			selector:          "select id from _vt.vreplication where a = 1",
+			applier:           "delete from _vt.vreplication where id in ::ids",
+			delCopyState:      "delete from _vt.copy_state where vrepl_id in ::ids",
+			delPostCopyAction: "delete from _vt.post_copy_action where vrepl_id in ::ids",
 		},
+		err: "unsafe WHERE clause in delete without the /*vt+ ALLOW_UNSAFE_VREPLICATION_WRITE */ comment directive:  where a = 1; should be using = or in with at least one of the following columns: id, workflow",
 	}, {
 		in: "delete from _vt.resharding_journal where id = 1",
 		plan: &testControllerPlan{
@@ -177,7 +205,7 @@ func TestControllerPlan(t *testing.T) {
 			opcode: reshardingJournalQuery,
 		},
 	}, {
-		in:  "delete from a where id = 1",
+		in:  "delete from _vt.a where id = 1",
 		err: "invalid table name: a",
 	}, {
 		in:  "delete a, b from _vt.vreplication where id = 1",
@@ -212,8 +240,17 @@ func TestControllerPlan(t *testing.T) {
 			query:  "select * from _vt.copy_state",
 		},
 	}, {
-		in:  "select * from a",
+		in: "select * from _vt.vreplication_log",
+		plan: &testControllerPlan{
+			opcode: selectQuery,
+			query:  "select * from _vt.vreplication_log",
+		},
+	}, {
+		in:  "select * from _vt.a",
 		err: "invalid table name: a",
+	}, {
+		in:  "select * from nope.a",
+		err: "invalid database name: nope",
 
 		// Parser
 	}, {
@@ -221,34 +258,35 @@ func TestControllerPlan(t *testing.T) {
 		err: "syntax error at position 4 near 'bad'",
 	}, {
 		in:  "set a = 1",
-		err: "unsupported construct: set a = 1",
+		err: "unsupported construct: set @@a = 1",
 	}}
 	for _, tcase := range tcases {
-		pl, err := buildControllerPlan(tcase.in)
-		if err != nil {
-			if err.Error() != tcase.err {
-				t.Errorf("getPlan(%v) error:\n%v, want\n%v", tcase.in, err, tcase.err)
+		t.Run(tcase.in, func(t *testing.T) {
+			pl, err := buildControllerPlan(tcase.in, sqlparser.NewTestParser())
+			if tcase.err != "" {
+				require.EqualError(t, err, tcase.err)
+				return
 			}
-			continue
-		}
-		if tcase.err != "" {
-			t.Errorf("getPlan(%v) error:\n%v, want\n%v", tcase.in, err, tcase.err)
-			continue
-		}
-		gotPlan := &testControllerPlan{
-			query:      pl.query,
-			opcode:     pl.opcode,
-			numInserts: pl.numInserts,
-			selector:   pl.selector,
-		}
-		if pl.applier != nil {
-			gotPlan.applier = pl.applier.Query
-		}
-		if pl.delCopyState != nil {
-			gotPlan.delCopyState = pl.delCopyState.Query
-		}
-		if !reflect.DeepEqual(gotPlan, tcase.plan) {
-			t.Errorf("getPlan(%v):\n%+v, want\n%+v", tcase.in, gotPlan, tcase.plan)
-		}
+			require.NoError(t, err)
+
+			gotPlan := &testControllerPlan{
+				query:      pl.query,
+				opcode:     pl.opcode,
+				numInserts: pl.numInserts,
+				selector:   pl.selector,
+			}
+			if pl.applier != nil {
+				gotPlan.applier = pl.applier.Query
+			}
+			if pl.delCopyState != nil {
+				gotPlan.delCopyState = pl.delCopyState.Query
+			}
+			if pl.delPostCopyAction != nil {
+				gotPlan.delPostCopyAction = pl.delPostCopyAction.Query
+			}
+			if !reflect.DeepEqual(gotPlan, tcase.plan) {
+				t.Errorf("getPlan(%v):\n%+v, want\n%+v", tcase.in, gotPlan, tcase.plan)
+			}
+		})
 	}
 }

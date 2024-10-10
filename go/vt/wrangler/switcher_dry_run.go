@@ -19,11 +19,14 @@ package wrangler
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 
-	"vitess.io/vitess/go/mysql"
+	"golang.org/x/exp/maps"
+
+	"vitess.io/vitess/go/mysql/replication"
 	"vitess.io/vitess/go/vt/vtctl/workflow"
 
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
@@ -44,6 +47,13 @@ func (dr *switcherDryRun) addParticipatingTablesToKeyspace(ctx context.Context, 
 
 func (dr *switcherDryRun) deleteRoutingRules(ctx context.Context) error {
 	dr.drLog.Log("Routing rules for participating tables will be deleted")
+	return nil
+}
+
+func (dr *switcherDryRun) deleteShardRoutingRules(ctx context.Context) error {
+	if dr.ts.isPartialMigration {
+		dr.drLog.Log("Shard routing rules for participating shards will be deleted")
+	}
 	return nil
 }
 
@@ -124,7 +134,7 @@ func (dr *switcherDryRun) changeRouting(ctx context.Context) error {
 }
 
 func (dr *switcherDryRun) streamMigraterfinalize(ctx context.Context, ts *trafficSwitcher, workflows []string) error {
-	dr.drLog.Log("SwitchWrites completed, freeze and delete vreplication streams on:")
+	dr.drLog.Log("Switch writes completed, freeze and delete vreplication streams on:")
 	logs := make([]string, 0)
 	for _, t := range ts.Targets() {
 		logs = append(logs, fmt.Sprintf("\ttablet %d", t.GetPrimary().Alias.Uid))
@@ -159,7 +169,7 @@ func (dr *switcherDryRun) migrateStreams(ctx context.Context, sm *workflow.Strea
 	dr.drLog.Log(fmt.Sprintf("Migrate streams to %s:", dr.ts.TargetKeyspaceName()))
 	for key, streams := range sm.Streams() {
 		for _, stream := range streams {
-			logs = append(logs, fmt.Sprintf("\tShard %s Id %d, Workflow %s, Pos %s, BinLogSource %v", key, stream.ID, stream.Workflow, mysql.EncodePosition(stream.Position), stream.BinlogSource))
+			logs = append(logs, fmt.Sprintf("\tShard %s Id %d, Workflow %s, Pos %s, BinLogSource %v", key, stream.ID, stream.Workflow, replication.EncodePosition(stream.Position), stream.BinlogSource))
 		}
 	}
 	if len(logs) > 0 {
@@ -171,7 +181,7 @@ func (dr *switcherDryRun) migrateStreams(ctx context.Context, sm *workflow.Strea
 		tabletStreams := templates
 		for _, vrs := range tabletStreams {
 			logs = append(logs, fmt.Sprintf("\t Keyspace %s, Shard %s, Tablet %d, Workflow %s, Id %d, Pos %v, BinLogSource %s",
-				vrs.BinlogSource.Keyspace, vrs.BinlogSource.Shard, target.GetPrimary().Alias.Uid, vrs.Workflow, vrs.ID, mysql.EncodePosition(vrs.Position), vrs.BinlogSource))
+				vrs.BinlogSource.Keyspace, vrs.BinlogSource.Shard, target.GetPrimary().Alias.Uid, vrs.Workflow, vrs.ID, replication.EncodePosition(vrs.Position), vrs.BinlogSource))
 		}
 	}
 	if len(logs) > 0 {
@@ -182,7 +192,7 @@ func (dr *switcherDryRun) migrateStreams(ctx context.Context, sm *workflow.Strea
 }
 
 func (dr *switcherDryRun) waitForCatchup(ctx context.Context, filteredReplicationWaitTime time.Duration) error {
-	dr.drLog.Log(fmt.Sprintf("Wait for VReplication on stopped streams to catchup for upto %v", filteredReplicationWaitTime))
+	dr.drLog.Log(fmt.Sprintf("Wait for VReplication on stopped streams to catchup for up to %v", filteredReplicationWaitTime))
 	return nil
 }
 
@@ -215,7 +225,7 @@ func (dr *switcherDryRun) stopStreams(ctx context.Context, sm *workflow.StreamMi
 }
 
 func (dr *switcherDryRun) cancelMigration(ctx context.Context, sm *workflow.StreamMigrator) {
-	dr.drLog.Log("Cancel stream migrations as requested")
+	dr.drLog.Log("Cancel migration as requested")
 }
 
 func (dr *switcherDryRun) lockKeyspace(ctx context.Context, keyspace, _ string) (context.Context, func(*error), error) {
@@ -320,6 +330,18 @@ func (dr *switcherDryRun) dropSourceDeniedTables(ctx context.Context) error {
 	return nil
 }
 
+func (dr *switcherDryRun) dropTargetDeniedTables(ctx context.Context) error {
+	logs := make([]string, 0)
+	for _, si := range dr.ts.TargetShards() {
+		logs = append(logs, fmt.Sprintf("\tKeyspace %s Shard %s Tablet %d", si.Keyspace(), si.ShardName(), si.PrimaryAlias.Uid))
+	}
+	if len(logs) > 0 {
+		dr.drLog.Log(fmt.Sprintf("Denied tables [%s] will be removed from:", strings.Join(dr.ts.Tables(), ",")))
+		dr.drLog.LogSlice(logs)
+	}
+	return nil
+}
+
 func (dr *switcherDryRun) logs() *[]string {
 	return &dr.drLog.logs
 }
@@ -361,5 +383,26 @@ func (dr *switcherDryRun) dropTargetShards(ctx context.Context) error {
 		dr.drLog.LogSlice(logs)
 	}
 
+	return nil
+}
+
+func (dr *switcherDryRun) resetSequences(ctx context.Context) error {
+	var err error
+	mustReset := false
+	if mustReset, err = dr.ts.mustResetSequences(ctx); err != nil {
+		return err
+	}
+	if !mustReset {
+		return nil
+	}
+	dr.drLog.Log("The sequence caches will be reset on the source since sequence tables are being moved")
+	return nil
+}
+
+func (dr *switcherDryRun) initializeTargetSequences(ctx context.Context, sequencesByBackingTable map[string]*sequenceMetadata) error {
+	sortedBackingTableNames := maps.Keys(sequencesByBackingTable)
+	slices.Sort(sortedBackingTableNames)
+	dr.drLog.Log(fmt.Sprintf("The following sequence backing tables used by tables being moved will be initialized: %s",
+		strings.Join(sortedBackingTableNames, ",")))
 	return nil
 }

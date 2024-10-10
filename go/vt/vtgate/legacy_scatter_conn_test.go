@@ -26,6 +26,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"vitess.io/vitess/go/mysql/collations"
+
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/test/utils"
 	"vitess.io/vitess/go/vt/discovery"
@@ -42,10 +44,11 @@ import (
 // This file uses the sandbox_test framework.
 
 func TestLegacyExecuteFailOnAutocommit(t *testing.T) {
+	ctx := utils.LeakCheckContext(t)
 
 	createSandbox("TestExecuteFailOnAutocommit")
-	hc := discovery.NewFakeLegacyHealthCheck()
-	sc := newTestLegacyScatterConn(hc, new(sandboxTopo), "aa")
+	hc := discovery.NewFakeHealthCheck(nil)
+	sc := newTestScatterConn(ctx, hc, newSandboxForCells(ctx, []string{"aa"}), "aa")
 	sbc0 := hc.AddTestTablet("aa", "0", 1, "TestExecuteFailOnAutocommit", "0", topodatapb.TabletType_PRIMARY, true, 1, nil)
 	sbc1 := hc.AddTestTablet("aa", "1", 1, "TestExecuteFailOnAutocommit", "1", topodatapb.TabletType_PRIMARY, true, 1, nil)
 
@@ -96,7 +99,7 @@ func TestLegacyExecuteFailOnAutocommit(t *testing.T) {
 		},
 		Autocommit: false,
 	}
-	_, errs := sc.ExecuteMultiShard(ctx, rss, queries, NewSafeSession(session), true /*autocommit*/, false)
+	_, errs := sc.ExecuteMultiShard(ctx, nil, rss, queries, NewSafeSession(session), true /*autocommit*/, false, nullResultsObserver{})
 	err := vterrors.Aggregate(errs)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "in autocommit mode, transactionID should be zero but was: 123")
@@ -105,8 +108,8 @@ func TestLegacyExecuteFailOnAutocommit(t *testing.T) {
 }
 
 func TestScatterConnExecuteMulti(t *testing.T) {
-	testScatterConnGeneric(t, "TestScatterConnExecuteMultiShard", func(sc *ScatterConn, shards []string) (*sqltypes.Result, error) {
-		res := srvtopo.NewResolver(&sandboxTopo{}, sc.gateway, "aa")
+	testScatterConnGeneric(t, "TestScatterConnExecuteMultiShard", func(ctx context.Context, sc *ScatterConn, shards []string) (*sqltypes.Result, error) {
+		res := srvtopo.NewResolver(newSandboxForCells(ctx, []string{"aa"}), sc.gateway, "aa")
 		rss, err := res.ResolveDestination(ctx, "TestScatterConnExecuteMultiShard", topodatapb.TabletType_REPLICA, key.DestinationShards(shards))
 		if err != nil {
 			return nil, err
@@ -120,14 +123,14 @@ func TestScatterConnExecuteMulti(t *testing.T) {
 			}
 		}
 
-		qr, errs := sc.ExecuteMultiShard(ctx, rss, queries, NewSafeSession(nil), false /*autocommit*/, false)
+		qr, errs := sc.ExecuteMultiShard(ctx, nil, rss, queries, NewSafeSession(nil), false /*autocommit*/, false, nullResultsObserver{})
 		return qr, vterrors.Aggregate(errs)
 	})
 }
 
 func TestScatterConnStreamExecuteMulti(t *testing.T) {
-	testScatterConnGeneric(t, "TestScatterConnStreamExecuteMulti", func(sc *ScatterConn, shards []string) (*sqltypes.Result, error) {
-		res := srvtopo.NewResolver(&sandboxTopo{}, sc.gateway, "aa")
+	testScatterConnGeneric(t, "TestScatterConnStreamExecuteMulti", func(ctx context.Context, sc *ScatterConn, shards []string) (*sqltypes.Result, error) {
+		res := srvtopo.NewResolver(newSandboxForCells(ctx, []string{"aa"}), sc.gateway, "aa")
 		rss, err := res.ResolveDestination(ctx, "TestScatterConnStreamExecuteMulti", topodatapb.TabletType_REPLICA, key.DestinationShards(shards))
 		if err != nil {
 			return nil, err
@@ -135,12 +138,12 @@ func TestScatterConnStreamExecuteMulti(t *testing.T) {
 		bvs := make([]map[string]*querypb.BindVariable, len(rss))
 		qr := new(sqltypes.Result)
 		var mu sync.Mutex
-		errors := sc.StreamExecuteMulti(ctx, "query", rss, bvs, NewSafeSession(&vtgatepb.Session{InTransaction: true}), true, func(r *sqltypes.Result) error {
+		errors := sc.StreamExecuteMulti(ctx, nil, "query", rss, bvs, NewSafeSession(&vtgatepb.Session{InTransaction: true}), true /* autocommit */, func(r *sqltypes.Result) error {
 			mu.Lock()
 			defer mu.Unlock()
 			qr.AppendResult(r)
 			return nil
-		})
+		}, nullResultsObserver{})
 		return qr, vterrors.Aggregate(errors)
 	})
 }
@@ -153,13 +156,15 @@ func verifyScatterConnError(t *testing.T, err error, wantErr string, wantCode vt
 	assert.Equal(t, wantCode, vterrors.Code(err))
 }
 
-func testScatterConnGeneric(t *testing.T, name string, f func(sc *ScatterConn, shards []string) (*sqltypes.Result, error)) {
-	hc := discovery.NewFakeLegacyHealthCheck()
+func testScatterConnGeneric(t *testing.T, name string, f func(ctx context.Context, sc *ScatterConn, shards []string) (*sqltypes.Result, error)) {
+	ctx := utils.LeakCheckContext(t)
+
+	hc := discovery.NewFakeHealthCheck(nil)
 
 	// no shard
 	s := createSandbox(name)
-	sc := newTestLegacyScatterConn(hc, new(sandboxTopo), "aa")
-	qr, err := f(sc, nil)
+	sc := newTestScatterConn(ctx, hc, newSandboxForCells(ctx, []string{"aa"}), "aa")
+	qr, err := f(ctx, sc, nil)
 	require.NoError(t, err)
 	if qr.RowsAffected != 0 {
 		t.Errorf("want 0, got %v", qr.RowsAffected)
@@ -167,86 +172,86 @@ func testScatterConnGeneric(t *testing.T, name string, f func(sc *ScatterConn, s
 
 	// single shard
 	s.Reset()
-	sc = newTestLegacyScatterConn(hc, new(sandboxTopo), "aa")
+	sc = newTestScatterConn(ctx, hc, newSandboxForCells(ctx, []string{"aa"}), "aa")
 	sbc := hc.AddTestTablet("aa", "0", 1, name, "0", topodatapb.TabletType_REPLICA, true, 1, nil)
 	sbc.MustFailCodes[vtrpcpb.Code_INVALID_ARGUMENT] = 1
-	_, err = f(sc, []string{"0"})
+	_, err = f(ctx, sc, []string{"0"})
 	want := fmt.Sprintf("target: %v.0.replica: INVALID_ARGUMENT error", name)
 	// Verify server error string.
 	if err == nil || err.Error() != want {
 		t.Errorf("want %s, got %v", want, err)
 	}
 	// Ensure that we tried only once.
-	if execCount := sbc.ExecCount.Get(); execCount != 1 {
+	if execCount := sbc.ExecCount.Load(); execCount != 1 {
 		t.Errorf("want 1, got %v", execCount)
 	}
 
 	// two shards
 	s.Reset()
 	hc.Reset()
-	sc = newTestLegacyScatterConn(hc, new(sandboxTopo), "aa")
+	sc = newTestScatterConn(ctx, hc, newSandboxForCells(ctx, []string{"aa"}), "aa")
 	sbc0 := hc.AddTestTablet("aa", "0", 1, name, "0", topodatapb.TabletType_REPLICA, true, 1, nil)
 	sbc1 := hc.AddTestTablet("aa", "1", 1, name, "1", topodatapb.TabletType_REPLICA, true, 1, nil)
 	sbc0.MustFailCodes[vtrpcpb.Code_INVALID_ARGUMENT] = 1
 	sbc1.MustFailCodes[vtrpcpb.Code_INVALID_ARGUMENT] = 1
-	_, err = f(sc, []string{"0", "1"})
+	_, err = f(ctx, sc, []string{"0", "1"})
 	// Verify server errors are consolidated.
 	want = fmt.Sprintf("target: %v.0.replica: INVALID_ARGUMENT error\ntarget: %v.1.replica: INVALID_ARGUMENT error", name, name)
 	verifyScatterConnError(t, err, want, vtrpcpb.Code_INVALID_ARGUMENT)
 	// Ensure that we tried only once.
-	if execCount := sbc0.ExecCount.Get(); execCount != 1 {
+	if execCount := sbc0.ExecCount.Load(); execCount != 1 {
 		t.Errorf("want 1, got %v", execCount)
 	}
-	if execCount := sbc1.ExecCount.Get(); execCount != 1 {
+	if execCount := sbc1.ExecCount.Load(); execCount != 1 {
 		t.Errorf("want 1, got %v", execCount)
 	}
 
 	// two shards with different errors
 	s.Reset()
 	hc.Reset()
-	sc = newTestLegacyScatterConn(hc, new(sandboxTopo), "aa")
+	sc = newTestScatterConn(ctx, hc, newSandboxForCells(ctx, []string{"aa"}), "aa")
 	sbc0 = hc.AddTestTablet("aa", "0", 1, name, "0", topodatapb.TabletType_REPLICA, true, 1, nil)
 	sbc1 = hc.AddTestTablet("aa", "1", 1, name, "1", topodatapb.TabletType_REPLICA, true, 1, nil)
 	sbc0.MustFailCodes[vtrpcpb.Code_INVALID_ARGUMENT] = 1
 	sbc1.MustFailCodes[vtrpcpb.Code_RESOURCE_EXHAUSTED] = 1
-	_, err = f(sc, []string{"0", "1"})
+	_, err = f(ctx, sc, []string{"0", "1"})
 	// Verify server errors are consolidated.
 	want = fmt.Sprintf("target: %v.0.replica: INVALID_ARGUMENT error\ntarget: %v.1.replica: RESOURCE_EXHAUSTED error", name, name)
 	// We should only surface the higher priority error code
 	verifyScatterConnError(t, err, want, vtrpcpb.Code_INVALID_ARGUMENT)
 	// Ensure that we tried only once.
-	if execCount := sbc0.ExecCount.Get(); execCount != 1 {
+	if execCount := sbc0.ExecCount.Load(); execCount != 1 {
 		t.Errorf("want 1, got %v", execCount)
 	}
-	if execCount := sbc1.ExecCount.Get(); execCount != 1 {
+	if execCount := sbc1.ExecCount.Load(); execCount != 1 {
 		t.Errorf("want 1, got %v", execCount)
 	}
 
 	// duplicate shards
 	s.Reset()
 	hc.Reset()
-	sc = newTestLegacyScatterConn(hc, new(sandboxTopo), "aa")
+	sc = newTestScatterConn(ctx, hc, newSandboxForCells(ctx, []string{"aa"}), "aa")
 	sbc = hc.AddTestTablet("aa", "0", 1, name, "0", topodatapb.TabletType_REPLICA, true, 1, nil)
-	_, _ = f(sc, []string{"0", "0"})
+	_, _ = f(ctx, sc, []string{"0", "0"})
 	// Ensure that we executed only once.
-	if execCount := sbc.ExecCount.Get(); execCount != 1 {
+	if execCount := sbc.ExecCount.Load(); execCount != 1 {
 		t.Errorf("want 1, got %v", execCount)
 	}
 
 	// no errors
 	s.Reset()
 	hc.Reset()
-	sc = newTestLegacyScatterConn(hc, new(sandboxTopo), "aa")
+	sc = newTestScatterConn(ctx, hc, newSandboxForCells(ctx, []string{"aa"}), "aa")
 	sbc0 = hc.AddTestTablet("aa", "0", 1, name, "0", topodatapb.TabletType_REPLICA, true, 1, nil)
 	sbc1 = hc.AddTestTablet("aa", "1", 1, name, "1", topodatapb.TabletType_REPLICA, true, 1, nil)
-	qr, err = f(sc, []string{"0", "1"})
+	qr, err = f(ctx, sc, []string{"0", "1"})
 	if err != nil {
 		t.Fatalf("want nil, got %v", err)
 	}
-	if execCount := sbc0.ExecCount.Get(); execCount != 1 {
+	if execCount := sbc0.ExecCount.Load(); execCount != 1 {
 		t.Errorf("want 1, got %v", execCount)
 	}
-	if execCount := sbc1.ExecCount.Get(); execCount != 1 {
+	if execCount := sbc1.ExecCount.Load(); execCount != 1 {
 		t.Errorf("want 1, got %v", execCount)
 	}
 	if qr.RowsAffected != 0 {
@@ -258,17 +263,19 @@ func testScatterConnGeneric(t *testing.T, name string, f func(sc *ScatterConn, s
 }
 
 func TestMaxMemoryRows(t *testing.T) {
-	save := *maxMemoryRows
-	*maxMemoryRows = 3
-	defer func() { *maxMemoryRows = save }()
+	ctx := utils.LeakCheckContext(t)
+
+	save := maxMemoryRows
+	maxMemoryRows = 3
+	defer func() { maxMemoryRows = save }()
 
 	createSandbox("TestMaxMemoryRows")
-	hc := discovery.NewFakeLegacyHealthCheck()
-	sc := newTestLegacyScatterConn(hc, new(sandboxTopo), "aa")
+	hc := discovery.NewFakeHealthCheck(nil)
+	sc := newTestScatterConn(ctx, hc, newSandboxForCells(ctx, []string{"aa"}), "aa")
 	sbc0 := hc.AddTestTablet("aa", "0", 1, "TestMaxMemoryRows", "0", topodatapb.TabletType_REPLICA, true, 1, nil)
 	sbc1 := hc.AddTestTablet("aa", "1", 1, "TestMaxMemoryRows", "1", topodatapb.TabletType_REPLICA, true, 1, nil)
 
-	res := srvtopo.NewResolver(&sandboxTopo{}, sc.gateway, "aa")
+	res := srvtopo.NewResolver(newSandboxForCells(ctx, []string{"aa"}), sc.gateway, "aa")
 	rss, _, err := res.ResolveDestinations(ctx, "TestMaxMemoryRows", topodatapb.TabletType_REPLICA, nil,
 		[]key.Destination{key.DestinationShard("0"), key.DestinationShard("1")})
 	require.NoError(t, err)
@@ -303,7 +310,7 @@ func TestMaxMemoryRows(t *testing.T) {
 		sbc0.SetResults([]*sqltypes.Result{tworows, tworows})
 		sbc1.SetResults([]*sqltypes.Result{tworows, tworows})
 
-		_, errs := sc.ExecuteMultiShard(ctx, rss, queries, session, false, test.ignoreMaxMemoryRows)
+		_, errs := sc.ExecuteMultiShard(ctx, nil, rss, queries, session, false, test.ignoreMaxMemoryRows, nullResultsObserver{})
 		if test.ignoreMaxMemoryRows {
 			require.NoError(t, err)
 		} else {
@@ -313,12 +320,13 @@ func TestMaxMemoryRows(t *testing.T) {
 }
 
 func TestLegaceHealthCheckFailsOnReservedConnections(t *testing.T) {
+	ctx := utils.LeakCheckContext(t)
 	keyspace := "keyspace"
 	createSandbox(keyspace)
-	hc := discovery.NewFakeLegacyHealthCheck()
-	sc := newTestLegacyScatterConn(hc, new(sandboxTopo), "aa")
+	hc := discovery.NewFakeHealthCheck(nil)
+	sc := newTestScatterConn(ctx, hc, newSandboxForCells(ctx, []string{"aa"}), "aa")
 
-	res := srvtopo.NewResolver(&sandboxTopo{}, sc.gateway, "aa")
+	res := srvtopo.NewResolver(newSandboxForCells(ctx, []string{"aa"}), sc.gateway, "aa")
 
 	session := NewSafeSession(&vtgatepb.Session{InTransaction: false, InReservedConn: true})
 	destinations := []key.Destination{key.DestinationShard("0")}
@@ -334,16 +342,16 @@ func TestLegaceHealthCheckFailsOnReservedConnections(t *testing.T) {
 		})
 	}
 
-	_, errs := sc.ExecuteMultiShard(ctx, rss, queries, session, false, false)
+	_, errs := sc.ExecuteMultiShard(ctx, nil, rss, queries, session, false, false, nullResultsObserver{})
 	require.Error(t, vterrors.Aggregate(errs))
 }
 
-func executeOnShards(t *testing.T, res *srvtopo.Resolver, keyspace string, sc *ScatterConn, session *SafeSession, destinations []key.Destination) {
+func executeOnShards(t *testing.T, ctx context.Context, res *srvtopo.Resolver, keyspace string, sc *ScatterConn, session *SafeSession, destinations []key.Destination) {
 	t.Helper()
-	require.Empty(t, executeOnShardsReturnsErr(t, res, keyspace, sc, session, destinations))
+	require.Empty(t, executeOnShardsReturnsErr(t, ctx, res, keyspace, sc, session, destinations))
 }
 
-func executeOnShardsReturnsErr(t *testing.T, res *srvtopo.Resolver, keyspace string, sc *ScatterConn, session *SafeSession, destinations []key.Destination) error {
+func executeOnShardsReturnsErr(t *testing.T, ctx context.Context, res *srvtopo.Resolver, keyspace string, sc *ScatterConn, session *SafeSession, destinations []key.Destination) error {
 	t.Helper()
 	rss, _, err := res.ResolveDestinations(ctx, keyspace, topodatapb.TabletType_REPLICA, nil, destinations)
 	require.NoError(t, err)
@@ -357,14 +365,26 @@ func executeOnShardsReturnsErr(t *testing.T, res *srvtopo.Resolver, keyspace str
 		})
 	}
 
-	_, errs := sc.ExecuteMultiShard(ctx, rss, queries, session, false, false)
+	_, errs := sc.ExecuteMultiShard(ctx, nil, rss, queries, session, false, false, nullResultsObserver{})
 	return vterrors.Aggregate(errs)
 }
 
+type recordingResultsObserver struct {
+	mu       sync.Mutex
+	recorded []*sqltypes.Result
+}
+
+func (o *recordingResultsObserver) observe(result *sqltypes.Result) {
+	mu.Lock()
+	o.recorded = append(o.recorded, result)
+	mu.Unlock()
+}
+
 func TestMultiExecs(t *testing.T) {
+	ctx := utils.LeakCheckContext(t)
 	createSandbox("TestMultiExecs")
-	hc := discovery.NewFakeLegacyHealthCheck()
-	sc := newTestLegacyScatterConn(hc, new(sandboxTopo), "aa")
+	hc := discovery.NewFakeHealthCheck(nil)
+	sc := newTestScatterConn(ctx, hc, newSandboxForCells(ctx, []string{"aa"}), "aa")
 	sbc0 := hc.AddTestTablet("aa", "0", 1, "TestMultiExecs", "0", topodatapb.TabletType_REPLICA, true, 1, nil)
 	sbc1 := hc.AddTestTablet("aa", "1", 1, "TestMultiExecs", "1", topodatapb.TabletType_REPLICA, true, 1, nil)
 
@@ -400,9 +420,17 @@ func TestMultiExecs(t *testing.T) {
 			},
 		},
 	}
+	results := []*sqltypes.Result{
+		{Info: "r0"},
+		{Info: "r1"},
+	}
+	sbc0.SetResults(results[0:1])
+	sbc1.SetResults(results[1:2])
+
+	observer := recordingResultsObserver{}
 
 	session := NewSafeSession(&vtgatepb.Session{})
-	_, err := sc.ExecuteMultiShard(ctx, rss, queries, session, false, false)
+	_, err := sc.ExecuteMultiShard(ctx, nil, rss, queries, session, false, false, &observer)
 	require.NoError(t, vterrors.Aggregate(err))
 	if len(sbc0.Queries) == 0 || len(sbc1.Queries) == 0 {
 		t.Fatalf("didn't get expected query")
@@ -419,8 +447,12 @@ func TestMultiExecs(t *testing.T) {
 	if !reflect.DeepEqual(sbc1.Queries[0].BindVariables, wantVars1) {
 		t.Errorf("got %+v, want %+v", sbc0.Queries[0].BindVariables, wantVars1)
 	}
+	assert.ElementsMatch(t, results, observer.recorded)
+
 	sbc0.Queries = nil
 	sbc1.Queries = nil
+	sbc0.SetResults(results[0:1])
+	sbc1.SetResults(results[1:2])
 
 	rss = []*srvtopo.ResolvedShard{
 		{
@@ -446,27 +478,31 @@ func TestMultiExecs(t *testing.T) {
 			"bv1": sqltypes.Int64BindVariable(1),
 		},
 	}
-	_ = sc.StreamExecuteMulti(ctx, "query", rss, bvs, session, false, func(*sqltypes.Result) error {
+
+	observer = recordingResultsObserver{}
+	_ = sc.StreamExecuteMulti(ctx, nil, "query", rss, bvs, session, false /* autocommit */, func(*sqltypes.Result) error {
 		return nil
-	})
+	}, &observer)
 	if !reflect.DeepEqual(sbc0.Queries[0].BindVariables, wantVars0) {
 		t.Errorf("got %+v, want %+v", sbc0.Queries[0].BindVariables, wantVars0)
 	}
 	if !reflect.DeepEqual(sbc1.Queries[0].BindVariables, wantVars1) {
 		t.Errorf("got %+v, want %+v", sbc0.Queries[0].BindVariables, wantVars1)
 	}
+	assert.ElementsMatch(t, results, observer.recorded)
 }
 
 func TestScatterConnSingleDB(t *testing.T) {
+	ctx := utils.LeakCheckContext(t)
 	createSandbox("TestScatterConnSingleDB")
-	hc := discovery.NewFakeLegacyHealthCheck()
+	hc := discovery.NewFakeHealthCheck(nil)
 
 	hc.Reset()
-	sc := newTestLegacyScatterConn(hc, new(sandboxTopo), "aa")
+	sc := newTestScatterConn(ctx, hc, newSandboxForCells(ctx, []string{"aa"}), "aa")
 	hc.AddTestTablet("aa", "0", 1, "TestScatterConnSingleDB", "0", topodatapb.TabletType_PRIMARY, true, 1, nil)
 	hc.AddTestTablet("aa", "1", 1, "TestScatterConnSingleDB", "1", topodatapb.TabletType_PRIMARY, true, 1, nil)
 
-	res := srvtopo.NewResolver(&sandboxTopo{}, sc.gateway, "aa")
+	res := srvtopo.NewResolver(newSandboxForCells(ctx, []string{"aa"}), sc.gateway, "aa")
 	rss0, err := res.ResolveDestination(ctx, "TestScatterConnSingleDB", topodatapb.TabletType_PRIMARY, key.DestinationShard("0"))
 	require.NoError(t, err)
 	rss1, err := res.ResolveDestination(ctx, "TestScatterConnSingleDB", topodatapb.TabletType_PRIMARY, key.DestinationShard("1"))
@@ -477,27 +513,27 @@ func TestScatterConnSingleDB(t *testing.T) {
 	// TransactionMode_SINGLE in session
 	session := NewSafeSession(&vtgatepb.Session{InTransaction: true, TransactionMode: vtgatepb.TransactionMode_SINGLE})
 	queries := []*querypb.BoundQuery{{Sql: "query1"}}
-	_, errors := sc.ExecuteMultiShard(ctx, rss0, queries, session, false, false)
+	_, errors := sc.ExecuteMultiShard(ctx, nil, rss0, queries, session, false, false, nullResultsObserver{})
 	require.Empty(t, errors)
-	_, errors = sc.ExecuteMultiShard(ctx, rss1, queries, session, false, false)
+	_, errors = sc.ExecuteMultiShard(ctx, nil, rss1, queries, session, false, false, nullResultsObserver{})
 	require.Error(t, errors[0])
 	assert.Contains(t, errors[0].Error(), want)
 
 	// TransactionMode_SINGLE in txconn
 	sc.txConn.mode = vtgatepb.TransactionMode_SINGLE
 	session = NewSafeSession(&vtgatepb.Session{InTransaction: true})
-	_, errors = sc.ExecuteMultiShard(ctx, rss0, queries, session, false, false)
+	_, errors = sc.ExecuteMultiShard(ctx, nil, rss0, queries, session, false, false, nullResultsObserver{})
 	require.Empty(t, errors)
-	_, errors = sc.ExecuteMultiShard(ctx, rss1, queries, session, false, false)
+	_, errors = sc.ExecuteMultiShard(ctx, nil, rss1, queries, session, false, false, nullResultsObserver{})
 	require.Error(t, errors[0])
 	assert.Contains(t, errors[0].Error(), want)
 
 	// TransactionMode_MULTI in txconn. Should not fail.
 	sc.txConn.mode = vtgatepb.TransactionMode_MULTI
 	session = NewSafeSession(&vtgatepb.Session{InTransaction: true})
-	_, errors = sc.ExecuteMultiShard(ctx, rss0, queries, session, false, false)
+	_, errors = sc.ExecuteMultiShard(ctx, nil, rss0, queries, session, false, false, nullResultsObserver{})
 	require.Empty(t, errors)
-	_, errors = sc.ExecuteMultiShard(ctx, rss1, queries, session, false, false)
+	_, errors = sc.ExecuteMultiShard(ctx, nil, rss1, queries, session, false, false, nullResultsObserver{})
 	require.Empty(t, errors)
 }
 
@@ -509,7 +545,7 @@ func TestAppendResult(t *testing.T) {
 	}
 	innerqr2 := &sqltypes.Result{
 		Fields: []*querypb.Field{
-			{Name: "foo", Type: sqltypes.Int8},
+			{Name: "foo", Type: sqltypes.Int8, Charset: collations.CollationBinaryID, Flags: uint32(querypb.MySqlFlag_NUM_FLAG)},
 		},
 		RowsAffected: 1,
 		InsertID:     1,
@@ -551,10 +587,11 @@ func TestAppendResult(t *testing.T) {
 }
 
 func TestReservePrequeries(t *testing.T) {
+	ctx := utils.LeakCheckContext(t)
 	keyspace := "keyspace"
 	createSandbox(keyspace)
 	hc := discovery.NewFakeHealthCheck(nil)
-	sc := newTestScatterConn(hc, new(sandboxTopo), "aa")
+	sc := newTestScatterConn(ctx, hc, newSandboxForCells(ctx, []string{"aa"}), "aa")
 	sbc0 := hc.AddTestTablet("aa", "0", 1, keyspace, "0", topodatapb.TabletType_REPLICA, true, 1, nil)
 	sbc1 := hc.AddTestTablet("aa", "1", 1, keyspace, "1", topodatapb.TabletType_REPLICA, true, 1, nil)
 
@@ -562,7 +599,7 @@ func TestReservePrequeries(t *testing.T) {
 	sbc0.SetResults([]*sqltypes.Result{{}})
 	sbc1.SetResults([]*sqltypes.Result{{}})
 
-	res := srvtopo.NewResolver(&sandboxTopo{}, sc.gateway, "aa")
+	res := srvtopo.NewResolver(newSandboxForCells(ctx, []string{"aa"}), sc.gateway, "aa")
 
 	session := NewSafeSession(&vtgatepb.Session{
 		InTransaction:  false,
@@ -574,26 +611,15 @@ func TestReservePrequeries(t *testing.T) {
 	})
 	destinations := []key.Destination{key.DestinationShard("0")}
 
-	executeOnShards(t, res, keyspace, sc, session, destinations)
-	assert.Equal(t, 2+1, len(sbc0.StringQueries()))
+	executeOnShards(t, ctx, res, keyspace, sc, session, destinations)
+	assert.Equal(t, 1+1, len(sbc0.StringQueries()))
 }
 
-func newTestLegacyScatterConn(hc discovery.LegacyHealthCheck, serv srvtopo.Server, cell string) *ScatterConn {
-	// The topo.Server is used to start watching the cells described
-	// in '-cells_to_watch' command line parameter, which is
-	// empty by default. So it's unused in this test, set to nil.
-	gw := GatewayCreator()(ctx, hc, serv, cell, 3)
-	tc := NewTxConn(gw, vtgatepb.TransactionMode_TWOPC)
-	return NewLegacyScatterConn("", tc, gw, hc)
-}
-
-func newTestScatterConn(hc discovery.HealthCheck, serv srvtopo.Server, cell string) *ScatterConn {
+func newTestScatterConn(ctx context.Context, hc discovery.HealthCheck, serv srvtopo.Server, cell string) *ScatterConn {
 	// The topo.Server is used to start watching the cells described
 	// in '-cells_to_watch' command line parameter, which is
 	// empty by default. So it's unused in this test, set to nil.
 	gw := NewTabletGateway(ctx, hc, serv, cell)
-	tc := NewTxConn(gw, vtgatepb.TransactionMode_TWOPC)
+	tc := NewTxConn(gw, vtgatepb.TransactionMode_MULTI)
 	return NewScatterConn("", tc, gw)
 }
-
-var ctx = context.Background()

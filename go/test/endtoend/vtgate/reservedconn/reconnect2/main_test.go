@@ -82,13 +82,13 @@ func TestMain(m *testing.M) {
 			SchemaSQL: sqlSchema,
 			VSchema:   vSchema,
 		}
-		clusterInstance.VtTabletExtraArgs = []string{"-queryserver-config-transaction-timeout", "5"}
+		clusterInstance.VtTabletExtraArgs = []string{"--queryserver-config-transaction-timeout", "5s"}
 		if err := clusterInstance.StartKeyspace(*keyspace, []string{"-80", "80-"}, 1, true); err != nil {
 			return 1
 		}
 
 		// Start vtgate
-		clusterInstance.VtGateExtraArgs = []string{"-lock_heartbeat_time", "2s", "-enable_system_settings=true"}
+		clusterInstance.VtGateExtraArgs = []string{"--lock_heartbeat_time", "2s"}
 		if err := clusterInstance.StartVtgate(); err != nil {
 			return 1
 		}
@@ -100,6 +100,7 @@ func TestMain(m *testing.M) {
 		return m.Run()
 	}()
 	os.Exit(exitCode)
+
 }
 
 func TestTabletChange(t *testing.T) {
@@ -114,7 +115,7 @@ func TestTabletChange(t *testing.T) {
 	utils.Exec(t, conn, "select * from test")
 
 	// Change Primary
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("PlannedReparentShard", "-keyspace_shard", fmt.Sprintf("%s/%s", keyspaceName, "-80"))
+	err = clusterInstance.VtctldClientProcess.ExecuteCommand("PlannedReparentShard", fmt.Sprintf("%s/%s", keyspaceName, "-80"))
 	require.NoError(t, err)
 
 	// this should pass as there is a new primary tablet and is serving.
@@ -135,7 +136,7 @@ func TestTabletChangeStreaming(t *testing.T) {
 	utils.Exec(t, conn, "select * from test")
 
 	// Change Primary
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("PlannedReparentShard", "-keyspace_shard", fmt.Sprintf("%s/%s", keyspaceName, "-80"))
+	err = clusterInstance.VtctldClientProcess.ExecuteCommand("PlannedReparentShard", fmt.Sprintf("%s/%s", keyspaceName, "-80"))
 	require.NoError(t, err)
 
 	// this should pass as there is a new primary tablet and is serving.

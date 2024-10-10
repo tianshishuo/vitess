@@ -54,6 +54,7 @@ to the go clients (for vtgate -> vttablet link). */
 package encryptedtransport
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -62,12 +63,13 @@ import (
 	"path"
 	"testing"
 
+	"github.com/pkg/errors"
+
+	"vitess.io/vitess/go/constants/sidecar"
 	"vitess.io/vitess/go/test/endtoend/encryption"
 
 	"vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/vterrors"
-
-	"context"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -131,7 +133,7 @@ func TestSecureTransport(t *testing.T) {
 
 	// start the tablets
 	for _, tablet := range []cluster.Vttablet{primaryTablet, replicaTablet} {
-		tablet.VttabletProcess.ExtraArgs = append(tablet.VttabletProcess.ExtraArgs, "-table-acl-config", tableACLConfigJSON, "-queryserver-config-strict-table-acl")
+		tablet.VttabletProcess.ExtraArgs = append(tablet.VttabletProcess.ExtraArgs, "--table-acl-config", tableACLConfigJSON, "--queryserver-config-strict-table-acl")
 		tablet.VttabletProcess.ExtraArgs = append(tablet.VttabletProcess.ExtraArgs, serverExtraArguments("vttablet-server-instance", "vttablet-client")...)
 		err = tablet.VttabletProcess.Setup()
 		require.NoError(t, err)
@@ -143,12 +145,15 @@ func TestSecureTransport(t *testing.T) {
 	vtctlClientTmArgs := append(vtctlClientArgs, tmclientExtraArgs("vttablet-client-1")...)
 
 	// Reparenting
-	vtctlClientArgs = append(vtctlClientTmArgs, "InitShardPrimary", "-force", "test_keyspace/0", primaryTablet.Alias)
+	vtctlClientArgs = append(vtctlClientTmArgs, "InitShardPrimary", "--", "--force", "test_keyspace/0", primaryTablet.Alias)
 	err = clusterInstance.VtctlProcess.ExecuteCommand(vtctlClientArgs...)
 	require.NoError(t, err)
 
+	err = clusterInstance.StartVTOrc("test_keyspace")
+	require.NoError(t, err)
+
 	// Apply schema
-	var vtctlApplySchemaArgs = append(vtctlClientTmArgs, "ApplySchema", "-sql", createVtInsertTest, "test_keyspace")
+	var vtctlApplySchemaArgs = append(vtctlClientTmArgs, "ApplySchema", "--", "--sql", createVtInsertTest, "test_keyspace")
 	err = clusterInstance.VtctlProcess.ExecuteCommand(vtctlApplySchemaArgs...)
 	require.NoError(t, err)
 
@@ -172,7 +177,7 @@ func TestSecureTransport(t *testing.T) {
 	setCreds(t, "vtgate-client-1", "vtgate-server")
 	ctx := context.Background()
 	request := getRequest("select * from vt_insert_test")
-	vc, err := getVitessClient(grpcAddress)
+	vc, err := getVitessClient(ctx, grpcAddress)
 	require.NoError(t, err)
 
 	qr, err := vc.Execute(ctx, request)
@@ -183,7 +188,7 @@ func TestSecureTransport(t *testing.T) {
 	// 'vtgate client 2' is not authorized to access vt_insert_test
 	setCreds(t, "vtgate-client-2", "vtgate-server")
 	request = getRequest("select * from vt_insert_test")
-	vc, err = getVitessClient(grpcAddress)
+	vc, err = getVitessClient(ctx, grpcAddress)
 	require.NoError(t, err)
 	qr, err = vc.Execute(ctx, request)
 	require.NoError(t, err)
@@ -192,25 +197,32 @@ func TestSecureTransport(t *testing.T) {
 	assert.Contains(t, err.Error(), "Select command denied to user")
 	assert.Contains(t, err.Error(), "for table 'vt_insert_test' (ACL check error)")
 
+	useEffectiveCallerID(ctx, t)
+	useEffectiveGroups(ctx, t)
+
+	clusterInstance.Teardown()
+}
+
+func useEffectiveCallerID(ctx context.Context, t *testing.T) {
 	// now restart vtgate in the mode where we don't use SSL
 	// for client connections, but we copy effective caller id
 	// into immediate caller id.
-	clusterInstance.VtGateExtraArgs = []string{"-grpc_use_effective_callerid"}
+	clusterInstance.VtGateExtraArgs = []string{"--grpc_use_effective_callerid"}
 	clusterInstance.VtGateExtraArgs = append(clusterInstance.VtGateExtraArgs, tabletConnExtraArgs("vttablet-client-1")...)
-	err = clusterInstance.RestartVtgate()
+	err := clusterInstance.RestartVtgate()
 	require.NoError(t, err)
 
-	grpcAddress = fmt.Sprintf("%s:%d", "localhost", clusterInstance.VtgateProcess.GrpcPort)
+	grpcAddress := fmt.Sprintf("%s:%d", "localhost", clusterInstance.VtgateProcess.GrpcPort)
 
 	setSSLInfoEmpty()
 
 	// get vitess client
-	vc, err = getVitessClient(grpcAddress)
+	vc, err := getVitessClient(ctx, grpcAddress)
 	require.NoError(t, err)
 
 	// test with empty effective caller Id
-	request = getRequest("select * from vt_insert_test")
-	qr, err = vc.Execute(ctx, request)
+	request := getRequest("select * from vt_insert_test")
+	qr, err := vc.Execute(ctx, request)
 	require.NoError(t, err)
 	err = vterrors.FromVTRPC(qr.Error)
 	require.Error(t, err)
@@ -238,8 +250,57 @@ func TestSecureTransport(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "Select command denied to user")
 	assert.Contains(t, err.Error(), "for table 'vt_insert_test' (ACL check error)")
+}
 
-	clusterInstance.Teardown()
+func useEffectiveGroups(ctx context.Context, t *testing.T) {
+	// now restart vtgate in the mode where we don't use SSL
+	// for client connections, but we copy effective caller's groups
+	// into immediate caller id.
+	clusterInstance.VtGateExtraArgs = []string{"--grpc_use_effective_callerid", "--grpc-use-effective-groups"}
+	clusterInstance.VtGateExtraArgs = append(clusterInstance.VtGateExtraArgs, tabletConnExtraArgs("vttablet-client-1")...)
+	err := clusterInstance.RestartVtgate()
+	require.NoError(t, err)
+
+	grpcAddress := fmt.Sprintf("%s:%d", "localhost", clusterInstance.VtgateProcess.GrpcPort)
+
+	setSSLInfoEmpty()
+
+	// get vitess client
+	vc, err := getVitessClient(ctx, grpcAddress)
+	require.NoError(t, err)
+
+	// test with empty effective caller Id
+	request := getRequest("select * from vt_insert_test")
+	qr, err := vc.Execute(ctx, request)
+	require.NoError(t, err)
+	err = vterrors.FromVTRPC(qr.Error)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Select command denied to user")
+	assert.Contains(t, err.Error(), "for table 'vt_insert_test' (ACL check error)")
+
+	// 'vtgate client 1' is authorized to access vt_insert_test
+	callerID := &vtrpc.CallerID{
+		Principal: "my-caller",
+		Groups:    []string{"vtgate client 1"},
+	}
+	request = getRequestWithCallerID(callerID, "select * from vt_insert_test")
+	qr, err = vc.Execute(ctx, request)
+	require.NoError(t, err)
+	err = vterrors.FromVTRPC(qr.Error)
+	require.NoError(t, err)
+
+	// 'vtgate client 2' is not authorized to access vt_insert_test
+	callerID = &vtrpc.CallerID{
+		Principal: "my-caller",
+		Groups:    []string{"vtgate client 2"},
+	}
+	request = getRequestWithCallerID(callerID, "select * from vt_insert_test")
+	qr, err = vc.Execute(ctx, request)
+	require.NoError(t, err)
+	err = vterrors.FromVTRPC(qr.Error)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Select command denied to user")
+	assert.Contains(t, err.Error(), "for table 'vt_insert_test' (ACL check error)")
 }
 
 func clusterSetUp(t *testing.T) (int, error) {
@@ -248,7 +309,7 @@ func clusterSetUp(t *testing.T) (int, error) {
 
 	// Start topo server
 	if err := clusterInstance.StartTopo(); err != nil {
-		return 1, err
+		return 1, errors.Wrap(err, "unable to start topo")
 	}
 
 	// create all certs
@@ -256,19 +317,19 @@ func clusterSetUp(t *testing.T) (int, error) {
 	certDirectory = path.Join(clusterInstance.TmpDirectory, "certs")
 	_ = encryption.CreateDirectory(certDirectory, 0700)
 
-	err := encryption.ExecuteVttlstestCommand("-root", certDirectory, "CreateCA")
+	err := encryption.ExecuteVttlstestCommand("--root", certDirectory, "CreateCA")
 	require.NoError(t, err)
 
-	err = createSignedCert("ca", "01", "vttablet-server", "vttablet server CA")
+	err = createIntermediateCA("ca", "01", "vttablet-server", "vttablet server CA")
 	require.NoError(t, err)
 
-	err = createSignedCert("ca", "02", "vttablet-client", "vttablet client CA")
+	err = createIntermediateCA("ca", "02", "vttablet-client", "vttablet client CA")
 	require.NoError(t, err)
 
-	err = createSignedCert("ca", "03", "vtgate-server", "vtgate server CA")
+	err = createIntermediateCA("ca", "03", "vtgate-server", "vtgate server CA")
 	require.NoError(t, err)
 
-	err = createSignedCert("ca", "04", "vtgate-client", "vtgate client CA")
+	err = createIntermediateCA("ca", "04", "vtgate-client", "vtgate client CA")
 	require.NoError(t, err)
 
 	err = createSignedCert("vttablet-server", "01", "vttablet-server-instance", "vttablet server instance")
@@ -289,7 +350,7 @@ func clusterSetUp(t *testing.T) (int, error) {
 	for _, keyspaceStr := range []string{keyspace} {
 		KeyspacePtr := &cluster.Keyspace{Name: keyspaceStr}
 		keyspace := *KeyspacePtr
-		if err := clusterInstance.VtctlProcess.CreateKeyspace(keyspace.Name); err != nil {
+		if err := clusterInstance.VtctlProcess.CreateKeyspace(keyspace.Name, sidecar.DefaultName, ""); err != nil {
 			return 1, err
 		}
 		shard := &cluster.Shard{
@@ -300,7 +361,11 @@ func clusterSetUp(t *testing.T) (int, error) {
 			tablet := clusterInstance.NewVttabletInstance("replica", 0, cell)
 
 			// Start Mysqlctl process
-			tablet.MysqlctlProcess = *cluster.MysqlCtlProcessInstance(tablet.TabletUID, tablet.MySQLPort, clusterInstance.TmpDirectory)
+			mysqlctlProcess, err := cluster.MysqlCtlProcessInstance(tablet.TabletUID, tablet.MySQLPort, clusterInstance.TmpDirectory)
+			if err != nil {
+				return 1, err
+			}
+			tablet.MysqlctlProcess = *mysqlctlProcess
 			proc, err := tablet.MysqlctlProcess.StartProcess()
 			if err != nil {
 				return 1, err
@@ -320,7 +385,6 @@ func clusterSetUp(t *testing.T) (int, error) {
 				clusterInstance.Hostname,
 				clusterInstance.TmpDirectory,
 				clusterInstance.VtTabletExtraArgs,
-				clusterInstance.EnableSemiSync,
 				clusterInstance.DefaultCharset)
 			tablet.Alias = tablet.VttabletProcess.TabletPath
 			shard.Vttablets = append(shard.Vttablets, tablet)
@@ -331,56 +395,69 @@ func clusterSetUp(t *testing.T) (int, error) {
 	for _, proc := range mysqlProcesses {
 		err := proc.Wait()
 		if err != nil {
-			return 1, err
+			return 1, errors.Wrap(err, "unable to wait on mysql process")
 		}
 	}
 	return 0, nil
+}
+
+func createIntermediateCA(ca string, serial string, name string, commonName string) error {
+	log.Infof("Creating intermediate signed cert and key %s", commonName)
+	tmpProcess := exec.Command(
+		"vttlstest",
+		"CreateIntermediateCA",
+		"--root", certDirectory,
+		"--parent", ca,
+		"--serial", serial,
+		"--common-name", commonName,
+		name)
+	return tmpProcess.Run()
 }
 
 func createSignedCert(ca string, serial string, name string, commonName string) error {
 	log.Infof("Creating signed cert and key %s", commonName)
 	tmpProcess := exec.Command(
 		"vttlstest",
-		"-root", certDirectory,
 		"CreateSignedCert",
-		"-parent", ca,
-		"-serial", serial,
-		"-common_name", commonName,
+		"--root", certDirectory,
+		"--parent", ca,
+		"--serial", serial,
+		"--common-name", commonName,
 		name)
 	return tmpProcess.Run()
 }
 
 func serverExtraArguments(name string, ca string) []string {
-	args := []string{"-grpc_cert", certDirectory + "/" + name + "-cert.pem",
-		"-grpc_key", certDirectory + "/" + name + "-key.pem",
-		"-grpc_ca", certDirectory + "/" + ca + "-cert.pem"}
+	args := []string{"--grpc_cert", certDirectory + "/" + name + "-cert.pem",
+		"--grpc_key", certDirectory + "/" + name + "-key.pem",
+		"--grpc_ca", certDirectory + "/" + ca + "-cert.pem"}
 	return args
 }
 
 func tmclientExtraArgs(name string) []string {
 	ca := "vttablet-server"
-	var args = []string{"-tablet_manager_grpc_cert", certDirectory + "/" + name + "-cert.pem",
-		"-tablet_manager_grpc_key", certDirectory + "/" + name + "-key.pem",
-		"-tablet_manager_grpc_ca", certDirectory + "/" + ca + "-cert.pem",
-		"-tablet_manager_grpc_server_name", "vttablet server instance"}
+	var args = []string{"--tablet_manager_grpc_cert", certDirectory + "/" + name + "-cert.pem",
+		"--tablet_manager_grpc_key", certDirectory + "/" + name + "-key.pem",
+		"--tablet_manager_grpc_ca", certDirectory + "/" + ca + "-cert.pem",
+		"--tablet_manager_grpc_server_name", "vttablet server instance"}
 	return args
 }
 
 func tabletConnExtraArgs(name string) []string {
 	ca := "vttablet-server"
-	args := []string{"-tablet_grpc_cert", certDirectory + "/" + name + "-cert.pem",
-		"-tablet_grpc_key", certDirectory + "/" + name + "-key.pem",
-		"-tablet_grpc_ca", certDirectory + "/" + ca + "-cert.pem",
-		"-tablet_grpc_server_name", "vttablet server instance"}
+	args := []string{"--tablet_grpc_cert", certDirectory + "/" + name + "-cert.pem",
+		"--tablet_grpc_key", certDirectory + "/" + name + "-key.pem",
+		"--tablet_grpc_ca", certDirectory + "/" + ca + "-cert.pem",
+		"--tablet_grpc_server_name", "vttablet server instance"}
 	return args
 }
 
-func getVitessClient(addr string) (vtgateservicepb.VitessClient, error) {
+func getVitessClient(ctx context.Context, addr string) (vtgateservicepb.VitessClient, error) {
 	opt, err := grpcclient.SecureDialOption(grpcCert, grpcKey, grpcCa, "", grpcName)
 	if err != nil {
 		return nil, err
 	}
-	cc, err := grpcclient.Dial(addr, grpcclient.FailFast(false), opt)
+	cc, err := grpcclient.DialContext(ctx, addr, grpcclient.FailFast(false), opt)
 	if err != nil {
 		return nil, err
 	}

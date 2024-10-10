@@ -24,16 +24,18 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"k8s.io/apimachinery/pkg/util/sets"
+
+	"vitess.io/vitess/go/mysql/replication"
 
 	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/sets"
 	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
 	"vitess.io/vitess/go/vt/topo/topoproto"
-
 	"vitess.io/vitess/go/vt/topotools/events"
 	"vitess.io/vitess/go/vt/vtctl/grpcvtctldserver/testutil"
+	"vitess.io/vitess/go/vt/vtctl/reparentutil/reparenttestutil"
 
 	replicationdatapb "vitess.io/vitess/go/vt/proto/replicationdata"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -58,8 +60,6 @@ func TestNewEmergencyReparenter(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
-
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -98,8 +98,6 @@ func TestEmergencyReparenter_getLockAction(t *testing.T) {
 	erp := &EmergencyReparenter{}
 
 	for _, tt := range tests {
-		tt := tt
-
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -110,14 +108,13 @@ func TestEmergencyReparenter_getLockAction(t *testing.T) {
 }
 
 func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
-	t.Parallel()
-
 	tests := []struct {
 		name                 string
+		durability           string
 		emergencyReparentOps EmergencyReparentOptions
 		tmc                  *testutil.TabletManagerClient
 		// setup
-		ts         *topo.Server
+		cells      []string
 		keyspace   string
 		shard      string
 		unlockTopo bool
@@ -129,6 +126,7 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 	}{
 		{
 			name:                 "success",
+			durability:           "none",
 			emergencyReparentOps: EmergencyReparentOptions{},
 			tmc: &testutil.TabletManagerClient{
 				PopulateReparentJournalResults: map[string]error{
@@ -143,26 +141,17 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 						Error:  nil,
 					},
 				},
-				PrimaryPositionResults: map[string]struct {
-					Position string
-					Error    error
-				}{
-					"zone1-0000000102": {
-						Error: nil,
-					},
-				},
 				SetReplicationSourceResults: map[string]error{
 					"zone1-0000000100": nil,
 					"zone1-0000000101": nil,
 				},
 				StopReplicationAndGetStatusResults: map[string]struct {
-					Status     *replicationdatapb.Status
 					StopStatus *replicationdatapb.StopReplicationStatus
 					Error      error
 				}{
 					"zone1-0000000100": {
 						StopStatus: &replicationdatapb.StopReplicationStatus{
-							Before: &replicationdatapb.Status{},
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
 							After: &replicationdatapb.Status{
 								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
 								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
@@ -171,7 +160,7 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 					},
 					"zone1-0000000101": {
 						StopStatus: &replicationdatapb.StopReplicationStatus{
-							Before: &replicationdatapb.Status{},
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
 							After: &replicationdatapb.Status{
 								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
 								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
@@ -180,7 +169,7 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 					},
 					"zone1-0000000102": {
 						StopStatus: &replicationdatapb.StopReplicationStatus{
-							Before: &replicationdatapb.Status{},
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
 							After: &replicationdatapb.Status{
 								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
 								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-26",
@@ -241,13 +230,146 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 			},
 			keyspace:  "testkeyspace",
 			shard:     "-",
-			ts:        memorytopo.NewServer("zone1"),
+			cells:     []string{"zone1"},
+			shouldErr: false,
+		},
+		{
+			name:                 "success - 1 replica and 1 rdonly failure",
+			durability:           "semi_sync",
+			emergencyReparentOps: EmergencyReparentOptions{},
+			tmc: &testutil.TabletManagerClient{
+				PopulateReparentJournalResults: map[string]error{
+					"zone1-0000000102": nil,
+				},
+				PromoteReplicaResults: map[string]struct {
+					Result string
+					Error  error
+				}{
+					"zone1-0000000102": {
+						Result: "ok",
+						Error:  nil,
+					},
+				},
+				SetReplicationSourceResults: map[string]error{
+					"zone1-0000000100": nil,
+					"zone1-0000000101": nil,
+				},
+				StopReplicationAndGetStatusResults: map[string]struct {
+					StopStatus *replicationdatapb.StopReplicationStatus
+					Error      error
+				}{
+					"zone1-0000000100": {
+						StopStatus: &replicationdatapb.StopReplicationStatus{
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
+							After: &replicationdatapb.Status{
+								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
+								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
+							},
+						},
+					},
+					"zone1-0000000101": {
+						StopStatus: &replicationdatapb.StopReplicationStatus{
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
+							After: &replicationdatapb.Status{
+								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
+								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
+							},
+						},
+					},
+					"zone1-0000000102": {
+						StopStatus: &replicationdatapb.StopReplicationStatus{
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
+							After: &replicationdatapb.Status{
+								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
+								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-26",
+							},
+						},
+					},
+					"zone1-0000000103": {
+						Error: assert.AnError,
+					},
+					"zone1-0000000104": {
+						Error: assert.AnError,
+					},
+				},
+				WaitForPositionResults: map[string]map[string]error{
+					"zone1-0000000100": {
+						"MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21": nil,
+					},
+					"zone1-0000000101": {
+						"MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21": nil,
+					},
+					"zone1-0000000102": {
+						"MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-26": nil,
+					},
+				},
+			},
+			shards: []*vtctldatapb.Shard{
+				{
+					Keyspace: "testkeyspace",
+					Name:     "-",
+					Shard: &topodatapb.Shard{
+						PrimaryAlias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  100,
+						},
+					},
+				},
+			},
+			tablets: []*topodatapb.Tablet{
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  100,
+					},
+					Keyspace: "testkeyspace",
+					Shard:    "-",
+				},
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  101,
+					},
+					Keyspace: "testkeyspace",
+					Shard:    "-",
+				},
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  102,
+					},
+					Keyspace: "testkeyspace",
+					Shard:    "-",
+					Hostname: "most up-to-date position, wins election",
+				},
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  103,
+					},
+					Keyspace: "testkeyspace",
+					Shard:    "-",
+				},
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  104,
+					},
+					Type:     topodatapb.TabletType_RDONLY,
+					Keyspace: "testkeyspace",
+					Shard:    "-",
+				},
+			},
+			keyspace:  "testkeyspace",
+			shard:     "-",
+			cells:     []string{"zone1"},
 			shouldErr: false,
 		},
 		{
 			// Here, all our tablets are tied, so we're going to explicitly pick
 			// zone1-101.
-			name: "success with requested primary-elect",
+			name:       "success with requested primary-elect",
+			durability: "none",
 			emergencyReparentOps: EmergencyReparentOptions{NewPrimaryAlias: &topodatapb.TabletAlias{
 				Cell: "zone1",
 				Uid:  101,
@@ -255,14 +377,6 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 			tmc: &testutil.TabletManagerClient{
 				PopulateReparentJournalResults: map[string]error{
 					"zone1-0000000101": nil,
-				},
-				PrimaryPositionResults: map[string]struct {
-					Position string
-					Error    error
-				}{
-					"zone1-0000000101": {
-						Error: nil,
-					},
 				},
 				PromoteReplicaResults: map[string]struct {
 					Result string
@@ -278,13 +392,12 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 					"zone1-0000000102": nil,
 				},
 				StopReplicationAndGetStatusResults: map[string]struct {
-					Status     *replicationdatapb.Status
 					StopStatus *replicationdatapb.StopReplicationStatus
 					Error      error
 				}{
 					"zone1-0000000100": {
 						StopStatus: &replicationdatapb.StopReplicationStatus{
-							Before: &replicationdatapb.Status{},
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
 							After: &replicationdatapb.Status{
 								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
 								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
@@ -293,7 +406,7 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 					},
 					"zone1-0000000101": {
 						StopStatus: &replicationdatapb.StopReplicationStatus{
-							Before: &replicationdatapb.Status{},
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
 							After: &replicationdatapb.Status{
 								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
 								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
@@ -302,7 +415,7 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 					},
 					"zone1-0000000102": {
 						StopStatus: &replicationdatapb.StopReplicationStatus{
-							Before: &replicationdatapb.Status{},
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
 							After: &replicationdatapb.Status{
 								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
 								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
@@ -362,11 +475,12 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 			},
 			keyspace:  "testkeyspace",
 			shard:     "-",
-			ts:        memorytopo.NewServer("zone1"),
+			cells:     []string{"zone1"},
 			shouldErr: false,
 		},
 		{
 			name:                 "success with existing primary",
+			durability:           "none",
 			emergencyReparentOps: EmergencyReparentOptions{},
 			tmc: &testutil.TabletManagerClient{
 				DemotePrimaryResults: map[string]struct {
@@ -377,14 +491,6 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 						Status: &replicationdatapb.PrimaryStatus{
 							Position: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
 						},
-					},
-				},
-				PrimaryPositionResults: map[string]struct {
-					Position string
-					Error    error
-				}{
-					"zone1-0000000102": {
-						Error: nil,
 					},
 				},
 				PopulateReparentJournalResults: map[string]error{
@@ -404,7 +510,6 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 					"zone1-0000000101": nil,
 				},
 				StopReplicationAndGetStatusResults: map[string]struct {
-					Status     *replicationdatapb.Status
 					StopStatus *replicationdatapb.StopReplicationStatus
 					Error      error
 				}{
@@ -413,7 +518,7 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 					},
 					"zone1-0000000101": {
 						StopStatus: &replicationdatapb.StopReplicationStatus{
-							Before: &replicationdatapb.Status{},
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
 							After: &replicationdatapb.Status{
 								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
 								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
@@ -422,7 +527,7 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 					},
 					"zone1-0000000102": {
 						StopStatus: &replicationdatapb.StopReplicationStatus{
-							Before: &replicationdatapb.Status{},
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
 							After: &replicationdatapb.Status{
 								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
 								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-26",
@@ -481,27 +586,28 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 			},
 			keyspace:  "testkeyspace",
 			shard:     "-",
-			ts:        memorytopo.NewServer("zone1"),
+			cells:     []string{"zone1"},
 			shouldErr: false,
 		},
 		{
 			name:                 "shard not found",
+			durability:           "none",
 			emergencyReparentOps: EmergencyReparentOptions{},
 			tmc:                  &testutil.TabletManagerClient{},
 			unlockTopo:           true, // we shouldn't try to lock the nonexistent shard
 			shards:               nil,
 			keyspace:             "testkeyspace",
 			shard:                "-",
-			ts:                   memorytopo.NewServer("zone1"),
+			cells:                []string{"zone1"},
 			shouldErr:            true,
 			errShouldContain:     "node doesn't exist: keyspaces/testkeyspace/shards/-/Shard",
 		},
 		{
 			name:                 "cannot stop replication",
+			durability:           "none",
 			emergencyReparentOps: EmergencyReparentOptions{},
 			tmc: &testutil.TabletManagerClient{
 				StopReplicationAndGetStatusResults: map[string]struct {
-					Status     *replicationdatapb.Status
 					StopStatus *replicationdatapb.StopReplicationStatus
 					Error      error
 				}{
@@ -551,27 +657,27 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 			},
 			keyspace:         "testkeyspace",
 			shard:            "-",
-			ts:               memorytopo.NewServer("zone1"),
+			cells:            []string{"zone1"},
 			shouldErr:        true,
 			errShouldContain: "failed to stop replication and build status maps",
 		},
 		{
 			name:                 "lost topo lock",
+			durability:           "none",
 			emergencyReparentOps: EmergencyReparentOptions{},
 			tmc: &testutil.TabletManagerClient{
 				StopReplicationAndGetStatusResults: map[string]struct {
-					Status     *replicationdatapb.Status
 					StopStatus *replicationdatapb.StopReplicationStatus
 					Error      error
 				}{
 					"zone1-0000000100": {
-						StopStatus: &replicationdatapb.StopReplicationStatus{},
+						StopStatus: &replicationdatapb.StopReplicationStatus{Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)}},
 					},
 					"zone1-0000000101": {
-						StopStatus: &replicationdatapb.StopReplicationStatus{},
+						StopStatus: &replicationdatapb.StopReplicationStatus{Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)}},
 					},
 					"zone1-0000000102": {
-						StopStatus: &replicationdatapb.StopReplicationStatus{},
+						StopStatus: &replicationdatapb.StopReplicationStatus{Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)}},
 					},
 				},
 			},
@@ -610,21 +716,22 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 			},
 			keyspace:         "testkeyspace",
 			shard:            "-",
-			ts:               memorytopo.NewServer("zone1"),
+			cells:            []string{"zone1"},
 			shouldErr:        true,
 			errShouldContain: "lost topology lock, aborting",
 		},
 		{
 			name:                 "cannot get reparent candidates",
+			durability:           "none",
 			emergencyReparentOps: EmergencyReparentOptions{},
 			tmc: &testutil.TabletManagerClient{
 				StopReplicationAndGetStatusResults: map[string]struct {
-					Status     *replicationdatapb.Status
 					StopStatus *replicationdatapb.StopReplicationStatus
 					Error      error
 				}{
 					"zone1-0000000100": {
 						StopStatus: &replicationdatapb.StopReplicationStatus{
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
 							After: &replicationdatapb.Status{
 								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
 								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
@@ -633,6 +740,7 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 					},
 					"zone1-0000000101": {
 						StopStatus: &replicationdatapb.StopReplicationStatus{
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
 							After: &replicationdatapb.Status{
 								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
 								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
@@ -641,7 +749,8 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 					},
 					"zone1-0000000102": {
 						StopStatus: &replicationdatapb.StopReplicationStatus{
-							After: &replicationdatapb.Status{},
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
+							After:  &replicationdatapb.Status{},
 						},
 					},
 				},
@@ -681,12 +790,13 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 			},
 			keyspace:         "testkeyspace",
 			shard:            "-",
-			ts:               memorytopo.NewServer("zone1"),
+			cells:            []string{"zone1"},
 			shouldErr:        true,
 			errShouldContain: "encountered tablet zone1-0000000102 with no relay log position",
 		},
 		{
 			name:                 "zero valid reparent candidates",
+			durability:           "none",
 			emergencyReparentOps: EmergencyReparentOptions{},
 			tmc:                  &testutil.TabletManagerClient{},
 			shards: []*vtctldatapb.Shard{
@@ -698,23 +808,24 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 			shouldErr:        true,
 			keyspace:         "testkeyspace",
 			shard:            "-",
-			ts:               memorytopo.NewServer("zone1"),
+			cells:            []string{"zone1"},
 			errShouldContain: "no valid candidates for emergency reparent",
 		},
 		{
-			name: "error waiting for relay logs to apply",
+			name:       "error waiting for relay logs to apply",
+			durability: "none",
 			// one replica is going to take a minute to apply relay logs
 			emergencyReparentOps: EmergencyReparentOptions{
 				WaitReplicasTimeout: time.Millisecond * 50,
 			},
 			tmc: &testutil.TabletManagerClient{
 				StopReplicationAndGetStatusResults: map[string]struct {
-					Status     *replicationdatapb.Status
 					StopStatus *replicationdatapb.StopReplicationStatus
 					Error      error
 				}{
 					"zone1-0000000100": {
 						StopStatus: &replicationdatapb.StopReplicationStatus{
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
 							After: &replicationdatapb.Status{
 								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
 								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
@@ -723,6 +834,7 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 					},
 					"zone1-0000000101": {
 						StopStatus: &replicationdatapb.StopReplicationStatus{
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
 							After: &replicationdatapb.Status{
 								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
 								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
@@ -731,6 +843,7 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 					},
 					"zone1-0000000102": {
 						StopStatus: &replicationdatapb.StopReplicationStatus{
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
 							After: &replicationdatapb.Status{
 								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
 								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
@@ -790,23 +903,24 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 			shouldErr:        true,
 			keyspace:         "testkeyspace",
 			shard:            "-",
-			ts:               memorytopo.NewServer("zone1"),
+			cells:            []string{"zone1"},
 			errShouldContain: "could not apply all relay logs within the provided waitReplicasTimeout",
 		},
 		{
-			name: "requested primary-elect is not in tablet map",
+			name:       "requested primary-elect is not in tablet map",
+			durability: "none",
 			emergencyReparentOps: EmergencyReparentOptions{NewPrimaryAlias: &topodatapb.TabletAlias{
 				Cell: "zone1",
 				Uid:  200,
 			}},
 			tmc: &testutil.TabletManagerClient{
 				StopReplicationAndGetStatusResults: map[string]struct {
-					Status     *replicationdatapb.Status
 					StopStatus *replicationdatapb.StopReplicationStatus
 					Error      error
 				}{
 					"zone1-0000000100": {
 						StopStatus: &replicationdatapb.StopReplicationStatus{
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
 							After: &replicationdatapb.Status{
 								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
 								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
@@ -815,6 +929,7 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 					},
 					"zone1-0000000101": {
 						StopStatus: &replicationdatapb.StopReplicationStatus{
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
 							After: &replicationdatapb.Status{
 								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
 								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
@@ -823,6 +938,7 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 					},
 					"zone1-0000000102": {
 						StopStatus: &replicationdatapb.StopReplicationStatus{
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
 							After: &replicationdatapb.Status{
 								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
 								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
@@ -876,19 +992,20 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 			},
 			keyspace:         "testkeyspace",
 			shard:            "-",
-			ts:               memorytopo.NewServer("zone1"),
+			cells:            []string{"zone1"},
 			shouldErr:        true,
 			errShouldContain: "primary elect zone1-0000000200 has errant GTIDs",
 		},
 		{
-			name: "requested primary-elect is not winning primary-elect",
+			name:       "requested primary-elect is not winning primary-elect",
+			durability: "none",
 			emergencyReparentOps: EmergencyReparentOptions{NewPrimaryAlias: &topodatapb.TabletAlias{ // we're requesting a tablet that's behind in replication
 				Cell: "zone1",
 				Uid:  102,
 			}},
 			keyspace: "testkeyspace",
 			shard:    "-",
-			ts:       memorytopo.NewServer("zone1"),
+			cells:    []string{"zone1"},
 			tmc: &testutil.TabletManagerClient{
 				PopulateReparentJournalResults: map[string]error{
 					"zone1-0000000102": nil,
@@ -915,18 +1032,14 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 						Position: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
 						Error:    nil,
 					},
-					"zone1-0000000102": {
-						Error: nil,
-					},
 				},
 				StopReplicationAndGetStatusResults: map[string]struct {
-					Status     *replicationdatapb.Status
 					StopStatus *replicationdatapb.StopReplicationStatus
 					Error      error
 				}{
 					"zone1-0000000100": {
 						StopStatus: &replicationdatapb.StopReplicationStatus{
-							Before: &replicationdatapb.Status{},
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
 							After: &replicationdatapb.Status{
 								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
 								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
@@ -935,7 +1048,7 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 					},
 					"zone1-0000000101": {
 						StopStatus: &replicationdatapb.StopReplicationStatus{
-							Before: &replicationdatapb.Status{},
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
 							After: &replicationdatapb.Status{
 								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
 								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-20",
@@ -944,7 +1057,7 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 					},
 					"zone1-0000000102": {
 						StopStatus: &replicationdatapb.StopReplicationStatus{
-							Before: &replicationdatapb.Status{},
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
 							After: &replicationdatapb.Status{
 								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
 								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-20",
@@ -1007,7 +1120,8 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 			shouldErr: false,
 		},
 		{
-			name: "cannot promote new primary",
+			name:       "cannot promote new primary",
+			durability: "none",
 			emergencyReparentOps: EmergencyReparentOptions{NewPrimaryAlias: &topodatapb.TabletAlias{
 				Cell: "zone1",
 				Uid:  102,
@@ -1021,25 +1135,16 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 						Error: assert.AnError,
 					},
 				},
-				PrimaryPositionResults: map[string]struct {
-					Position string
-					Error    error
-				}{
-					"zone1-0000000102": {
-						Error: nil,
-					},
-				},
 				PopulateReparentJournalResults: map[string]error{
 					"zone1-0000000102": nil,
 				},
 				StopReplicationAndGetStatusResults: map[string]struct {
-					Status     *replicationdatapb.Status
 					StopStatus *replicationdatapb.StopReplicationStatus
 					Error      error
 				}{
 					"zone1-0000000100": {
 						StopStatus: &replicationdatapb.StopReplicationStatus{
-							Before: &replicationdatapb.Status{},
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
 							After: &replicationdatapb.Status{
 								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
 								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
@@ -1048,7 +1153,7 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 					},
 					"zone1-0000000101": {
 						StopStatus: &replicationdatapb.StopReplicationStatus{
-							Before: &replicationdatapb.Status{},
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
 							After: &replicationdatapb.Status{
 								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
 								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
@@ -1057,7 +1162,7 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 					},
 					"zone1-0000000102": {
 						StopStatus: &replicationdatapb.StopReplicationStatus{
-							Before: &replicationdatapb.Status{},
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
 							After: &replicationdatapb.Status{
 								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
 								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
@@ -1123,12 +1228,13 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 			},
 			keyspace:         "testkeyspace",
 			shard:            "-",
-			ts:               memorytopo.NewServer("zone1"),
+			cells:            []string{"zone1"},
 			shouldErr:        true,
 			errShouldContain: "failed to be upgraded to primary",
 		},
 		{
-			name:                 "constraint failure - promotion-rule",
+			name:                 "promotion-rule - no valid candidates for emergency reparent",
+			durability:           "none",
 			emergencyReparentOps: EmergencyReparentOptions{},
 			tmc: &testutil.TabletManagerClient{
 				PopulateReparentJournalResults: map[string]error{
@@ -1143,26 +1249,17 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 						Error:  nil,
 					},
 				},
-				PrimaryPositionResults: map[string]struct {
-					Position string
-					Error    error
-				}{
-					"zone1-0000000102": {
-						Error: nil,
-					},
-				},
 				SetReplicationSourceResults: map[string]error{
 					"zone1-0000000100": nil,
 					"zone1-0000000101": nil,
 				},
 				StopReplicationAndGetStatusResults: map[string]struct {
-					Status     *replicationdatapb.Status
 					StopStatus *replicationdatapb.StopReplicationStatus
 					Error      error
 				}{
 					"zone1-0000000100": {
 						StopStatus: &replicationdatapb.StopReplicationStatus{
-							Before: &replicationdatapb.Status{},
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
 							After: &replicationdatapb.Status{
 								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
 								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
@@ -1171,7 +1268,7 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 					},
 					"zone1-0000000101": {
 						StopStatus: &replicationdatapb.StopReplicationStatus{
-							Before: &replicationdatapb.Status{},
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
 							After: &replicationdatapb.Status{
 								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
 								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
@@ -1180,7 +1277,7 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 					},
 					"zone1-0000000102": {
 						StopStatus: &replicationdatapb.StopReplicationStatus{
-							Before: &replicationdatapb.Status{},
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
 							After: &replicationdatapb.Status{
 								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
 								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-26",
@@ -1238,12 +1335,125 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 			},
 			keyspace:         "testkeyspace",
 			shard:            "-",
-			ts:               memorytopo.NewServer("zone1"),
+			cells:            []string{"zone1"},
 			shouldErr:        true,
-			errShouldContain: "elected primary does not satisfy promotion rule constraint",
+			errShouldContain: "no valid candidates for emergency reparent",
 		},
 		{
-			name:                 "constraint failure - cross-cell",
+			name:       "proposed primary - must not promotion rule",
+			durability: "none",
+			emergencyReparentOps: EmergencyReparentOptions{
+				NewPrimaryAlias: &topodatapb.TabletAlias{
+					Cell: "zone1",
+					Uid:  102,
+				},
+			},
+			tmc: &testutil.TabletManagerClient{
+				PopulateReparentJournalResults: map[string]error{
+					"zone1-0000000102": nil,
+				},
+				PromoteReplicaResults: map[string]struct {
+					Result string
+					Error  error
+				}{
+					"zone1-0000000102": {
+						Result: "ok",
+						Error:  nil,
+					},
+				},
+				SetReplicationSourceResults: map[string]error{
+					"zone1-0000000100": nil,
+					"zone1-0000000101": nil,
+				},
+				StopReplicationAndGetStatusResults: map[string]struct {
+					StopStatus *replicationdatapb.StopReplicationStatus
+					Error      error
+				}{
+					"zone1-0000000100": {
+						StopStatus: &replicationdatapb.StopReplicationStatus{
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
+							After: &replicationdatapb.Status{
+								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
+								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
+							},
+						},
+					},
+					"zone1-0000000101": {
+						StopStatus: &replicationdatapb.StopReplicationStatus{
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
+							After: &replicationdatapb.Status{
+								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
+								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
+							},
+						},
+					},
+					"zone1-0000000102": {
+						StopStatus: &replicationdatapb.StopReplicationStatus{
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
+							After: &replicationdatapb.Status{
+								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
+								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-26",
+							},
+						},
+					},
+				},
+				WaitForPositionResults: map[string]map[string]error{
+					"zone1-0000000100": {
+						"MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21": nil,
+					},
+					"zone1-0000000101": {
+						"MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21": nil,
+					},
+					"zone1-0000000102": {
+						"MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-26": nil,
+					},
+				},
+			},
+			shards: []*vtctldatapb.Shard{
+				{
+					Keyspace: "testkeyspace",
+					Name:     "-",
+				},
+			},
+			tablets: []*topodatapb.Tablet{
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  100,
+					},
+					Type:     topodatapb.TabletType_RDONLY,
+					Keyspace: "testkeyspace",
+					Shard:    "-",
+				},
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  101,
+					},
+					Type:     topodatapb.TabletType_RDONLY,
+					Keyspace: "testkeyspace",
+					Shard:    "-",
+				},
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  102,
+					},
+					Type:     topodatapb.TabletType_RDONLY,
+					Keyspace: "testkeyspace",
+					Shard:    "-",
+					Hostname: "proposed primary",
+				},
+			},
+			keyspace:         "testkeyspace",
+			shard:            "-",
+			cells:            []string{"zone1"},
+			shouldErr:        true,
+			errShouldContain: "proposed primary zone1-0000000102 has a must not promotion rule",
+		},
+		{
+			name:                 "cross cell - no valid candidates",
+			durability:           "none",
 			emergencyReparentOps: EmergencyReparentOptions{PreventCrossCellPromotion: true},
 			tmc: &testutil.TabletManagerClient{
 				PopulateReparentJournalResults: map[string]error{
@@ -1258,26 +1468,17 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 						Error:  nil,
 					},
 				},
-				PrimaryPositionResults: map[string]struct {
-					Position string
-					Error    error
-				}{
-					"zone1-0000000102": {
-						Error: nil,
-					},
-				},
 				SetReplicationSourceResults: map[string]error{
 					"zone1-0000000100": nil,
 					"zone1-0000000101": nil,
 				},
 				StopReplicationAndGetStatusResults: map[string]struct {
-					Status     *replicationdatapb.Status
 					StopStatus *replicationdatapb.StopReplicationStatus
 					Error      error
 				}{
 					"zone1-0000000100": {
 						StopStatus: &replicationdatapb.StopReplicationStatus{
-							Before: &replicationdatapb.Status{},
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
 							After: &replicationdatapb.Status{
 								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
 								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
@@ -1286,7 +1487,7 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 					},
 					"zone1-0000000101": {
 						StopStatus: &replicationdatapb.StopReplicationStatus{
-							Before: &replicationdatapb.Status{},
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
 							After: &replicationdatapb.Status{
 								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
 								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
@@ -1295,7 +1496,7 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 					},
 					"zone1-0000000102": {
 						StopStatus: &replicationdatapb.StopReplicationStatus{
-							Before: &replicationdatapb.Status{},
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
 							After: &replicationdatapb.Status{
 								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
 								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-26",
@@ -1365,20 +1566,307 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 			},
 			keyspace:         "testkeyspace",
 			shard:            "-",
-			ts:               memorytopo.NewServer("zone1", "zone2"),
+			cells:            []string{"zone1", "zone2"},
 			shouldErr:        true,
-			errShouldContain: "elected primary does not satisfy geographic constraint",
+			errShouldContain: "no valid candidates for emergency reparent",
+		},
+		{
+			name:       "proposed primary in a different cell",
+			durability: "none",
+			emergencyReparentOps: EmergencyReparentOptions{
+				PreventCrossCellPromotion: true,
+				NewPrimaryAlias: &topodatapb.TabletAlias{
+					Cell: "zone1",
+					Uid:  102,
+				},
+			},
+			tmc: &testutil.TabletManagerClient{
+				PopulateReparentJournalResults: map[string]error{
+					"zone1-0000000102": nil,
+				},
+				PromoteReplicaResults: map[string]struct {
+					Result string
+					Error  error
+				}{
+					"zone1-0000000102": {
+						Result: "ok",
+						Error:  nil,
+					},
+				},
+				SetReplicationSourceResults: map[string]error{
+					"zone1-0000000100": nil,
+					"zone1-0000000101": nil,
+				},
+				StopReplicationAndGetStatusResults: map[string]struct {
+					StopStatus *replicationdatapb.StopReplicationStatus
+					Error      error
+				}{
+					"zone1-0000000100": {
+						StopStatus: &replicationdatapb.StopReplicationStatus{
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
+							After: &replicationdatapb.Status{
+								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
+								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
+							},
+						},
+					},
+					"zone1-0000000101": {
+						StopStatus: &replicationdatapb.StopReplicationStatus{
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
+							After: &replicationdatapb.Status{
+								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
+								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
+							},
+						},
+					},
+					"zone1-0000000102": {
+						StopStatus: &replicationdatapb.StopReplicationStatus{
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
+							After: &replicationdatapb.Status{
+								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
+								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-26",
+							},
+						},
+					},
+				},
+				WaitForPositionResults: map[string]map[string]error{
+					"zone1-0000000100": {
+						"MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21": nil,
+					},
+					"zone1-0000000101": {
+						"MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21": nil,
+					},
+					"zone1-0000000102": {
+						"MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-26": nil,
+					},
+				},
+			},
+			shards: []*vtctldatapb.Shard{
+				{
+					Keyspace: "testkeyspace",
+					Name:     "-",
+					Shard: &topodatapb.Shard{
+						PrimaryAlias: &topodatapb.TabletAlias{
+							Cell: "zone2",
+							Uid:  100,
+						},
+					},
+				},
+			},
+			tablets: []*topodatapb.Tablet{
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  100,
+					},
+					Keyspace: "testkeyspace",
+					Shard:    "-",
+				},
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  101,
+					},
+					Keyspace: "testkeyspace",
+					Shard:    "-",
+				},
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  102,
+					},
+					Keyspace: "testkeyspace",
+					Shard:    "-",
+					Hostname: "proposed primary",
+				},
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone2",
+						Uid:  100,
+					},
+					Keyspace: "testkeyspace",
+					Shard:    "-",
+					Hostname: "failed previous primary",
+				},
+			},
+			keyspace:         "testkeyspace",
+			shard:            "-",
+			cells:            []string{"zone1", "zone2"},
+			shouldErr:        true,
+			errShouldContain: "proposed primary zone1-0000000102 is is a different cell as the previous primary",
+		},
+		{
+			name:       "proposed primary cannot make progress",
+			durability: "cross_cell",
+			emergencyReparentOps: EmergencyReparentOptions{
+				NewPrimaryAlias: &topodatapb.TabletAlias{
+					Cell: "zone1",
+					Uid:  102,
+				},
+			},
+			tmc: &testutil.TabletManagerClient{
+				PopulateReparentJournalResults: map[string]error{
+					"zone1-0000000102": nil,
+				},
+				PromoteReplicaResults: map[string]struct {
+					Result string
+					Error  error
+				}{
+					"zone1-0000000102": {
+						Result: "ok",
+						Error:  nil,
+					},
+				},
+				SetReplicationSourceResults: map[string]error{
+					"zone1-0000000100": nil,
+					"zone1-0000000101": nil,
+				},
+				StopReplicationAndGetStatusResults: map[string]struct {
+					StopStatus *replicationdatapb.StopReplicationStatus
+					Error      error
+				}{
+					"zone1-0000000100": {
+						StopStatus: &replicationdatapb.StopReplicationStatus{
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
+							After: &replicationdatapb.Status{
+								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
+								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
+							},
+						},
+					},
+					"zone1-0000000101": {
+						StopStatus: &replicationdatapb.StopReplicationStatus{
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
+							After: &replicationdatapb.Status{
+								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
+								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
+							},
+						},
+					},
+					"zone1-0000000102": {
+						StopStatus: &replicationdatapb.StopReplicationStatus{
+							Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
+							After: &replicationdatapb.Status{
+								SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
+								RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-26",
+							},
+						},
+					},
+				},
+				WaitForPositionResults: map[string]map[string]error{
+					"zone1-0000000100": {
+						"MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21": nil,
+					},
+					"zone1-0000000101": {
+						"MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21": nil,
+					},
+					"zone1-0000000102": {
+						"MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-26": nil,
+					},
+				},
+			},
+			shards: []*vtctldatapb.Shard{
+				{
+					Keyspace: "testkeyspace",
+					Name:     "-",
+					Shard: &topodatapb.Shard{
+						PrimaryAlias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  101,
+						},
+					},
+				},
+			},
+			tablets: []*topodatapb.Tablet{
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  100,
+					},
+					Keyspace: "testkeyspace",
+					Shard:    "-",
+				},
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  101,
+					},
+					Keyspace: "testkeyspace",
+					Shard:    "-",
+				},
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  102,
+					},
+					Keyspace: "testkeyspace",
+					Shard:    "-",
+					Hostname: "proposed primary",
+				},
+			},
+			keyspace:         "testkeyspace",
+			shard:            "-",
+			cells:            []string{"zone1"},
+			shouldErr:        true,
+			errShouldContain: "proposed primary zone1-0000000102 will not be able to make forward progress on being promoted",
+		},
+		{
+			name:       "expected primary mismatch",
+			durability: "none",
+			emergencyReparentOps: EmergencyReparentOptions{
+				ExpectedPrimaryAlias: &topodatapb.TabletAlias{
+					Cell: "zone1",
+					Uid:  101,
+				},
+			},
+			tmc: &testutil.TabletManagerClient{},
+			shards: []*vtctldatapb.Shard{
+				{
+					Keyspace: "testkeyspace",
+					Name:     "-",
+					Shard: &topodatapb.Shard{
+						IsPrimaryServing: true,
+						PrimaryAlias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  100,
+						},
+					},
+				},
+			},
+			tablets: []*topodatapb.Tablet{
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  100,
+					},
+					Type:     topodatapb.TabletType_PRIMARY,
+					Keyspace: "testkeyspace",
+					Shard:    "-",
+				},
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  101,
+					},
+					Type:     topodatapb.TabletType_REPLICA,
+					Keyspace: "testkeyspace",
+					Shard:    "-",
+				},
+			},
+			keyspace:         "testkeyspace",
+			shard:            "-",
+			cells:            []string{"zone1"},
+			shouldErr:        true,
+			errShouldContain: "primary zone1-0000000100 is not equal to expected alias zone1-0000000101",
 		},
 	}
 
-	_ = SetDurabilityPolicy("none")
 	for _, tt := range tests {
-		tt := tt
-
 		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
 
-			ctx := context.Background()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
 			logger := logutil.NewMemoryLogger()
 			ev := &events.Reparent{}
 
@@ -1389,11 +1877,14 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 				tt.tablets[i] = tablet
 			}
 
-			testutil.AddShards(ctx, t, tt.ts, tt.shards...)
-			testutil.AddTablets(ctx, t, tt.ts, nil, tt.tablets...)
+			ts := memorytopo.NewServer(ctx, tt.cells...)
+			defer ts.Close()
+			testutil.AddShards(ctx, t, ts, tt.shards...)
+			testutil.AddTablets(ctx, t, ts, nil, tt.tablets...)
+			reparenttestutil.SetKeyspaceDurability(ctx, t, ts, tt.keyspace, tt.durability)
 
 			if !tt.unlockTopo {
-				lctx, unlock, lerr := tt.ts.LockShard(ctx, tt.keyspace, tt.shard, "test lock")
+				lctx, unlock, lerr := ts.LockShard(ctx, tt.keyspace, tt.shard, "test lock")
 				require.NoError(t, lerr, "could not lock %s/%s for testing", tt.keyspace, tt.shard)
 
 				defer func() {
@@ -1404,12 +1895,12 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 				ctx = lctx // make the reparentShardLocked call use the lock ctx
 			}
 
-			erp := NewEmergencyReparenter(tt.ts, tt.tmc, logger)
+			erp := NewEmergencyReparenter(ts, tt.tmc, logger)
 
 			err := erp.reparentShardLocked(ctx, ev, tt.keyspace, tt.shard, tt.emergencyReparentOps)
 			if tt.shouldErr {
 				assert.Error(t, err)
-				assert.Contains(t, err.Error(), tt.errShouldContain)
+				assert.ErrorContains(t, err, tt.errShouldContain)
 				return
 			}
 
@@ -1418,7 +1909,7 @@ func TestEmergencyReparenter_reparentShardLocked(t *testing.T) {
 	}
 }
 
-func TestEmergencyReparenter_promoteNewPrimary(t *testing.T) {
+func TestEmergencyReparenter_promotionOfNewPrimary(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -1427,7 +1918,6 @@ func TestEmergencyReparenter_promoteNewPrimary(t *testing.T) {
 		tmc                   *testutil.TabletManagerClient
 		unlockTopo            bool
 		newPrimaryTabletAlias string
-		ts                    *topo.Server
 		keyspace              string
 		shard                 string
 		tablets               []*topodatapb.Tablet
@@ -1439,18 +1929,10 @@ func TestEmergencyReparenter_promoteNewPrimary(t *testing.T) {
 	}{
 		{
 			name:                 "success",
-			emergencyReparentOps: EmergencyReparentOptions{IgnoreReplicas: sets.NewString("zone1-0000000404")},
+			emergencyReparentOps: EmergencyReparentOptions{IgnoreReplicas: sets.New[string]("zone1-0000000404")},
 			tmc: &testutil.TabletManagerClient{
 				PopulateReparentJournalResults: map[string]error{
 					"zone1-0000000100": nil,
-				},
-				PrimaryPositionResults: map[string]struct {
-					Position string
-					Error    error
-				}{
-					"zone1-0000000100": {
-						Error: nil,
-					},
 				},
 				PromoteReplicaResults: map[string]struct {
 					Result string
@@ -1507,34 +1989,25 @@ func TestEmergencyReparenter_promoteNewPrimary(t *testing.T) {
 			statusMap: map[string]*replicationdatapb.StopReplicationStatus{
 				"zone1-0000000101": { // forceStart = false
 					Before: &replicationdatapb.Status{
-						IoThreadRunning:  false,
-						SqlThreadRunning: false,
+						IoState:  int32(replication.ReplicationStateStopped),
+						SqlState: int32(replication.ReplicationStateStopped),
 					},
 				},
 				"zone1-0000000102": { // forceStart = true
 					Before: &replicationdatapb.Status{
-						IoThreadRunning:  true,
-						SqlThreadRunning: true,
+						IoState:  int32(replication.ReplicationStateRunning),
+						SqlState: int32(replication.ReplicationStateRunning),
 					},
 				},
 			},
 			keyspace:  "testkeyspace",
 			shard:     "-",
-			ts:        memorytopo.NewServer("zone1"),
 			shouldErr: false,
 		},
 		{
-			name:                 "PrimaryPosition error",
+			name:                 "PromoteReplica error",
 			emergencyReparentOps: EmergencyReparentOptions{},
 			tmc: &testutil.TabletManagerClient{
-				PrimaryPositionResults: map[string]struct {
-					Position string
-					Error    error
-				}{
-					"zone1-0000000100": {
-						Error: fmt.Errorf("primary position error"),
-					},
-				},
 				PromoteReplicaResults: map[string]struct {
 					Result string
 					Error  error
@@ -1566,7 +2039,6 @@ func TestEmergencyReparenter_promoteNewPrimary(t *testing.T) {
 			statusMap:        map[string]*replicationdatapb.StopReplicationStatus{},
 			keyspace:         "testkeyspace",
 			shard:            "-",
-			ts:               memorytopo.NewServer("zone1"),
 			shouldErr:        true,
 			errShouldContain: "primary position error",
 		},
@@ -1577,14 +2049,6 @@ func TestEmergencyReparenter_promoteNewPrimary(t *testing.T) {
 				PopulateReparentJournalResults: map[string]error{
 					"zone1-0000000100": assert.AnError,
 				},
-				PrimaryPositionResults: map[string]struct {
-					Position string
-					Error    error
-				}{
-					"zone1-0000000100": {
-						Error: nil,
-					},
-				},
 				PromoteReplicaResults: map[string]struct {
 					Result string
 					Error  error
@@ -1616,7 +2080,6 @@ func TestEmergencyReparenter_promoteNewPrimary(t *testing.T) {
 			statusMap:        map[string]*replicationdatapb.StopReplicationStatus{},
 			keyspace:         "testkeyspace",
 			shard:            "-",
-			ts:               memorytopo.NewServer("zone1"),
 			shouldErr:        true,
 			errShouldContain: "failed to PopulateReparentJournal on primary",
 		},
@@ -1626,14 +2089,6 @@ func TestEmergencyReparenter_promoteNewPrimary(t *testing.T) {
 			tmc: &testutil.TabletManagerClient{
 				PopulateReparentJournalResults: map[string]error{
 					"zone1-0000000100": nil,
-				},
-				PrimaryPositionResults: map[string]struct {
-					Position string
-					Error    error
-				}{
-					"zone1-0000000100": {
-						Error: nil,
-					},
 				},
 				PromoteReplicaResults: map[string]struct {
 					Result string
@@ -1680,7 +2135,6 @@ func TestEmergencyReparenter_promoteNewPrimary(t *testing.T) {
 			statusMap:        map[string]*replicationdatapb.StopReplicationStatus{},
 			keyspace:         "testkeyspace",
 			shard:            "-",
-			ts:               memorytopo.NewServer("zone1"),
 			shouldErr:        true,
 			errShouldContain: " replica(s) failed",
 		},
@@ -1690,14 +2144,6 @@ func TestEmergencyReparenter_promoteNewPrimary(t *testing.T) {
 			tmc: &testutil.TabletManagerClient{
 				PopulateReparentJournalResults: map[string]error{
 					"zone1-0000000100": nil,
-				},
-				PrimaryPositionResults: map[string]struct {
-					Position string
-					Error    error
-				}{
-					"zone1-0000000100": {
-						Error: nil,
-					},
 				},
 				PromoteReplicaResults: map[string]struct {
 					Result string
@@ -1749,7 +2195,6 @@ func TestEmergencyReparenter_promoteNewPrimary(t *testing.T) {
 			shouldErr:        true,
 			keyspace:         "testkeyspace",
 			shard:            "-",
-			ts:               memorytopo.NewServer("zone1"),
 			errShouldContain: "context deadline exceeded",
 		},
 		{
@@ -1758,14 +2203,6 @@ func TestEmergencyReparenter_promoteNewPrimary(t *testing.T) {
 			tmc: &testutil.TabletManagerClient{
 				PopulateReparentJournalResults: map[string]error{
 					"zone1-0000000100": nil,
-				},
-				PrimaryPositionResults: map[string]struct {
-					Position string
-					Error    error
-				}{
-					"zone1-0000000100": {
-						Error: nil,
-					},
 				},
 				PromoteReplicaResults: map[string]struct {
 					Result string
@@ -1811,23 +2248,14 @@ func TestEmergencyReparenter_promoteNewPrimary(t *testing.T) {
 			statusMap: map[string]*replicationdatapb.StopReplicationStatus{},
 			keyspace:  "testkeyspace",
 			shard:     "-",
-			ts:        memorytopo.NewServer("zone1"),
 			shouldErr: false,
 		},
 		{
 			name:                 "success in initialization",
-			emergencyReparentOps: EmergencyReparentOptions{IgnoreReplicas: sets.NewString("zone1-0000000404")},
+			emergencyReparentOps: EmergencyReparentOptions{IgnoreReplicas: sets.New[string]("zone1-0000000404")},
 			tmc: &testutil.TabletManagerClient{
 				PopulateReparentJournalResults: map[string]error{
 					"zone1-0000000100": nil,
-				},
-				PrimaryPositionResults: map[string]struct {
-					Position string
-					Error    error
-				}{
-					"zone1-0000000100": {
-						Error: nil,
-					},
 				},
 				InitPrimaryResults: map[string]struct {
 					Result string
@@ -1885,31 +2313,30 @@ func TestEmergencyReparenter_promoteNewPrimary(t *testing.T) {
 			statusMap: map[string]*replicationdatapb.StopReplicationStatus{
 				"zone1-0000000101": { // forceStart = false
 					Before: &replicationdatapb.Status{
-						IoThreadRunning:  false,
-						SqlThreadRunning: false,
+						IoState:  int32(replication.ReplicationStateStopped),
+						SqlState: int32(replication.ReplicationStateStopped),
 					},
 				},
 				"zone1-0000000102": { // forceStart = true
 					Before: &replicationdatapb.Status{
-						IoThreadRunning:  true,
-						SqlThreadRunning: true,
+						IoState:  int32(replication.ReplicationStateRunning),
+						SqlState: int32(replication.ReplicationStateRunning),
 					},
 				},
 			},
 			keyspace:  "testkeyspace",
 			shard:     "-",
-			ts:        memorytopo.NewServer("zone1"),
 			shouldErr: false,
 		},
 	}
 
+	durability, _ := GetDurabilityPolicy("none")
 	for _, tt := range tests {
-		tt := tt
-
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			ctx := context.Background()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 			logger := logutil.NewMemoryLogger()
 			ev := &events.Reparent{ShardInfo: topo.ShardInfo{
 				Shard: &topodatapb.Shard{
@@ -1923,7 +2350,10 @@ func TestEmergencyReparenter_promoteNewPrimary(t *testing.T) {
 				ev.ShardInfo.PrimaryAlias = nil
 			}
 
-			testutil.AddShards(ctx, t, tt.ts, &vtctldatapb.Shard{
+			ts := memorytopo.NewServer(ctx, "zone1")
+			defer ts.Close()
+
+			testutil.AddShards(ctx, t, ts, &vtctldatapb.Shard{
 				Keyspace: tt.keyspace,
 				Name:     tt.shard,
 			})
@@ -1934,7 +2364,7 @@ func TestEmergencyReparenter_promoteNewPrimary(t *testing.T) {
 					lerr   error
 				)
 
-				ctx, unlock, lerr = tt.ts.LockShard(ctx, tt.keyspace, tt.shard, "test lock")
+				ctx, unlock, lerr = ts.LockShard(ctx, tt.keyspace, tt.shard, "test lock")
 				require.NoError(t, lerr, "could not lock %s/%s for test", tt.keyspace, tt.shard)
 
 				defer func() {
@@ -1944,8 +2374,10 @@ func TestEmergencyReparenter_promoteNewPrimary(t *testing.T) {
 			}
 			tabletInfo := tt.tabletMap[tt.newPrimaryTabletAlias]
 
-			erp := NewEmergencyReparenter(tt.ts, tt.tmc, logger)
-			err := erp.promoteNewPrimary(ctx, ev, tabletInfo.Tablet, tt.emergencyReparentOps, tt.tabletMap, tt.statusMap)
+			tt.emergencyReparentOps.durability = durability
+
+			erp := NewEmergencyReparenter(ts, tt.tmc, logger)
+			_, err := erp.reparentReplicas(ctx, ev, tabletInfo.Tablet, tt.tabletMap, tt.statusMap, tt.emergencyReparentOps, false)
 			if tt.shouldErr {
 				assert.Error(t, err)
 				assert.Contains(t, err.Error(), tt.errShouldContain)
@@ -1966,7 +2398,7 @@ func TestEmergencyReparenter_waitForAllRelayLogsToApply(t *testing.T) {
 	tests := []struct {
 		name       string
 		tmc        *testutil.TabletManagerClient
-		candidates map[string]mysql.Position
+		candidates map[string]replication.Position
 		tabletMap  map[string]*topo.TabletInfo
 		statusMap  map[string]*replicationdatapb.StopReplicationStatus
 		shouldErr  bool
@@ -1983,7 +2415,7 @@ func TestEmergencyReparenter_waitForAllRelayLogsToApply(t *testing.T) {
 					},
 				},
 			},
-			candidates: map[string]mysql.Position{
+			candidates: map[string]replication.Position{
 				"zone1-0000000100": {},
 				"zone1-0000000101": {},
 			},
@@ -2031,7 +2463,7 @@ func TestEmergencyReparenter_waitForAllRelayLogsToApply(t *testing.T) {
 					},
 				},
 			},
-			candidates: map[string]mysql.Position{
+			candidates: map[string]replication.Position{
 				"zone1-0000000100": {},
 				"zone1-0000000101": {},
 			},
@@ -2082,7 +2514,7 @@ func TestEmergencyReparenter_waitForAllRelayLogsToApply(t *testing.T) {
 					},
 				},
 			},
-			candidates: map[string]mysql.Position{
+			candidates: map[string]replication.Position{
 				"zone1-0000000100": {},
 				"zone1-0000000101": {},
 				"zone1-0000000102": {},
@@ -2147,7 +2579,7 @@ func TestEmergencyReparenter_waitForAllRelayLogsToApply(t *testing.T) {
 					},
 				},
 			},
-			candidates: map[string]mysql.Position{
+			candidates: map[string]replication.Position{
 				"zone1-0000000100": {},
 				"zone1-0000000101": {},
 			},
@@ -2186,8 +2618,6 @@ func TestEmergencyReparenter_waitForAllRelayLogsToApply(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
-
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -2203,11 +2633,9 @@ func TestEmergencyReparenter_waitForAllRelayLogsToApply(t *testing.T) {
 	}
 }
 
-func TestEmergencyReparenterCounters(t *testing.T) {
-	ersCounter.Set(0)
-	ersSuccessCounter.Set(0)
-	ersFailureCounter.Set(0)
-	_ = SetDurabilityPolicy("none")
+func TestEmergencyReparenterStats(t *testing.T) {
+	ersCounter.ResetAll()
+	reparentShardOpTimings.Reset()
 
 	emergencyReparentOps := EmergencyReparentOptions{}
 	tmc := &testutil.TabletManagerClient{
@@ -2223,26 +2651,17 @@ func TestEmergencyReparenterCounters(t *testing.T) {
 				Error:  nil,
 			},
 		},
-		PrimaryPositionResults: map[string]struct {
-			Position string
-			Error    error
-		}{
-			"zone1-0000000102": {
-				Error: nil,
-			},
-		},
 		SetReplicationSourceResults: map[string]error{
 			"zone1-0000000100": nil,
 			"zone1-0000000101": nil,
 		},
 		StopReplicationAndGetStatusResults: map[string]struct {
-			Status     *replicationdatapb.Status
 			StopStatus *replicationdatapb.StopReplicationStatus
 			Error      error
 		}{
 			"zone1-0000000100": {
 				StopStatus: &replicationdatapb.StopReplicationStatus{
-					Before: &replicationdatapb.Status{},
+					Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
 					After: &replicationdatapb.Status{
 						SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
 						RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
@@ -2251,7 +2670,7 @@ func TestEmergencyReparenterCounters(t *testing.T) {
 			},
 			"zone1-0000000101": {
 				StopStatus: &replicationdatapb.StopReplicationStatus{
-					Before: &replicationdatapb.Status{},
+					Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
 					After: &replicationdatapb.Status{
 						SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
 						RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-21",
@@ -2260,7 +2679,7 @@ func TestEmergencyReparenterCounters(t *testing.T) {
 			},
 			"zone1-0000000102": {
 				StopStatus: &replicationdatapb.StopReplicationStatus{
-					Before: &replicationdatapb.Status{},
+					Before: &replicationdatapb.Status{IoState: int32(replication.ReplicationStateRunning), SqlState: int32(replication.ReplicationStateRunning)},
 					After: &replicationdatapb.Status{
 						SourceUuid:       "3E11FA47-71CA-11E1-9E33-C80AA9429562",
 						RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-26",
@@ -2318,11 +2737,12 @@ func TestEmergencyReparenterCounters(t *testing.T) {
 	}
 	keyspace := "testkeyspace"
 	shard := "-"
-	ts := memorytopo.NewServer("zone1")
 
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	logger := logutil.NewMemoryLogger()
 
+	ts := memorytopo.NewServer(ctx, "zone1")
 	testutil.AddShards(ctx, t, ts, shards...)
 	testutil.AddTablets(ctx, t, ts, &testutil.AddTabletOptions{
 		AlsoSetShardPrimary: true,
@@ -2336,9 +2756,8 @@ func TestEmergencyReparenterCounters(t *testing.T) {
 	require.NoError(t, err)
 
 	// check the counter values
-	require.EqualValues(t, 1, ersCounter.Get())
-	require.EqualValues(t, 1, ersSuccessCounter.Get())
-	require.EqualValues(t, 0, ersFailureCounter.Get())
+	require.EqualValues(t, map[string]int64{"testkeyspace.-.success": 1}, ersCounter.Counts())
+	require.EqualValues(t, map[string]int64{"All": 1, "EmergencyReparentShard": 1}, reparentShardOpTimings.Counts())
 
 	// set emergencyReparentOps to request a non existent tablet
 	emergencyReparentOps.NewPrimaryAlias = &topodatapb.TabletAlias{
@@ -2351,46 +2770,45 @@ func TestEmergencyReparenterCounters(t *testing.T) {
 	require.Error(t, err)
 
 	// check the counter values
-	require.EqualValues(t, 2, ersCounter.Get())
-	require.EqualValues(t, 1, ersSuccessCounter.Get())
-	require.EqualValues(t, 1, ersFailureCounter.Get())
+	require.EqualValues(t, map[string]int64{"testkeyspace.-.success": 1, "testkeyspace.-.failure": 1}, ersCounter.Counts())
+	require.EqualValues(t, map[string]int64{"All": 2, "EmergencyReparentShard": 2}, reparentShardOpTimings.Counts())
 }
 
 func TestEmergencyReparenter_findMostAdvanced(t *testing.T) {
-	sid1 := mysql.SID{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
-	mysqlGTID1 := mysql.Mysql56GTID{
+	sid1 := replication.SID{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+	mysqlGTID1 := replication.Mysql56GTID{
 		Server:   sid1,
 		Sequence: 9,
 	}
-	mysqlGTID2 := mysql.Mysql56GTID{
+	mysqlGTID2 := replication.Mysql56GTID{
 		Server:   sid1,
 		Sequence: 10,
 	}
-	mysqlGTID3 := mysql.Mysql56GTID{
+	mysqlGTID3 := replication.Mysql56GTID{
 		Server:   sid1,
 		Sequence: 11,
 	}
 
-	positionMostAdvanced := mysql.Position{GTIDSet: mysql.Mysql56GTIDSet{}}
+	positionMostAdvanced := replication.Position{GTIDSet: replication.Mysql56GTIDSet{}}
 	positionMostAdvanced.GTIDSet = positionMostAdvanced.GTIDSet.AddGTID(mysqlGTID1)
 	positionMostAdvanced.GTIDSet = positionMostAdvanced.GTIDSet.AddGTID(mysqlGTID2)
 	positionMostAdvanced.GTIDSet = positionMostAdvanced.GTIDSet.AddGTID(mysqlGTID3)
 
-	positionIntermediate1 := mysql.Position{GTIDSet: mysql.Mysql56GTIDSet{}}
+	positionIntermediate1 := replication.Position{GTIDSet: replication.Mysql56GTIDSet{}}
 	positionIntermediate1.GTIDSet = positionIntermediate1.GTIDSet.AddGTID(mysqlGTID1)
 
-	positionIntermediate2 := mysql.Position{GTIDSet: mysql.Mysql56GTIDSet{}}
+	positionIntermediate2 := replication.Position{GTIDSet: replication.Mysql56GTIDSet{}}
 	positionIntermediate2.GTIDSet = positionIntermediate2.GTIDSet.AddGTID(mysqlGTID1)
 	positionIntermediate2.GTIDSet = positionIntermediate2.GTIDSet.AddGTID(mysqlGTID2)
 
-	positionOnly2 := mysql.Position{GTIDSet: mysql.Mysql56GTIDSet{}}
+	positionOnly2 := replication.Position{GTIDSet: replication.Mysql56GTIDSet{}}
 	positionOnly2.GTIDSet = positionOnly2.GTIDSet.AddGTID(mysqlGTID2)
 
-	positionEmpty := mysql.Position{GTIDSet: mysql.Mysql56GTIDSet{}}
+	positionEmpty := replication.Position{GTIDSet: replication.Mysql56GTIDSet{}}
 
 	tests := []struct {
 		name                 string
-		validCandidates      map[string]mysql.Position
+		validCandidates      map[string]replication.Position
 		tabletMap            map[string]*topo.TabletInfo
 		emergencyReparentOps EmergencyReparentOptions
 		result               *topodatapb.Tablet
@@ -2398,7 +2816,7 @@ func TestEmergencyReparenter_findMostAdvanced(t *testing.T) {
 	}{
 		{
 			name: "choose most advanced",
-			validCandidates: map[string]mysql.Position{
+			validCandidates: map[string]replication.Position{
 				"zone1-0000000100": positionMostAdvanced,
 				"zone1-0000000101": positionIntermediate1,
 				"zone1-0000000102": positionIntermediate2,
@@ -2446,7 +2864,7 @@ func TestEmergencyReparenter_findMostAdvanced(t *testing.T) {
 			},
 		}, {
 			name: "choose most advanced with the best promotion rule",
-			validCandidates: map[string]mysql.Position{
+			validCandidates: map[string]replication.Position{
 				"zone1-0000000100": positionMostAdvanced,
 				"zone1-0000000101": positionIntermediate1,
 				"zone1-0000000102": positionMostAdvanced,
@@ -2500,7 +2918,7 @@ func TestEmergencyReparenter_findMostAdvanced(t *testing.T) {
 				Cell: "zone1",
 				Uid:  102,
 			}},
-			validCandidates: map[string]mysql.Position{
+			validCandidates: map[string]replication.Position{
 				"zone1-0000000100": positionMostAdvanced,
 				"zone1-0000000101": positionIntermediate1,
 				"zone1-0000000102": positionMostAdvanced,
@@ -2554,7 +2972,7 @@ func TestEmergencyReparenter_findMostAdvanced(t *testing.T) {
 				Cell: "zone1",
 				Uid:  102,
 			}},
-			validCandidates: map[string]mysql.Position{
+			validCandidates: map[string]replication.Position{
 				"zone1-0000000100": positionOnly2,
 				"zone1-0000000101": positionIntermediate1,
 				"zone1-0000000102": positionEmpty,
@@ -2600,12 +3018,13 @@ func TestEmergencyReparenter_findMostAdvanced(t *testing.T) {
 		},
 	}
 
-	_ = SetDurabilityPolicy("none")
+	durability, _ := GetDurabilityPolicy("none")
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			erp := NewEmergencyReparenter(nil, nil, logutil.NewMemoryLogger())
 
+			test.emergencyReparentOps.durability = durability
 			winningTablet, _, err := erp.findMostAdvanced(test.validCandidates, test.tabletMap, test.emergencyReparentOps)
 			if test.err != "" {
 				assert.Error(t, err)
@@ -2618,104 +3037,13 @@ func TestEmergencyReparenter_findMostAdvanced(t *testing.T) {
 	}
 }
 
-func TestEmergencyReparenter_checkIfConstraintsSatisfied(t *testing.T) {
-	testcases := []struct {
-		name                    string
-		newPrimary, prevPrimary *topodatapb.Tablet
-		opts                    EmergencyReparentOptions
-		err                     string
-	}{
-		{
-			name: "no constraint failure",
-			newPrimary: &topodatapb.Tablet{
-				Alias: &topodatapb.TabletAlias{
-					Cell: "cell1",
-				},
-				Type: topodatapb.TabletType_REPLICA,
-			},
-			prevPrimary: &topodatapb.Tablet{
-				Alias: &topodatapb.TabletAlias{
-					Cell: "cell1",
-				},
-			},
-			opts: EmergencyReparentOptions{PreventCrossCellPromotion: true},
-			err:  "",
-		}, {
-			name: "promotion rule constraint failure",
-			newPrimary: &topodatapb.Tablet{
-				Alias: &topodatapb.TabletAlias{
-					Cell: "cell1",
-					Uid:  100,
-				},
-				Type: topodatapb.TabletType_RDONLY,
-			},
-			prevPrimary: &topodatapb.Tablet{
-				Alias: &topodatapb.TabletAlias{
-					Cell: "cell1",
-				},
-			},
-			opts: EmergencyReparentOptions{PreventCrossCellPromotion: true},
-			err:  "elected primary does not satisfy promotion rule constraint - cell1-0000000100",
-		}, {
-			name: "cross cell constraint failure",
-			newPrimary: &topodatapb.Tablet{
-				Alias: &topodatapb.TabletAlias{
-					Cell: "cell1",
-					Uid:  100,
-				},
-				Type: topodatapb.TabletType_REPLICA,
-			},
-			prevPrimary: &topodatapb.Tablet{
-				Alias: &topodatapb.TabletAlias{
-					Cell: "cell2",
-				},
-			},
-			opts: EmergencyReparentOptions{PreventCrossCellPromotion: true},
-			err:  "elected primary does not satisfy geographic constraint - cell1-0000000100",
-		}, {
-			name: "cross cell but no constraint failure",
-			newPrimary: &topodatapb.Tablet{
-				Alias: &topodatapb.TabletAlias{
-					Cell: "cell1",
-					Uid:  100,
-				},
-				Type: topodatapb.TabletType_REPLICA,
-			},
-			prevPrimary: &topodatapb.Tablet{
-				Alias: &topodatapb.TabletAlias{
-					Cell: "cell2",
-				},
-			},
-			opts: EmergencyReparentOptions{PreventCrossCellPromotion: false},
-			err:  "",
-		},
-	}
-
-	_ = SetDurabilityPolicy("none")
-	erp := NewEmergencyReparenter(nil, nil, nil)
-
-	for _, testcase := range testcases {
-		t.Run(testcase.name, func(t *testing.T) {
-			err := erp.checkIfConstraintsSatisfied(testcase.newPrimary, testcase.prevPrimary, testcase.opts)
-			if testcase.err == "" {
-				require.NoError(t, err)
-			} else {
-				require.EqualError(t, err, testcase.err)
-			}
-		})
-	}
-}
-
 func TestEmergencyReparenter_reparentReplicas(t *testing.T) {
-	t.Parallel()
-
 	tests := []struct {
 		name                  string
 		emergencyReparentOps  EmergencyReparentOptions
 		tmc                   *testutil.TabletManagerClient
 		unlockTopo            bool
 		newPrimaryTabletAlias string
-		ts                    *topo.Server
 		keyspace              string
 		shard                 string
 		tablets               []*topodatapb.Tablet
@@ -2723,17 +3051,18 @@ func TestEmergencyReparenter_reparentReplicas(t *testing.T) {
 		statusMap             map[string]*replicationdatapb.StopReplicationStatus
 		shouldErr             bool
 		errShouldContain      string
+		remoteOpTimeout       time.Duration
 	}{
 		{
 			name:                 "success",
-			emergencyReparentOps: EmergencyReparentOptions{IgnoreReplicas: sets.NewString("zone1-0000000404")},
+			emergencyReparentOps: EmergencyReparentOptions{IgnoreReplicas: sets.New[string]("zone1-0000000404")},
 			tmc: &testutil.TabletManagerClient{
 				PopulateReparentJournalResults: map[string]error{
 					"zone1-0000000100": nil,
 				},
-				PrimaryPositionResults: map[string]struct {
-					Position string
-					Error    error
+				PromoteReplicaResults: map[string]struct {
+					Result string
+					Error  error
 				}{
 					"zone1-0000000100": {
 						Error: nil,
@@ -2786,29 +3115,28 @@ func TestEmergencyReparenter_reparentReplicas(t *testing.T) {
 			statusMap: map[string]*replicationdatapb.StopReplicationStatus{
 				"zone1-0000000101": { // forceStart = false
 					Before: &replicationdatapb.Status{
-						IoThreadRunning:  false,
-						SqlThreadRunning: false,
+						IoState:  int32(replication.ReplicationStateStopped),
+						SqlState: int32(replication.ReplicationStateStopped),
 					},
 				},
 				"zone1-0000000102": { // forceStart = true
 					Before: &replicationdatapb.Status{
-						IoThreadRunning:  true,
-						SqlThreadRunning: true,
+						IoState:  int32(replication.ReplicationStateRunning),
+						SqlState: int32(replication.ReplicationStateRunning),
 					},
 				},
 			},
 			keyspace:  "testkeyspace",
 			shard:     "-",
-			ts:        memorytopo.NewServer("zone1"),
 			shouldErr: false,
 		},
 		{
-			name:                 "PrimaryPosition error",
+			name:                 "PromoteReplica error",
 			emergencyReparentOps: EmergencyReparentOptions{},
 			tmc: &testutil.TabletManagerClient{
-				PrimaryPositionResults: map[string]struct {
-					Position string
-					Error    error
+				PromoteReplicaResults: map[string]struct {
+					Result string
+					Error  error
 				}{
 					"zone1-0000000100": {
 						Error: fmt.Errorf("primary position error"),
@@ -2837,7 +3165,6 @@ func TestEmergencyReparenter_reparentReplicas(t *testing.T) {
 			statusMap:        map[string]*replicationdatapb.StopReplicationStatus{},
 			keyspace:         "testkeyspace",
 			shard:            "-",
-			ts:               memorytopo.NewServer("zone1"),
 			shouldErr:        true,
 			errShouldContain: "primary position error",
 		},
@@ -2848,9 +3175,9 @@ func TestEmergencyReparenter_reparentReplicas(t *testing.T) {
 				PopulateReparentJournalResults: map[string]error{
 					"zone1-0000000100": assert.AnError,
 				},
-				PrimaryPositionResults: map[string]struct {
-					Position string
-					Error    error
+				PromoteReplicaResults: map[string]struct {
+					Result string
+					Error  error
 				}{
 					"zone1-0000000100": {
 						Error: nil,
@@ -2879,7 +3206,6 @@ func TestEmergencyReparenter_reparentReplicas(t *testing.T) {
 			statusMap:        map[string]*replicationdatapb.StopReplicationStatus{},
 			keyspace:         "testkeyspace",
 			shard:            "-",
-			ts:               memorytopo.NewServer("zone1"),
 			shouldErr:        true,
 			errShouldContain: "failed to PopulateReparentJournal on primary",
 		},
@@ -2890,9 +3216,9 @@ func TestEmergencyReparenter_reparentReplicas(t *testing.T) {
 				PopulateReparentJournalResults: map[string]error{
 					"zone1-0000000100": nil,
 				},
-				PrimaryPositionResults: map[string]struct {
-					Position string
-					Error    error
+				PromoteReplicaResults: map[string]struct {
+					Result string
+					Error  error
 				}{
 					"zone1-0000000100": {
 						Error: nil,
@@ -2935,7 +3261,6 @@ func TestEmergencyReparenter_reparentReplicas(t *testing.T) {
 			statusMap:        map[string]*replicationdatapb.StopReplicationStatus{},
 			keyspace:         "testkeyspace",
 			shard:            "-",
-			ts:               memorytopo.NewServer("zone1"),
 			shouldErr:        true,
 			errShouldContain: " replica(s) failed",
 		},
@@ -2946,9 +3271,9 @@ func TestEmergencyReparenter_reparentReplicas(t *testing.T) {
 				PopulateReparentJournalResults: map[string]error{
 					"zone1-0000000100": nil,
 				},
-				PrimaryPositionResults: map[string]struct {
-					Position string
-					Error    error
+				PromoteReplicaResults: map[string]struct {
+					Result string
+					Error  error
 				}{
 					"zone1-0000000100": {
 						Error: nil,
@@ -2995,7 +3320,6 @@ func TestEmergencyReparenter_reparentReplicas(t *testing.T) {
 			shouldErr:        true,
 			keyspace:         "testkeyspace",
 			shard:            "-",
-			ts:               memorytopo.NewServer("zone1"),
 			errShouldContain: "context deadline exceeded",
 		},
 		{
@@ -3005,9 +3329,9 @@ func TestEmergencyReparenter_reparentReplicas(t *testing.T) {
 				PopulateReparentJournalResults: map[string]error{
 					"zone1-0000000100": nil,
 				},
-				PrimaryPositionResults: map[string]struct {
-					Position string
-					Error    error
+				PromoteReplicaResults: map[string]struct {
+					Result string
+					Error  error
 				}{
 					"zone1-0000000100": {
 						Error: nil,
@@ -3048,22 +3372,162 @@ func TestEmergencyReparenter_reparentReplicas(t *testing.T) {
 			statusMap: map[string]*replicationdatapb.StopReplicationStatus{},
 			keyspace:  "testkeyspace",
 			shard:     "-",
-			ts:        memorytopo.NewServer("zone1"),
 			shouldErr: false,
+		}, {
+			name:                 "single replica failing to SetReplicationSource does not fail the promotion",
+			emergencyReparentOps: EmergencyReparentOptions{},
+			tmc: &testutil.TabletManagerClient{
+				PopulateReparentJournalResults: map[string]error{
+					"zone1-0000000100": nil,
+				},
+				PromoteReplicaResults: map[string]struct {
+					Result string
+					Error  error
+				}{
+					"zone1-0000000100": {
+						Error: nil,
+					},
+				},
+				SetReplicationSourceResults: map[string]error{
+					"zone1-0000000101": assert.AnError,
+				},
+			},
+			newPrimaryTabletAlias: "zone1-0000000100",
+			tabletMap: map[string]*topo.TabletInfo{
+				"zone1-0000000100": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  100,
+						},
+					},
+				},
+				"zone1-0000000101": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  101,
+						},
+					},
+				},
+			},
+			statusMap: map[string]*replicationdatapb.StopReplicationStatus{},
+			keyspace:  "testkeyspace",
+			shard:     "-",
+			shouldErr: false,
+		},
+		{
+			name:                 "primary promotion gets infinitely stuck",
+			emergencyReparentOps: EmergencyReparentOptions{},
+			tmc: &testutil.TabletManagerClient{
+				PopulateReparentJournalResults: map[string]error{
+					"zone1-0000000100": nil,
+				},
+				PromoteReplicaResults: map[string]struct {
+					Result string
+					Error  error
+				}{
+					"zone1-0000000100": {
+						Error: nil,
+					},
+				},
+				PromoteReplicaDelays: map[string]time.Duration{
+					"zone1-0000000100": 500 * time.Hour,
+				},
+				SetReplicationSourceResults: map[string]error{
+					"zone1-0000000101": nil,
+					"zone1-0000000102": nil,
+				},
+			},
+			remoteOpTimeout:       100 * time.Millisecond,
+			newPrimaryTabletAlias: "zone1-0000000100",
+			tabletMap: map[string]*topo.TabletInfo{
+				"zone1-0000000100": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  100,
+						},
+						Hostname: "primary-elect",
+					},
+				},
+				"zone1-0000000101": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  101,
+						},
+					},
+				},
+				"zone1-0000000102": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  102,
+						},
+						Hostname: "requires force start",
+					},
+				},
+				"zone1-0000000404": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  404,
+						},
+						Hostname: "ignored tablet",
+					},
+				},
+			},
+			statusMap: map[string]*replicationdatapb.StopReplicationStatus{
+				"zone1-0000000101": { // forceStart = false
+					Before: &replicationdatapb.Status{
+						IoState:  int32(replication.ReplicationStateStopped),
+						SqlState: int32(replication.ReplicationStateStopped),
+					},
+				},
+				"zone1-0000000102": { // forceStart = true
+					Before: &replicationdatapb.Status{
+						IoState:  int32(replication.ReplicationStateRunning),
+						SqlState: int32(replication.ReplicationStateRunning),
+					},
+				},
+			},
+			keyspace:         "testkeyspace",
+			shard:            "-",
+			shouldErr:        true,
+			errShouldContain: "failed to promote zone1-0000000100 to primary: primary-elect tablet zone1-0000000100 failed to be upgraded to primary: context deadline exceeded",
 		},
 	}
 
+	durability, _ := GetDurabilityPolicy("none")
 	for _, tt := range tests {
-		tt := tt
-
 		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
+			if tt.remoteOpTimeout != 0 {
+				oldTimeout := topo.RemoteOperationTimeout
+				topo.RemoteOperationTimeout = tt.remoteOpTimeout
+				defer func() {
+					topo.RemoteOperationTimeout = oldTimeout
+				}()
+			}
 
-			ctx := context.Background()
 			logger := logutil.NewMemoryLogger()
-			ev := &events.Reparent{}
+			ev := &events.Reparent{
+				ShardInfo: topo.ShardInfo{
+					Shard: &topodatapb.Shard{
+						PrimaryAlias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  000,
+						},
+					},
+				},
+			}
 
-			testutil.AddShards(ctx, t, tt.ts, &vtctldatapb.Shard{
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ts := memorytopo.NewServer(ctx, "zone1")
+			defer ts.Close()
+
+			testutil.AddShards(ctx, t, ts, &vtctldatapb.Shard{
 				Keyspace: tt.keyspace,
 				Name:     tt.shard,
 			})
@@ -3074,7 +3538,7 @@ func TestEmergencyReparenter_reparentReplicas(t *testing.T) {
 					lerr   error
 				)
 
-				ctx, unlock, lerr = tt.ts.LockShard(ctx, tt.keyspace, tt.shard, "test lock")
+				ctx, unlock, lerr = ts.LockShard(ctx, tt.keyspace, tt.shard, "test lock")
 				require.NoError(t, lerr, "could not lock %s/%s for test", tt.keyspace, tt.shard)
 
 				defer func() {
@@ -3084,8 +3548,10 @@ func TestEmergencyReparenter_reparentReplicas(t *testing.T) {
 			}
 			tabletInfo := tt.tabletMap[tt.newPrimaryTabletAlias]
 
-			erp := NewEmergencyReparenter(tt.ts, tt.tmc, logger)
-			_, err := erp.reparentReplicas(ctx, ev, tabletInfo.Tablet, tt.tabletMap, tt.statusMap, tt.emergencyReparentOps, false /* waitForAllReplicas */, true /* populateReparentJournal */)
+			tt.emergencyReparentOps.durability = durability
+
+			erp := NewEmergencyReparenter(ts, tt.tmc, logger)
+			_, err := erp.reparentReplicas(ctx, ev, tabletInfo.Tablet, tt.tabletMap, tt.statusMap, tt.emergencyReparentOps, false /* intermediateReparent */)
 			if tt.shouldErr {
 				assert.Error(t, err)
 				assert.Contains(t, err.Error(), tt.errShouldContain)
@@ -3101,35 +3567,27 @@ func TestEmergencyReparenter_promoteIntermediateSource(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name                 string
-		emergencyReparentOps EmergencyReparentOptions
-		tmc                  *testutil.TabletManagerClient
-		unlockTopo           bool
-		newSourceTabletAlias string
-		ts                   *topo.Server
-		keyspace             string
-		shard                string
-		tablets              []*topodatapb.Tablet
-		tabletMap            map[string]*topo.TabletInfo
-		statusMap            map[string]*replicationdatapb.StopReplicationStatus
-		shouldErr            bool
-		errShouldContain     string
-		result               []*topodatapb.Tablet
+		name                  string
+		emergencyReparentOps  EmergencyReparentOptions
+		tmc                   *testutil.TabletManagerClient
+		unlockTopo            bool
+		newSourceTabletAlias  string
+		keyspace              string
+		shard                 string
+		tablets               []*topodatapb.Tablet
+		validCandidateTablets []*topodatapb.Tablet
+		tabletMap             map[string]*topo.TabletInfo
+		statusMap             map[string]*replicationdatapb.StopReplicationStatus
+		shouldErr             bool
+		errShouldContain      string
+		result                []*topodatapb.Tablet
 	}{
 		{
 			name:                 "success",
-			emergencyReparentOps: EmergencyReparentOptions{IgnoreReplicas: sets.NewString("zone1-0000000404")},
+			emergencyReparentOps: EmergencyReparentOptions{IgnoreReplicas: sets.New[string]("zone1-0000000404")},
 			tmc: &testutil.TabletManagerClient{
 				PopulateReparentJournalResults: map[string]error{
 					"zone1-0000000100": nil,
-				},
-				PrimaryPositionResults: map[string]struct {
-					Position string
-					Error    error
-				}{
-					"zone1-0000000100": {
-						Error: nil,
-					},
 				},
 				SetReplicationSourceResults: map[string]error{
 					"zone1-0000000101": nil,
@@ -3178,20 +3636,19 @@ func TestEmergencyReparenter_promoteIntermediateSource(t *testing.T) {
 			statusMap: map[string]*replicationdatapb.StopReplicationStatus{
 				"zone1-0000000101": { // forceStart = false
 					Before: &replicationdatapb.Status{
-						IoThreadRunning:  false,
-						SqlThreadRunning: false,
+						IoState:  int32(replication.ReplicationStateStopped),
+						SqlState: int32(replication.ReplicationStateStopped),
 					},
 				},
 				"zone1-0000000102": { // forceStart = true
 					Before: &replicationdatapb.Status{
-						IoThreadRunning:  true,
-						SqlThreadRunning: true,
+						IoState:  int32(replication.ReplicationStateRunning),
+						SqlState: int32(replication.ReplicationStateRunning),
 					},
 				},
 			},
 			keyspace:  "testkeyspace",
 			shard:     "-",
-			ts:        memorytopo.NewServer("zone1"),
 			shouldErr: false,
 			result: []*topodatapb.Tablet{
 				{
@@ -3214,6 +3671,189 @@ func TestEmergencyReparenter_promoteIntermediateSource(t *testing.T) {
 					Hostname: "requires force start",
 				},
 			},
+			validCandidateTablets: []*topodatapb.Tablet{
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  100,
+					},
+					Hostname: "primary-elect",
+				}, {
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  101,
+					},
+				},
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  102,
+					},
+					Hostname: "requires force start",
+				},
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  404,
+					},
+				},
+			},
+		},
+		{
+			name:                 "success - filter with valid tablets before",
+			emergencyReparentOps: EmergencyReparentOptions{},
+			tmc: &testutil.TabletManagerClient{
+				PopulateReparentJournalResults: map[string]error{
+					"zone1-0000000100": nil,
+				},
+				SetReplicationSourceResults: map[string]error{
+					"zone1-0000000101": nil,
+				},
+			},
+			newSourceTabletAlias: "zone1-0000000100",
+			tabletMap: map[string]*topo.TabletInfo{
+				"zone1-0000000100": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  100,
+						},
+						Hostname: "primary-elect",
+					},
+				},
+				"zone1-0000000101": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  101,
+						},
+					},
+				},
+				"zone1-0000000102": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  102,
+						},
+						Hostname: "requires force start",
+					},
+				},
+				"zone1-0000000404": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  404,
+						},
+						Hostname: "ignored tablet",
+					},
+				},
+			},
+			statusMap: map[string]*replicationdatapb.StopReplicationStatus{
+				"zone1-0000000101": { // forceStart = false
+					Before: &replicationdatapb.Status{
+						IoState:  int32(replication.ReplicationStateStopped),
+						SqlState: int32(replication.ReplicationStateStopped),
+					},
+				},
+			},
+			keyspace:  "testkeyspace",
+			shard:     "-",
+			shouldErr: false,
+			result: []*topodatapb.Tablet{
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  100,
+					},
+					Hostname: "primary-elect",
+				}, {
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  101,
+					},
+				},
+			},
+			validCandidateTablets: []*topodatapb.Tablet{
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  100,
+					},
+					Hostname: "primary-elect",
+				}, {
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  101,
+					},
+				},
+			},
+		}, {
+			name:                 "success - only 2 tablets and they error",
+			emergencyReparentOps: EmergencyReparentOptions{},
+			tmc: &testutil.TabletManagerClient{
+				PopulateReparentJournalResults: map[string]error{
+					"zone1-0000000100": nil,
+				},
+				SetReplicationSourceResults: map[string]error{
+					"zone1-0000000101": fmt.Errorf("An error"),
+				},
+			},
+			newSourceTabletAlias: "zone1-0000000100",
+			tabletMap: map[string]*topo.TabletInfo{
+				"zone1-0000000100": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  100,
+						},
+						Hostname: "primary-elect",
+					},
+				},
+				"zone1-0000000101": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  101,
+						},
+					},
+				},
+				"zone1-0000000102": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  102,
+						},
+						Hostname: "requires force start",
+					},
+				},
+			},
+			statusMap: map[string]*replicationdatapb.StopReplicationStatus{},
+			keyspace:  "testkeyspace",
+			shard:     "-",
+			shouldErr: false,
+			result: []*topodatapb.Tablet{
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  100,
+					},
+					Hostname: "primary-elect",
+				},
+			},
+			validCandidateTablets: []*topodatapb.Tablet{
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  100,
+					},
+					Hostname: "primary-elect",
+				}, {
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  101,
+					},
+				},
+			},
 		},
 		{
 			name:                 "all replicas failed",
@@ -3222,15 +3862,6 @@ func TestEmergencyReparenter_promoteIntermediateSource(t *testing.T) {
 				PopulateReparentJournalResults: map[string]error{
 					"zone1-0000000100": nil,
 				},
-				PrimaryPositionResults: map[string]struct {
-					Position string
-					Error    error
-				}{
-					"zone1-0000000100": {
-						Error: nil,
-					},
-				},
-
 				SetReplicationSourceResults: map[string]error{
 					// everyone fails, we all fail
 					"zone1-0000000101": assert.AnError,
@@ -3255,7 +3886,7 @@ func TestEmergencyReparenter_promoteIntermediateSource(t *testing.T) {
 						},
 					},
 				},
-				"zone1-00000000102": {
+				"zone1-0000000102": {
 					Tablet: &topodatapb.Tablet{
 						Alias: &topodatapb.TabletAlias{
 							Cell: "zone1",
@@ -3264,10 +3895,30 @@ func TestEmergencyReparenter_promoteIntermediateSource(t *testing.T) {
 					},
 				},
 			},
+			validCandidateTablets: []*topodatapb.Tablet{
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  100,
+					},
+					Hostname: "primary-elect",
+				}, {
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  101,
+					},
+				},
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  102,
+					},
+					Hostname: "requires force start",
+				},
+			},
 			statusMap:        map[string]*replicationdatapb.StopReplicationStatus{},
 			keyspace:         "testkeyspace",
 			shard:            "-",
-			ts:               memorytopo.NewServer("zone1"),
 			shouldErr:        true,
 			errShouldContain: " replica(s) failed",
 		},
@@ -3277,14 +3928,6 @@ func TestEmergencyReparenter_promoteIntermediateSource(t *testing.T) {
 			tmc: &testutil.TabletManagerClient{
 				PopulateReparentJournalResults: map[string]error{
 					"zone1-0000000100": nil,
-				},
-				PrimaryPositionResults: map[string]struct {
-					Position string
-					Error    error
-				}{
-					"zone1-0000000100": {
-						Error: nil,
-					},
 				},
 				SetReplicationSourceResults: map[string]error{
 					"zone1-0000000101": nil, // this one succeeds, so we're good
@@ -3321,8 +3964,28 @@ func TestEmergencyReparenter_promoteIntermediateSource(t *testing.T) {
 			statusMap: map[string]*replicationdatapb.StopReplicationStatus{},
 			keyspace:  "testkeyspace",
 			shard:     "-",
-			ts:        memorytopo.NewServer("zone1"),
 			shouldErr: false,
+			validCandidateTablets: []*topodatapb.Tablet{
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  100,
+					},
+					Hostname: "primary-elect",
+				}, {
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  101,
+					},
+				},
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  102,
+					},
+					Hostname: "requires force start",
+				},
+			},
 			result: []*topodatapb.Tablet{
 				{
 					Alias: &topodatapb.TabletAlias{
@@ -3337,19 +4000,109 @@ func TestEmergencyReparenter_promoteIntermediateSource(t *testing.T) {
 				},
 			},
 		},
+		{
+			name:                 "success - filter using valid candidate list",
+			emergencyReparentOps: EmergencyReparentOptions{},
+			tmc: &testutil.TabletManagerClient{
+				PopulateReparentJournalResults: map[string]error{
+					"zone1-0000000100": nil,
+				},
+				SetReplicationSourceResults: map[string]error{
+					"zone1-0000000101": nil,
+					"zone1-0000000102": nil,
+				},
+			},
+			newSourceTabletAlias: "zone1-0000000100",
+			tabletMap: map[string]*topo.TabletInfo{
+				"zone1-0000000100": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  100,
+						},
+						Hostname: "primary-elect",
+					},
+				},
+				"zone1-0000000101": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  101,
+						},
+					},
+				},
+				"zone1-0000000102": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  102,
+						},
+						Hostname: "requires force start",
+					},
+				},
+			},
+			statusMap: map[string]*replicationdatapb.StopReplicationStatus{
+				"zone1-0000000101": { // forceStart = false
+					Before: &replicationdatapb.Status{
+						IoState:  int32(replication.ReplicationStateStopped),
+						SqlState: int32(replication.ReplicationStateStopped),
+					},
+				},
+				"zone1-0000000102": { // forceStart = true
+					Before: &replicationdatapb.Status{
+						IoState:  int32(replication.ReplicationStateRunning),
+						SqlState: int32(replication.ReplicationStateRunning),
+					},
+				},
+			},
+			keyspace:  "testkeyspace",
+			shard:     "-",
+			shouldErr: false,
+			result: []*topodatapb.Tablet{
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  100,
+					},
+					Hostname: "primary-elect",
+				}, {
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  101,
+					},
+				},
+			},
+			validCandidateTablets: []*topodatapb.Tablet{
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  100,
+					},
+					Hostname: "primary-elect",
+				}, {
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  101,
+					},
+				},
+			},
+		},
 	}
 
+	durability, _ := GetDurabilityPolicy("none")
 	for _, tt := range tests {
-		tt := tt
-
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			ctx := context.Background()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 			logger := logutil.NewMemoryLogger()
 			ev := &events.Reparent{}
 
-			testutil.AddShards(ctx, t, tt.ts, &vtctldatapb.Shard{
+			ts := memorytopo.NewServer(ctx, "zone1")
+			defer ts.Close()
+
+			testutil.AddShards(ctx, t, ts, &vtctldatapb.Shard{
 				Keyspace: tt.keyspace,
 				Name:     tt.shard,
 			})
@@ -3360,7 +4113,7 @@ func TestEmergencyReparenter_promoteIntermediateSource(t *testing.T) {
 					lerr   error
 				)
 
-				ctx, unlock, lerr = tt.ts.LockShard(ctx, tt.keyspace, tt.shard, "test lock")
+				ctx, unlock, lerr = ts.LockShard(ctx, tt.keyspace, tt.shard, "test lock")
 				require.NoError(t, lerr, "could not lock %s/%s for test", tt.keyspace, tt.shard)
 
 				defer func() {
@@ -3370,8 +4123,10 @@ func TestEmergencyReparenter_promoteIntermediateSource(t *testing.T) {
 			}
 			tabletInfo := tt.tabletMap[tt.newSourceTabletAlias]
 
-			erp := NewEmergencyReparenter(tt.ts, tt.tmc, logger)
-			res, err := erp.promoteIntermediateSource(ctx, ev, tabletInfo.Tablet, tt.tabletMap, tt.statusMap, tt.emergencyReparentOps)
+			tt.emergencyReparentOps.durability = durability
+
+			erp := NewEmergencyReparenter(ts, tt.tmc, logger)
+			res, err := erp.promoteIntermediateSource(ctx, ev, tabletInfo.Tablet, tt.tabletMap, tt.statusMap, tt.validCandidateTablets, tt.emergencyReparentOps)
 			if tt.shouldErr {
 				assert.Error(t, err)
 				assert.Contains(t, err.Error(), tt.errShouldContain)
@@ -3379,7 +4134,10 @@ func TestEmergencyReparenter_promoteIntermediateSource(t *testing.T) {
 			}
 
 			assert.NoError(t, err)
-			assert.ElementsMatch(t, tt.result, res)
+			require.Equal(t, len(tt.result), len(res))
+			for idx, tablet := range res {
+				assert.EqualValues(t, topoproto.TabletAliasString(tt.result[idx].Alias), topoproto.TabletAliasString(tablet.Alias))
+			}
 		})
 	}
 }
@@ -3389,7 +4147,6 @@ func TestEmergencyReparenter_identifyPrimaryCandidate(t *testing.T) {
 		name                 string
 		emergencyReparentOps EmergencyReparentOptions
 		intermediateSource   *topodatapb.Tablet
-		prevPrimary          *topodatapb.Tablet
 		validCandidates      []*topodatapb.Tablet
 		tabletMap            map[string]*topo.TabletInfo
 		err                  string
@@ -3402,7 +4159,6 @@ func TestEmergencyReparenter_identifyPrimaryCandidate(t *testing.T) {
 				Uid:  100,
 			}},
 			intermediateSource: nil,
-			prevPrimary:        nil,
 			validCandidates: []*topodatapb.Tablet{
 				{
 					Alias: &topodatapb.TabletAlias{
@@ -3428,14 +4184,24 @@ func TestEmergencyReparenter_identifyPrimaryCandidate(t *testing.T) {
 				},
 			},
 		}, {
+			name:            "empty valid list",
+			validCandidates: nil,
+			err:             "no valid candidates for emergency reparent",
+		}, {
 			name: "explicit request for a primary tablet not in valid list",
 			emergencyReparentOps: EmergencyReparentOptions{NewPrimaryAlias: &topodatapb.TabletAlias{
 				Cell: "zone1",
 				Uid:  100,
 			}},
 			intermediateSource: nil,
-			prevPrimary:        nil,
-			validCandidates:    nil,
+			validCandidates: []*topodatapb.Tablet{
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  101,
+					},
+				},
+			},
 			tabletMap: map[string]*topo.TabletInfo{
 				"zone1-0000000100": {
 					Tablet: &topodatapb.Tablet{
@@ -3454,7 +4220,6 @@ func TestEmergencyReparenter_identifyPrimaryCandidate(t *testing.T) {
 				Uid:  100,
 			}},
 			intermediateSource: nil,
-			prevPrimary:        nil,
 			validCandidates: []*topodatapb.Tablet{
 				{
 					Alias: &topodatapb.TabletAlias{
@@ -3466,17 +4231,12 @@ func TestEmergencyReparenter_identifyPrimaryCandidate(t *testing.T) {
 			tabletMap: map[string]*topo.TabletInfo{},
 			err:       "candidate zone1-0000000100 not found in the tablet map; this an impossible situation",
 		}, {
-			name:                 "preferred candidate in the same cell same as our replica",
-			emergencyReparentOps: EmergencyReparentOptions{PreventCrossCellPromotion: true},
+			name:                 "preferred candidate in the valid list with the best promote rule",
+			emergencyReparentOps: EmergencyReparentOptions{},
 			intermediateSource: &topodatapb.Tablet{
 				Alias: &topodatapb.TabletAlias{
 					Cell: "zone1",
 					Uid:  100,
-				},
-			},
-			prevPrimary: &topodatapb.Tablet{
-				Alias: &topodatapb.TabletAlias{
-					Cell: "zone1",
 				},
 			},
 			validCandidates: []*topodatapb.Tablet{
@@ -3520,125 +4280,12 @@ func TestEmergencyReparenter_identifyPrimaryCandidate(t *testing.T) {
 				},
 			},
 		}, {
-			name:                 "preferred candidate in the same cell different from original replica",
-			emergencyReparentOps: EmergencyReparentOptions{PreventCrossCellPromotion: true},
-			intermediateSource: &topodatapb.Tablet{
-				Alias: &topodatapb.TabletAlias{
-					Cell: "zone1",
-					Uid:  100,
-				},
-			},
-			prevPrimary: &topodatapb.Tablet{
-				Alias: &topodatapb.TabletAlias{
-					Cell: "zone1",
-				},
-			},
-			validCandidates: []*topodatapb.Tablet{
-				{
-					Alias: &topodatapb.TabletAlias{
-						Cell: "zone1",
-						Uid:  100,
-					},
-					Type: topodatapb.TabletType_RDONLY,
-				}, {
-					Alias: &topodatapb.TabletAlias{
-						Cell: "zone1",
-						Uid:  101,
-					},
-					Type: topodatapb.TabletType_REPLICA,
-				}, {
-					Alias: &topodatapb.TabletAlias{
-						Cell: "zone1",
-						Uid:  102,
-					},
-					Type: topodatapb.TabletType_RDONLY,
-				}, {
-					Alias: &topodatapb.TabletAlias{
-						Cell: "zone2",
-						Uid:  100,
-					},
-					Type: topodatapb.TabletType_RDONLY,
-				}, {
-					Alias: &topodatapb.TabletAlias{
-						Cell: "zone2",
-						Uid:  101,
-					},
-					Type: topodatapb.TabletType_PRIMARY,
-				},
-			},
-			tabletMap: nil,
-			result: &topodatapb.Tablet{
-				Alias: &topodatapb.TabletAlias{
-					Cell: "zone1",
-					Uid:  101,
-				},
-			},
-		}, {
-			name:                 "preferred candidate in the different cell same as original replica",
+			name:                 "preferred candidate has non optimal promotion rule",
 			emergencyReparentOps: EmergencyReparentOptions{},
 			intermediateSource: &topodatapb.Tablet{
 				Alias: &topodatapb.TabletAlias{
 					Cell: "zone2",
 					Uid:  101,
-				},
-			},
-			prevPrimary: &topodatapb.Tablet{
-				Alias: &topodatapb.TabletAlias{
-					Cell: "zone1",
-				},
-			},
-			validCandidates: []*topodatapb.Tablet{
-				{
-					Alias: &topodatapb.TabletAlias{
-						Cell: "zone1",
-						Uid:  100,
-					},
-					Type: topodatapb.TabletType_REPLICA,
-				}, {
-					Alias: &topodatapb.TabletAlias{
-						Cell: "zone1",
-						Uid:  102,
-					},
-					Type: topodatapb.TabletType_RDONLY,
-				}, {
-					Alias: &topodatapb.TabletAlias{
-						Cell: "zone2",
-						Uid:  100,
-					},
-					Type: topodatapb.TabletType_RDONLY,
-				}, {
-					Alias: &topodatapb.TabletAlias{
-						Cell: "zone2",
-						Uid:  101,
-					},
-					Type: topodatapb.TabletType_PRIMARY,
-				}, {
-					Alias: &topodatapb.TabletAlias{
-						Cell: "zone2",
-						Uid:  102,
-					},
-					Type: topodatapb.TabletType_PRIMARY,
-				},
-			},
-			tabletMap: nil,
-			result: &topodatapb.Tablet{
-				Alias: &topodatapb.TabletAlias{
-					Cell: "zone2",
-					Uid:  101,
-				},
-			},
-		}, {
-			name:                 "preferred candidate in the different cell different from original replica",
-			emergencyReparentOps: EmergencyReparentOptions{},
-			intermediateSource: &topodatapb.Tablet{
-				Alias: &topodatapb.TabletAlias{
-					Cell: "zone2",
-					Uid:  101,
-				},
-			},
-			prevPrimary: &topodatapb.Tablet{
-				Alias: &topodatapb.TabletAlias{
-					Cell: "zone1",
 				},
 			},
 			validCandidates: []*topodatapb.Tablet{
@@ -3681,70 +4328,17 @@ func TestEmergencyReparenter_identifyPrimaryCandidate(t *testing.T) {
 					Uid:  102,
 				},
 			},
-		}, {
-			name:                 "prevent cross cell promotion",
-			emergencyReparentOps: EmergencyReparentOptions{PreventCrossCellPromotion: true},
-			intermediateSource: &topodatapb.Tablet{
-				Alias: &topodatapb.TabletAlias{
-					Cell: "zone1",
-					Uid:  100,
-				},
-			},
-			prevPrimary: &topodatapb.Tablet{
-				Alias: &topodatapb.TabletAlias{
-					Cell: "zone1",
-				},
-			},
-			validCandidates: []*topodatapb.Tablet{
-				{
-					Alias: &topodatapb.TabletAlias{
-						Cell: "zone1",
-						Uid:  100,
-					},
-					Type: topodatapb.TabletType_RDONLY,
-				}, {
-					Alias: &topodatapb.TabletAlias{
-						Cell: "zone1",
-						Uid:  102,
-					},
-					Type: topodatapb.TabletType_RDONLY,
-				}, {
-					Alias: &topodatapb.TabletAlias{
-						Cell: "zone2",
-						Uid:  100,
-					},
-					Type: topodatapb.TabletType_RDONLY,
-				}, {
-					Alias: &topodatapb.TabletAlias{
-						Cell: "zone2",
-						Uid:  101,
-					},
-					Type: topodatapb.TabletType_RDONLY,
-				}, {
-					Alias: &topodatapb.TabletAlias{
-						Cell: "zone2",
-						Uid:  102,
-					},
-					Type: topodatapb.TabletType_PRIMARY,
-				},
-			},
-			tabletMap: nil,
-			result: &topodatapb.Tablet{
-				Alias: &topodatapb.TabletAlias{
-					Cell: "zone1",
-					Uid:  100,
-				},
-			},
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_ = SetDurabilityPolicy("none")
+			durability, _ := GetDurabilityPolicy("none")
+			test.emergencyReparentOps.durability = durability
 			logger := logutil.NewMemoryLogger()
 
 			erp := NewEmergencyReparenter(nil, nil, logger)
-			res, err := erp.identifyPrimaryCandidate(test.intermediateSource, test.prevPrimary, test.validCandidates, test.tabletMap, test.emergencyReparentOps)
+			res, err := erp.identifyPrimaryCandidate(test.intermediateSource, test.validCandidates, test.tabletMap, test.emergencyReparentOps)
 			if test.err != "" {
 				assert.EqualError(t, err, test.err)
 				return
@@ -3758,18 +4352,12 @@ func TestEmergencyReparenter_identifyPrimaryCandidate(t *testing.T) {
 // TestParentContextCancelled tests that even if the parent context of reparentReplicas cancels, we should not cancel the context of
 // SetReplicationSource since there could be tablets that are running it even after ERS completes.
 func TestParentContextCancelled(t *testing.T) {
+	durability, err := GetDurabilityPolicy("none")
+	require.NoError(t, err)
 	// Setup ERS options with a very high wait replicas timeout
-	emergencyReparentOps := EmergencyReparentOptions{IgnoreReplicas: sets.NewString("zone1-0000000404"), WaitReplicasTimeout: time.Minute}
+	emergencyReparentOps := EmergencyReparentOptions{IgnoreReplicas: sets.New[string]("zone1-0000000404"), WaitReplicasTimeout: time.Minute, durability: durability}
 	// Make the replica tablet return its results after 3 seconds
 	tmc := &testutil.TabletManagerClient{
-		PrimaryPositionResults: map[string]struct {
-			Position string
-			Error    error
-		}{
-			"zone1-0000000100": {
-				Error: nil,
-			},
-		},
 		SetReplicationSourceResults: map[string]error{
 			"zone1-0000000101": nil,
 		},
@@ -3800,17 +4388,19 @@ func TestParentContextCancelled(t *testing.T) {
 	statusMap := map[string]*replicationdatapb.StopReplicationStatus{
 		"zone1-0000000101": {
 			Before: &replicationdatapb.Status{
-				IoThreadRunning:  true,
-				SqlThreadRunning: true,
+				IoState:  int32(replication.ReplicationStateRunning),
+				SqlState: int32(replication.ReplicationStateRunning),
 			},
 		},
 	}
 	keyspace := "testkeyspace"
 	shard := "-"
-	ts := memorytopo.NewServer("zone1")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	ts := memorytopo.NewServer(ctx, "zone1")
+	defer ts.Close()
+
 	logger := logutil.NewMemoryLogger()
 	ev := &events.Reparent{}
 
@@ -3827,6 +4417,145 @@ func TestParentContextCancelled(t *testing.T) {
 		time.Sleep(time.Second)
 		cancel()
 	}()
-	_, err := erp.reparentReplicas(ctx, ev, tabletMap[newPrimaryTabletAlias].Tablet, tabletMap, statusMap, emergencyReparentOps, false, false)
+	_, err = erp.reparentReplicas(ctx, ev, tabletMap[newPrimaryTabletAlias].Tablet, tabletMap, statusMap, emergencyReparentOps, true)
 	require.NoError(t, err)
+}
+
+func TestEmergencyReparenter_filterValidCandidates(t *testing.T) {
+	var (
+		primaryTablet = &topodatapb.Tablet{
+			Alias: &topodatapb.TabletAlias{
+				Cell: "zone-1",
+				Uid:  1,
+			},
+			Type: topodatapb.TabletType_PRIMARY,
+		}
+		replicaTablet = &topodatapb.Tablet{
+			Alias: &topodatapb.TabletAlias{
+				Cell: "zone-1",
+				Uid:  2,
+			},
+			Type: topodatapb.TabletType_REPLICA,
+		}
+		rdonlyTablet = &topodatapb.Tablet{
+			Alias: &topodatapb.TabletAlias{
+				Cell: "zone-1",
+				Uid:  3,
+			},
+			Type: topodatapb.TabletType_RDONLY,
+		}
+		replicaCrossCellTablet = &topodatapb.Tablet{
+			Alias: &topodatapb.TabletAlias{
+				Cell: "zone-2",
+				Uid:  2,
+			},
+			Type: topodatapb.TabletType_REPLICA,
+		}
+		rdonlyCrossCellTablet = &topodatapb.Tablet{
+			Alias: &topodatapb.TabletAlias{
+				Cell: "zone-2",
+				Uid:  3,
+			},
+			Type: topodatapb.TabletType_RDONLY,
+		}
+	)
+	allTablets := []*topodatapb.Tablet{primaryTablet, replicaTablet, rdonlyTablet, replicaCrossCellTablet, rdonlyCrossCellTablet}
+	tests := []struct {
+		name             string
+		durability       string
+		validTablets     []*topodatapb.Tablet
+		tabletsReachable []*topodatapb.Tablet
+		prevPrimary      *topodatapb.Tablet
+		opts             EmergencyReparentOptions
+		filteredTablets  []*topodatapb.Tablet
+		errShouldContain string
+	}{
+		{
+			name:             "filter must not",
+			durability:       "none",
+			validTablets:     allTablets,
+			tabletsReachable: allTablets,
+			filteredTablets:  []*topodatapb.Tablet{primaryTablet, replicaTablet, replicaCrossCellTablet},
+		}, {
+			name:             "filter cross cell",
+			durability:       "none",
+			validTablets:     allTablets,
+			tabletsReachable: allTablets,
+			prevPrimary: &topodatapb.Tablet{
+				Alias: &topodatapb.TabletAlias{
+					Cell: "zone-1",
+				},
+			},
+			opts: EmergencyReparentOptions{
+				PreventCrossCellPromotion: true,
+			},
+			filteredTablets: []*topodatapb.Tablet{primaryTablet, replicaTablet},
+		}, {
+			name:             "filter establish",
+			durability:       "cross_cell",
+			validTablets:     []*topodatapb.Tablet{primaryTablet, replicaTablet},
+			tabletsReachable: []*topodatapb.Tablet{primaryTablet, replicaTablet, rdonlyTablet, rdonlyCrossCellTablet},
+			filteredTablets:  nil,
+		}, {
+			name:       "filter mixed",
+			durability: "cross_cell",
+			prevPrimary: &topodatapb.Tablet{
+				Alias: &topodatapb.TabletAlias{
+					Cell: "zone-2",
+				},
+			},
+			opts: EmergencyReparentOptions{
+				PreventCrossCellPromotion: true,
+			},
+			validTablets:     allTablets,
+			tabletsReachable: allTablets,
+			filteredTablets:  []*topodatapb.Tablet{replicaCrossCellTablet},
+		}, {
+			name:             "error - requested primary must not",
+			durability:       "none",
+			validTablets:     allTablets,
+			tabletsReachable: allTablets,
+			opts: EmergencyReparentOptions{
+				NewPrimaryAlias: rdonlyTablet.Alias,
+			},
+			errShouldContain: "proposed primary zone-1-0000000003 has a must not promotion rule",
+		}, {
+			name:             "error - requested primary not in same cell",
+			durability:       "none",
+			validTablets:     allTablets,
+			tabletsReachable: allTablets,
+			prevPrimary:      primaryTablet,
+			opts: EmergencyReparentOptions{
+				PreventCrossCellPromotion: true,
+				NewPrimaryAlias:           replicaCrossCellTablet.Alias,
+			},
+			errShouldContain: "proposed primary zone-2-0000000002 is is a different cell as the previous primary",
+		}, {
+			name:             "error - requested primary cannot establish",
+			durability:       "cross_cell",
+			validTablets:     allTablets,
+			tabletsReachable: []*topodatapb.Tablet{primaryTablet, replicaTablet, rdonlyTablet, rdonlyCrossCellTablet},
+			opts: EmergencyReparentOptions{
+				NewPrimaryAlias: primaryTablet.Alias,
+			},
+			errShouldContain: "proposed primary zone-1-0000000001 will not be able to make forward progress on being promoted",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			durability, err := GetDurabilityPolicy(tt.durability)
+			require.NoError(t, err)
+			tt.opts.durability = durability
+			logger := logutil.NewMemoryLogger()
+			erp := NewEmergencyReparenter(nil, nil, logger)
+			tabletList, err := erp.filterValidCandidates(tt.validTablets, tt.tabletsReachable, tt.prevPrimary, tt.opts)
+			if tt.errShouldContain != "" {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tt.errShouldContain)
+			} else {
+				require.NoError(t, err)
+				require.EqualValues(t, tt.filteredTablets, tabletList)
+			}
+		})
+	}
 }

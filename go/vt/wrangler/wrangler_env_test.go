@@ -18,24 +18,28 @@ package wrangler
 
 import (
 	"context"
-	"flag"
 	"fmt"
+	"math/rand/v2"
 	"sync"
+	"testing"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/grpcclient"
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/topo/memorytopo"
+	"vitess.io/vitess/go/vt/vtenv"
+	"vitess.io/vitess/go/vt/vttablet/queryservice"
+	"vitess.io/vitess/go/vt/vttablet/queryservice/fakes"
+	"vitess.io/vitess/go/vt/vttablet/tabletconn"
+	"vitess.io/vitess/go/vt/vttablet/tabletconntest"
+	"vitess.io/vitess/go/vt/vttablet/tmclient"
+
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
-	"vitess.io/vitess/go/vt/topo"
-	"vitess.io/vitess/go/vt/topo/memorytopo"
-	"vitess.io/vitess/go/vt/vttablet/queryservice"
-	"vitess.io/vitess/go/vt/vttablet/queryservice/fakes"
-	"vitess.io/vitess/go/vt/vttablet/tabletconn"
-	"vitess.io/vitess/go/vt/vttablet/tmclient"
 )
 
 const (
@@ -52,39 +56,35 @@ type testWranglerEnv struct {
 	tabletType topodatapb.TabletType
 	tmc        *testWranglerTMClient
 	mu         sync.Mutex
-	tablets    map[int]*testWranglerTablet
 }
 
-// wranglerEnv has to be a global for RegisterDialer to work.
-var wranglerEnv *testWranglerEnv
+//----------------------------------------------
+// testWranglerEnv
 
-func init() {
-	tabletconn.RegisterDialer("WranglerTest", func(tablet *topodatapb.Tablet, failFast grpcclient.FailFast) (queryservice.QueryService, error) {
-		wranglerEnv.mu.Lock()
-		defer wranglerEnv.mu.Unlock()
-		if qs, ok := wranglerEnv.tablets[int(tablet.Alias.Uid)]; ok {
+func newWranglerTestEnv(t testing.TB, ctx context.Context, sourceShards, targetShards []string, positions map[string]string, timeUpdated int64) *testWranglerEnv {
+	env := &testWranglerEnv{
+		workflow:   "wrWorkflow",
+		topoServ:   memorytopo.NewServer(ctx, "zone1"),
+		cell:       "zone1",
+		tabletType: topodatapb.TabletType_REPLICA,
+		tmc:        newTestWranglerTMClient(),
+	}
+	env.wr = New(vtenv.NewTestEnv(), logutil.NewConsoleLogger(), env.topoServ, env.tmc)
+	env.tmc.tablets = make(map[int]*testWranglerTablet)
+
+	// Generate a unique dialer name.
+	dialerName := fmt.Sprintf("WranglerTest-%s-%d", t.Name(), rand.IntN(1000000000))
+	tabletconn.RegisterDialer(dialerName, func(ctx context.Context, tablet *topodatapb.Tablet, failFast grpcclient.FailFast) (queryservice.QueryService, error) {
+		env.mu.Lock()
+		defer env.mu.Unlock()
+		if qs, ok := env.tmc.tablets[int(tablet.Alias.Uid)]; ok {
 			return qs, nil
 		}
 		// some tests don't require the query service. Earlier we were returning an error for such cases but the tablet picker
 		// now logs a warning and spams the logs. Hence we return a fake service instead
 		return newFakeTestWranglerTablet(), nil
 	})
-}
-
-//----------------------------------------------
-// testWranglerEnv
-
-func newWranglerTestEnv(sourceShards, targetShards []string, query string, positions map[string]string, timeUpdated int64) *testWranglerEnv {
-	flag.Set("tablet_protocol", "WranglerTest")
-	env := &testWranglerEnv{
-		workflow:   "wrWorkflow",
-		tablets:    make(map[int]*testWranglerTablet),
-		topoServ:   memorytopo.NewServer("zone1"),
-		cell:       "zone1",
-		tabletType: topodatapb.TabletType_REPLICA,
-		tmc:        newTestWranglerTMClient(),
-	}
-	env.wr = New(logutil.NewConsoleLogger(), env.topoServ, env.tmc)
+	tabletconntest.SetProtocol("go.vt.wrangler.wrangler_env_test", dialerName)
 
 	tabletID := 100
 	for _, shard := range sourceShards {
@@ -107,13 +107,19 @@ func newWranglerTestEnv(sourceShards, targetShards []string, query string, posit
 				Keyspace: "source",
 				Shard:    sourceShard,
 				Filter: &binlogdatapb.Filter{
-					Rules: []*binlogdatapb.Rule{{
-						Match:  "t1",
-						Filter: query,
-					}},
+					Rules: []*binlogdatapb.Rule{
+						{
+							Match:  "t1",
+							Filter: "",
+						},
+						{
+							Match:  "t2",
+							Filter: "",
+						},
+					},
 				},
 			}
-			rows = append(rows, fmt.Sprintf("%d|%v|||", j+1, bls))
+			rows = append(rows, fmt.Sprintf("%d|%v||||0|0|0", j+1, bls))
 			position := testStopPosition
 			if pos := positions[sourceShard+shard]; pos != "" {
 				position = pos
@@ -129,10 +135,10 @@ func newWranglerTestEnv(sourceShards, targetShards []string, query string, posit
 		// migrater buildMigrationTargets
 		env.tmc.setVRResults(
 			primary.tablet,
-			"select id, source, message, cell, tablet_types from _vt.vreplication where db_name = 'vt_target' and workflow = 'wrWorkflow'",
+			"select id, source, message, cell, tablet_types, workflow_type, workflow_sub_type, defer_secondary_keys from _vt.vreplication where db_name = 'vt_target' and workflow = 'wrWorkflow'",
 			sqltypes.MakeTestResult(sqltypes.MakeTestFields(
-				"id|source|message|cell|tablet_types",
-				"int64|varchar|varchar|varchar|varchar"),
+				"id|source|message|cell|tablet_types|workflow_type|workflow_sub_type|defer_secondary_keys",
+				"int64|varchar|varchar|varchar|varchar|int64|int64|int64"),
 				rows...,
 			),
 		)
@@ -143,11 +149,11 @@ func newWranglerTestEnv(sourceShards, targetShards []string, query string, posit
 		env.tmc.setVRResults(primary.tablet, "insert into _vt.vreplication(state, workflow, db_name) values ('Running', 'wk1', 'ks1'), ('Stopped', 'wk1', 'ks1')", &sqltypes.Result{RowsAffected: 2})
 
 		result := sqltypes.MakeTestResult(sqltypes.MakeTestFields(
-			"id|source|pos|stop_pos|max_replication_lag|state|db_name|time_updated|transaction_timestamp|time_heartbeat|message|tags",
-			"int64|varchar|varchar|varchar|int64|varchar|varchar|int64|int64|int64|varchar|varchar"),
-			fmt.Sprintf("1|%v|MySQL56/14b68925-696a-11ea-aee7-fec597a91f5e:1-3||0|Running|vt_target|%d|0|%d||", bls, timeUpdated, timeUpdated),
+			"id|source|pos|stop_pos|max_replication_lag|state|db_name|time_updated|transaction_timestamp|time_heartbeat|time_throttled|component_throttled|message|tags|workflow_type|workflow_sub_type|defer_secondary_keys|rows_copied",
+			"int64|varchar|varchar|varchar|int64|varchar|varchar|int64|int64|int64|int64|int64|varchar|varchar|varchar|int64|int64|int64|int64"),
+			fmt.Sprintf("1|%v|MySQL56/14b68925-696a-11ea-aee7-fec597a91f5e:1-3||0|Running|vt_target|%d|0|%d|0||||||0|1000", bls, timeUpdated, timeUpdated),
 		)
-		env.tmc.setVRResults(primary.tablet, "select id, source, pos, stop_pos, max_replication_lag, state, db_name, time_updated, transaction_timestamp, time_heartbeat, message, tags from _vt.vreplication where db_name = 'vt_target' and workflow = 'wrWorkflow'", result)
+		env.tmc.setVRResults(primary.tablet, "select id, source, pos, stop_pos, max_replication_lag, state, db_name, time_updated, transaction_timestamp, time_heartbeat, time_throttled, component_throttled, message, tags, workflow_type, workflow_sub_type, defer_secondary_keys, rows_copied from _vt.vreplication where db_name = 'vt_target' and workflow = 'wrWorkflow'", result)
 		env.tmc.setVRResults(
 			primary.tablet,
 			"select source, pos from _vt.vreplication where db_name='vt_target' and workflow='wrWorkflow'",
@@ -164,17 +170,17 @@ func newWranglerTestEnv(sourceShards, targetShards []string, query string, posit
 		)
 		env.tmc.setVRResults(primary.tablet, "select distinct workflow from _vt.vreplication where state != 'Stopped' and db_name = 'vt_target'", result)
 
-		result = sqltypes.MakeTestResult(sqltypes.MakeTestFields(
-			"table|lastpk",
-			"varchar|varchar"),
-			"t1|pk1",
+		result = sqltypes.MakeTestResult(
+			sqltypes.MakeTestFields("vrepl_id|table|lastpk", "int64|varchar|varchar"),
+			"1|t1|pk1",
+			"1|t2|pk2",
 		)
 
-		env.tmc.setVRResults(primary.tablet, "select table_name, lastpk from _vt.copy_state where vrepl_id = 1", result)
+		env.tmc.setVRResults(primary.tablet, "select vrepl_id, table_name, lastpk from _vt.copy_state where vrepl_id in (1) and id in (select max(id) from _vt.copy_state where vrepl_id in (1) group by vrepl_id, table_name)", result)
 
-		env.tmc.setVRResults(primary.tablet, "select id, source, pos, stop_pos, max_replication_lag, state, db_name, time_updated, transaction_timestamp, message, tags from _vt.vreplication where db_name = 'vt_target' and workflow = 'bad'", &sqltypes.Result{})
+		env.tmc.setVRResults(primary.tablet, "select id, source, pos, stop_pos, max_replication_lag, state, db_name, time_updated, transaction_timestamp, time_heartbeat, time_throttled, component_throttled, message, tags from _vt.vreplication where db_name = 'vt_target' and workflow = 'bad'", &sqltypes.Result{})
 
-		env.tmc.setVRResults(primary.tablet, "select id, source, pos, stop_pos, max_replication_lag, state, db_name, time_updated, transaction_timestamp, message, tags from _vt.vreplication where db_name = 'vt_target' and workflow = 'badwf'", &sqltypes.Result{})
+		env.tmc.setVRResults(primary.tablet, "select id, source, pos, stop_pos, max_replication_lag, state, db_name, time_updated, transaction_timestamp, time_heartbeat, time_throttled, component_throttled, message, tags from _vt.vreplication where db_name = 'vt_target' and workflow = 'badwf'", &sqltypes.Result{})
 		env.tmc.vrpos[tabletID] = testSourceGtid
 		env.tmc.pos[tabletID] = testTargetPrimaryPosition
 
@@ -197,17 +203,16 @@ func newWranglerTestEnv(sourceShards, targetShards []string, query string, posit
 		"wrWorkflow", "wrWorkflow2",
 	)
 	env.tmc.setVRResults(primary.tablet, "select distinct workflow from _vt.vreplication where db_name = 'vt_target2'", result)
-	wranglerEnv = env
 	return env
 }
 
 func (env *testWranglerEnv) close() {
 	env.mu.Lock()
 	defer env.mu.Unlock()
-	for _, t := range env.tablets {
+	for _, t := range env.tmc.tablets {
 		env.topoServ.DeleteTablet(context.Background(), t.tablet.Alias)
 	}
-	env.tablets = nil
+	env.tmc.tablets = nil
 }
 
 func newFakeTestWranglerTablet() *testWranglerTablet {
@@ -244,7 +249,7 @@ func (env *testWranglerEnv) addTablet(id int, keyspace, shard string, tabletType
 			"test": int32(id),
 		},
 	}
-	env.tablets[id] = newTestWranglerTablet(tablet)
+	env.tmc.tablets[id] = newTestWranglerTablet(tablet)
 	if err := env.wr.TopoServer().InitTablet(context.Background(), tablet, false /* allowPrimaryOverride */, true /* createShardAndKeyspace */, false /* allowUpdate */); err != nil {
 		panic(err)
 	}
@@ -257,8 +262,8 @@ func (env *testWranglerEnv) addTablet(id int, keyspace, shard string, tabletType
 			panic(err)
 		}
 	}
-	env.tablets[id].queryResults = make(map[string]*querypb.QueryResult)
-	return env.tablets[id]
+	env.tmc.tablets[id].queryResults = make(map[string]*querypb.QueryResult)
+	return env.tmc.tablets[id]
 }
 
 //----------------------------------------------
@@ -295,6 +300,7 @@ func (tvt *testWranglerTablet) StreamHealth(ctx context.Context, callback func(*
 
 type testWranglerTMClient struct {
 	tmclient.TabletManagerClient
+	tablets   map[int]*testWranglerTablet
 	schema    *tabletmanagerdatapb.SchemaDefinition
 	vrQueries map[int]map[string]*querypb.QueryResult
 	waitpos   map[int]string
@@ -311,7 +317,7 @@ func newTestWranglerTMClient() *testWranglerTMClient {
 	}
 }
 
-func (tmc *testWranglerTMClient) GetSchema(ctx context.Context, tablet *topodatapb.Tablet, tables, excludeTables []string, includeViews bool) (*tabletmanagerdatapb.SchemaDefinition, error) {
+func (tmc *testWranglerTMClient) GetSchema(ctx context.Context, tablet *topodatapb.Tablet, request *tabletmanagerdatapb.GetSchemaRequest) (*tabletmanagerdatapb.SchemaDefinition, error) {
 	return tmc.schema, nil
 }
 
@@ -332,13 +338,13 @@ func (tmc *testWranglerTMClient) VReplicationExec(ctx context.Context, tablet *t
 	return result, nil
 }
 
-func (tmc *testWranglerTMClient) ExecuteFetchAsApp(ctx context.Context, tablet *topodatapb.Tablet, usePool bool, query []byte, maxRows int) (*querypb.QueryResult, error) {
-	t := wranglerEnv.tablets[int(tablet.Alias.Uid)]
-	t.gotQueries = append(t.gotQueries, string(query))
-	result, ok := t.queryResults[string(query)]
+func (tmc *testWranglerTMClient) ExecuteFetchAsApp(ctx context.Context, tablet *topodatapb.Tablet, usePool bool, req *tabletmanagerdatapb.ExecuteFetchAsAppRequest) (*querypb.QueryResult, error) {
+	t := tmc.tablets[int(tablet.Alias.Uid)]
+	t.gotQueries = append(t.gotQueries, string(req.Query))
+	result, ok := t.queryResults[string(req.Query)]
 	if !ok {
 		result = &querypb.QueryResult{}
-		log.Errorf("Query: %s, Result :%v\n", query, result)
+		log.Errorf("Query: %s, Result :%v\n", string(req.Query), result)
 	}
 	return result, nil
 }

@@ -22,9 +22,9 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
-	"vitess.io/vitess/go/sync2"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
@@ -36,7 +36,7 @@ const (
 	unhappyClass   = "unhappy"
 )
 
-var (
+const (
 	// This template is a slight duplicate of the one in go/cmd/vttablet/status.go.
 	headerTemplate = `
 <style>
@@ -205,7 +205,7 @@ google.setOnLoadCallback(drawQPSChart);
 type queryserviceStatus struct {
 	Latest     *historyRecord
 	Details    []*kv
-	History    []interface{}
+	History    []any
 	CurrentQPS float64
 }
 
@@ -217,8 +217,8 @@ type kv struct {
 
 // AddStatusHeader registers a standlone header for the status page.
 func (tsv *TabletServer) AddStatusHeader() {
-	tsv.exporter.AddStatusPart("Tablet Server", headerTemplate, func() interface{} {
-		return map[string]interface{}{
+	tsv.exporter.AddStatusPart("Tablet Server", headerTemplate, func() any {
+		return map[string]any{
 			"Alias":  tsv.exporter.Name(),
 			"Prefix": tsv.exporter.URLPrefix(),
 			"Target": tsv.sm.Target(),
@@ -229,10 +229,10 @@ func (tsv *TabletServer) AddStatusHeader() {
 // AddStatusPart registers the status part for the status page.
 func (tsv *TabletServer) AddStatusPart() {
 	// Save the threshold values for reporting.
-	degradedThreshold.Set(tsv.config.Healthcheck.DegradedThresholdSeconds.Get())
-	unhealthyThreshold.Set(tsv.config.Healthcheck.UnhealthyThresholdSeconds.Get())
+	degradedThreshold.Store(tsv.config.Healthcheck.DegradedThreshold.Nanoseconds())
+	unhealthyThreshold.Store(tsv.config.Healthcheck.UnhealthyThreshold.Nanoseconds())
 
-	tsv.exporter.AddStatusPart("Health", queryserviceStatusTemplate, func() interface{} {
+	tsv.exporter.AddStatusPart("Health", queryserviceStatusTemplate, func() any {
 		status := queryserviceStatus{
 			History: tsv.hs.history.Records(),
 		}
@@ -266,8 +266,8 @@ func (tsv *TabletServer) AddStatusPart() {
 	})
 }
 
-var degradedThreshold sync2.AtomicDuration
-var unhealthyThreshold sync2.AtomicDuration
+var degradedThreshold atomic.Int64
+var unhealthyThreshold atomic.Int64
 
 type historyRecord struct {
 	Time       time.Time
@@ -279,7 +279,7 @@ type historyRecord struct {
 
 func (r *historyRecord) Class() string {
 	if r.serving {
-		if r.lag > degradedThreshold.Get() {
+		if r.lag > time.Duration(degradedThreshold.Load()) {
 			return unhappyClass
 		}
 		return healthyClass
@@ -289,12 +289,12 @@ func (r *historyRecord) Class() string {
 
 func (r *historyRecord) Status() string {
 	if r.serving {
-		if r.lag > degradedThreshold.Get() {
+		if r.lag > time.Duration(degradedThreshold.Load()) {
 			return fmt.Sprintf("replication delayed: %v", r.lag)
 		}
 		return "healthy"
 	}
-	if r.lag > unhealthyThreshold.Get() {
+	if r.lag > time.Duration(unhealthyThreshold.Load()) {
 		return fmt.Sprintf("not serving: replication delay %v", r.lag)
 	}
 	if r.err != nil {
@@ -308,7 +308,7 @@ func (r *historyRecord) TabletType() string {
 }
 
 // IsDuplicate implements history.Deduplicable
-func (r *historyRecord) IsDuplicate(other interface{}) bool {
+func (r *historyRecord) IsDuplicate(other any) bool {
 	rother, ok := other.(*historyRecord)
 	if !ok {
 		return false

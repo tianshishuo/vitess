@@ -44,6 +44,7 @@ const (
 	StmtShow
 	StmtUse
 	StmtOther
+	StmtAnalyze
 	StmtUnknown
 	StmtComment
 	StmtPriv
@@ -58,9 +59,14 @@ const (
 	StmtCallProc
 	StmtRevert
 	StmtShowMigrationLogs
+	StmtCommentOnly
+	StmtPrepare
+	StmtExecute
+	StmtDeallocate
+	StmtKill
 )
 
-//ASTToStatementType returns a StatementType from an AST stmt
+// ASTToStatementType returns a StatementType from an AST stmt
 func ASTToStatementType(stmt Statement) StatementType {
 	switch stmt.(type) {
 	case *Select, *Union:
@@ -83,9 +89,11 @@ func ASTToStatementType(stmt Statement) StatementType {
 		return StmtShowMigrationLogs
 	case *Use:
 		return StmtUse
-	case *OtherRead, *OtherAdmin, *Load:
+	case *OtherAdmin, *Load:
 		return StmtOther
-	case Explain:
+	case *Analyze:
+		return StmtAnalyze
+	case Explain, *VExplainStmt:
 		return StmtExplain
 	case *Begin:
 		return StmtBegin
@@ -111,12 +119,22 @@ func ASTToStatementType(stmt Statement) StatementType {
 		return StmtStream
 	case *VStream:
 		return StmtVStream
+	case *CommentOnly:
+		return StmtCommentOnly
+	case *PrepareStmt:
+		return StmtPrepare
+	case *ExecuteStmt:
+		return StmtExecute
+	case *DeallocateStmt:
+		return StmtDeallocate
+	case *Kill:
+		return StmtKill
 	default:
 		return StmtUnknown
 	}
 }
 
-//CanNormalize takes Statement and returns if the statement can be normalized.
+// CanNormalize takes Statement and returns if the statement can be normalized.
 func CanNormalize(stmt Statement) bool {
 	switch stmt.(type) {
 	case *Select, *Union, *Insert, *Update, *Delete, *Set, *CallProc, *Stream: // TODO: we could merge this logic into ASTrewriter
@@ -127,22 +145,12 @@ func CanNormalize(stmt Statement) bool {
 
 // CachePlan takes Statement and returns true if the query plan should be cached
 func CachePlan(stmt Statement) bool {
-	var directives CommentDirectives
-	switch stmt := stmt.(type) {
-	case *Select:
-		directives = ExtractCommentDirectives(stmt.Comments)
-	case *Insert:
-		directives = ExtractCommentDirectives(stmt.Comments)
-	case *Update:
-		directives = ExtractCommentDirectives(stmt.Comments)
-	case *Delete:
-		directives = ExtractCommentDirectives(stmt.Comments)
-	case *Union, *Stream:
-		return true
+	switch stmt.(type) {
+	case *Select, *Insert, *Update, *Delete, *Union, *Stream:
+		return !checkDirective(stmt, DirectiveSkipQueryPlanCache)
 	default:
 		return false
 	}
-	return !directives.IsSet(DirectiveSkipQueryPlanCache)
 }
 
 // MustRewriteAST takes Statement and returns true if RewriteAST must run on it for correct execution irrespective of user flags.
@@ -230,14 +238,18 @@ func Preview(sql string) StatementType {
 		return StmtUse
 	case "describe", "desc", "explain":
 		return StmtExplain
-	case "analyze", "repair", "optimize":
+	case "repair", "optimize":
 		return StmtOther
+	case "analyze":
+		return StmtAnalyze
 	case "grant", "revoke":
 		return StmtPriv
 	case "release":
 		return StmtRelease
 	case "rollback":
 		return StmtSRollback
+	case "kill":
+		return StmtKill
 	}
 	return StmtUnknown
 }
@@ -276,6 +288,8 @@ func (s StatementType) String() string {
 		return "USE"
 	case StmtOther:
 		return "OTHER"
+	case StmtAnalyze:
+		return "ANALYZE"
 	case StmtPriv:
 		return "PRIV"
 	case StmtExplain:
@@ -294,6 +308,16 @@ func (s StatementType) String() string {
 		return "FLUSH"
 	case StmtCallProc:
 		return "CALL_PROC"
+	case StmtCommentOnly:
+		return "COMMENT_ONLY"
+	case StmtPrepare:
+		return "PREPARE"
+	case StmtExecute:
+		return "EXECUTE"
+	case StmtDeallocate:
+		return "DEALLOCATE PREPARE"
+	case StmtKill:
+		return "KILL"
 	default:
 		return "UNKNOWN"
 	}
@@ -308,7 +332,7 @@ func IsDML(sql string) bool {
 	return false
 }
 
-//IsDMLStatement returns true if the query is an INSERT, UPDATE or DELETE statement.
+// IsDMLStatement returns true if the query is an INSERT, UPDATE or DELETE statement.
 func IsDMLStatement(stmt Statement) bool {
 	switch stmt.(type) {
 	case *Insert, *Update, *Delete:
@@ -318,56 +342,10 @@ func IsDMLStatement(stmt Statement) bool {
 	return false
 }
 
-// SplitAndExpression breaks up the Expr into AND-separated conditions
-// and appends them to filters. Outer parenthesis are removed. Precedence
-// should be taken into account if expressions are recombined.
-func SplitAndExpression(filters []Expr, node Expr) []Expr {
-	if node == nil {
-		return filters
-	}
-	switch node := node.(type) {
-	case *AndExpr:
-		filters = SplitAndExpression(filters, node.Left)
-		return SplitAndExpression(filters, node.Right)
-	}
-	return append(filters, node)
-}
-
-// AndExpressions ands together two or more expressions, minimising the expr when possible
-func AndExpressions(exprs ...Expr) Expr {
-	switch len(exprs) {
-	case 0:
-		return nil
-	case 1:
-		return exprs[0]
-	default:
-		result := (Expr)(nil)
-	outer:
-		// we'll loop and remove any duplicates
-		for i, expr := range exprs {
-			if expr == nil {
-				continue
-			}
-			if result == nil {
-				result = expr
-				continue outer
-			}
-
-			for j := 0; j < i; j++ {
-				if EqualsExpr(expr, exprs[j]) {
-					continue outer
-				}
-			}
-			result = &AndExpr{Left: result, Right: expr}
-		}
-		return result
-	}
-}
-
 // TableFromStatement returns the qualified table name for the query.
 // This works only for select statements.
-func TableFromStatement(sql string) (TableName, error) {
-	stmt, err := Parse(sql)
+func (p *Parser) TableFromStatement(sql string) (TableName, error) {
+	stmt, err := p.Parse(sql)
 	if err != nil {
 		return TableName{}, err
 	}
@@ -391,12 +369,12 @@ func TableFromStatement(sql string) (TableName, error) {
 
 // GetTableName returns the table name from the SimpleTableExpr
 // only if it's a simple expression. Otherwise, it returns "".
-func GetTableName(node SimpleTableExpr) TableIdent {
+func GetTableName(node SimpleTableExpr) IdentifierCS {
 	if n, ok := node.(TableName); ok && n.Qualifier.IsEmpty() {
 		return n.Name
 	}
 	// sub-select or '.' expression
-	return NewTableIdent("")
+	return NewIdentifierCS("")
 }
 
 // IsColName returns true if the Expr is a *ColName.
@@ -409,7 +387,7 @@ func IsColName(node Expr) bool {
 // NULL is not considered to be a value.
 func IsValue(node Expr) bool {
 	switch v := node.(type) {
-	case Argument:
+	case *Argument:
 		return true
 	case *Literal:
 		switch v.Type {
@@ -447,20 +425,11 @@ func IsSimpleTuple(node Expr) bool {
 	return false
 }
 
-//IsLockingFunc returns true for all functions that are used to work with mysql advisory locks
+// IsLockingFunc returns true for all functions that are used to work with mysql advisory locks
 func IsLockingFunc(node Expr) bool {
-	switch p := node.(type) {
-	case *FuncExpr:
-		_, found := lockingFunctions[p.Name.Lowered()]
-		return found
+	switch node.(type) {
+	case *LockingFunc:
+		return true
 	}
 	return false
-}
-
-var lockingFunctions = map[string]interface{}{
-	"get_lock":          nil,
-	"is_free_lock":      nil,
-	"is_used_lock":      nil,
-	"release_all_locks": nil,
-	"release_lock":      nil,
 }

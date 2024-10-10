@@ -37,12 +37,12 @@ type testCaseSysVar struct {
 }
 
 type myTestCase struct {
-	in, expected                                                       string
-	liid, db, foundRows, rowCount, rawGTID, rawTimeout, sessTrackGTID  bool
-	ddlStrategy, sessionUUID, sessionEnableSystemSettings              bool
-	udv                                                                int
-	autocommit, clientFoundRows, skipQueryPlanCache, socket            bool
-	sqlSelectLimit, transactionMode, workload, version, versionComment bool
+	in, expected                                                                            string
+	liid, db, foundRows, rowCount, rawGTID, rawTimeout, sessTrackGTID                       bool
+	ddlStrategy, migrationContext, sessionUUID, sessionEnableSystemSettings                 bool
+	udv                                                                                     int
+	autocommit, foreignKeyChecks, clientFoundRows, skipQueryPlanCache, socket, queryTimeout bool
+	sqlSelectLimit, transactionMode, workload, version, versionComment                      bool
 }
 
 func TestRewrites(in *testing.T) {
@@ -54,6 +54,10 @@ func TestRewrites(in *testing.T) {
 		in:       "SELECT @@version",
 		expected: "SELECT :__vtversion as `@@version`",
 		version:  true,
+	}, {
+		in:           "SELECT @@query_timeout",
+		expected:     "SELECT :__vtquery_timeout as `@@query_timeout`",
+		queryTimeout: true,
 	}, {
 		in:             "SELECT @@version_comment",
 		expected:       "SELECT :__vtversion_comment as `@@version_comment`",
@@ -96,6 +100,10 @@ func TestRewrites(in *testing.T) {
 		in:       "select (select database() from dual) from dual",
 		expected: "select :__vtdbname as `(select database() from dual)` from dual",
 		db:       true,
+	}, {
+		// don't unnest solo columns
+		in:       "select 1 as foobar, (select foobar)",
+		expected: "select 1 as foobar, (select foobar from dual) from dual",
 	}, {
 		in:       "select id from user where database()",
 		expected: "select id from user where database()",
@@ -178,6 +186,10 @@ func TestRewrites(in *testing.T) {
 		expected:    "select * from user where col = :__vtddl_strategy",
 		ddlStrategy: true,
 	}, {
+		in:               `select * from user where col = @@migration_context`,
+		expected:         "select * from user where col = :__vtmigration_context",
+		migrationContext: true,
+	}, {
 		in:       `select * from user where col = @@read_after_write_gtid OR col = @@read_after_write_timeout OR col = @@session_track_gtids`,
 		expected: "select * from user where col = :__vtread_after_write_gtid or col = :__vtread_after_write_timeout or col = :__vtsession_track_gtids",
 		rawGTID:  true, rawTimeout: true, sessTrackGTID: true,
@@ -255,11 +267,36 @@ func TestRewrites(in *testing.T) {
 		expected: "SELECT * FROM tbl WHERE id not regexp '%foobar'",
 	}, {
 		in:       "SELECT * FROM tbl WHERE not id not regexp '%foobar'",
-		expected: "SELECT * FROM tbl WHERE id regexp '%foobar'",
+		expected: "select * from tbl where id regexp '%foobar'",
+	}, {
+		in:       "SELECT * FROM tbl WHERE exists(select col1, col2 from other_table where foo > bar)",
+		expected: "SELECT * FROM tbl WHERE exists(select 1 from other_table where foo > bar)",
+	}, {
+		in:       "SELECT * FROM tbl WHERE exists(select col1, col2 from other_table where foo > bar limit 100 offset 34)",
+		expected: "SELECT * FROM tbl WHERE exists(select 1 from other_table where foo > bar limit 100 offset 34)",
+	}, {
+		in:       "SELECT * FROM tbl WHERE exists(select col1, col2, count(*) from other_table where foo > bar group by col1, col2)",
+		expected: "SELECT * FROM tbl WHERE exists(select 1 from other_table where foo > bar)",
+	}, {
+		in:       "SELECT * FROM tbl WHERE exists(select col1, col2 from other_table where foo > bar group by col1, col2)",
+		expected: "SELECT * FROM tbl WHERE exists(select 1 from other_table where foo > bar)",
+	}, {
+		in:       "SELECT * FROM tbl WHERE exists(select count(*) from other_table where foo > bar)",
+		expected: "SELECT * FROM tbl WHERE true",
+	}, {
+		in:       "SELECT * FROM tbl WHERE exists(select col1, col2, count(*) from other_table where foo > bar group by col1, col2 having count(*) > 3)",
+		expected: "SELECT * FROM tbl WHERE exists(select col1, col2, count(*) from other_table where foo > bar group by col1, col2 having count(*) > 3)",
+	}, {
+		in:       "SELECT id, name, salary FROM user_details",
+		expected: "SELECT id, name, salary FROM (select user.id, user.name, user_extra.salary from user join user_extra where user.id = user_extra.user_id) as user_details",
+	}, {
+		in:       "select max(distinct c1), min(distinct c2), avg(distinct c3), sum(distinct c4), count(distinct c5), group_concat(distinct c6) from tbl",
+		expected: "select max(c1) as `max(distinct c1)`, min(c2) as `min(distinct c2)`, avg(distinct c3), sum(distinct c4), count(distinct c5), group_concat(distinct c6) from tbl",
 	}, {
 		in:                          "SHOW VARIABLES",
 		expected:                    "SHOW VARIABLES",
 		autocommit:                  true,
+		foreignKeyChecks:            true,
 		clientFoundRows:             true,
 		skipQueryPlanCache:          true,
 		sqlSelectLimit:              true,
@@ -268,16 +305,19 @@ func TestRewrites(in *testing.T) {
 		version:                     true,
 		versionComment:              true,
 		ddlStrategy:                 true,
+		migrationContext:            true,
 		sessionUUID:                 true,
 		sessionEnableSystemSettings: true,
 		rawGTID:                     true,
 		rawTimeout:                  true,
 		sessTrackGTID:               true,
 		socket:                      true,
+		queryTimeout:                true,
 	}, {
 		in:                          "SHOW GLOBAL VARIABLES",
 		expected:                    "SHOW GLOBAL VARIABLES",
 		autocommit:                  true,
+		foreignKeyChecks:            true,
 		clientFoundRows:             true,
 		skipQueryPlanCache:          true,
 		sqlSelectLimit:              true,
@@ -286,24 +326,34 @@ func TestRewrites(in *testing.T) {
 		version:                     true,
 		versionComment:              true,
 		ddlStrategy:                 true,
+		migrationContext:            true,
 		sessionUUID:                 true,
 		sessionEnableSystemSettings: true,
 		rawGTID:                     true,
 		rawTimeout:                  true,
 		sessTrackGTID:               true,
 		socket:                      true,
+		queryTimeout:                true,
 	}}
-
+	parser := NewTestParser()
 	for _, tc := range tests {
 		in.Run(tc.in, func(t *testing.T) {
 			require := require.New(t)
-			stmt, err := Parse(tc.in)
+			stmt, err := parser.Parse(tc.in)
 			require.NoError(err)
 
-			result, err := RewriteAST(stmt, "ks", SQLSelectLimitUnset, "", nil) // passing `ks` just to test that no rewriting happens as it is not system schema
+			result, err := RewriteAST(
+				stmt,
+				"ks", // passing `ks` just to test that no rewriting happens as it is not system schema
+				SQLSelectLimitUnset,
+				"",
+				nil,
+				nil,
+				&fakeViews{},
+			)
 			require.NoError(err)
 
-			expected, err := Parse(tc.expected)
+			expected, err := parser.Parse(tc.expected)
 			require.NoError(err, "test expectation does not parse [%s]", tc.expected)
 
 			s := String(expected)
@@ -315,12 +365,15 @@ func TestRewrites(in *testing.T) {
 			assert.Equal(tc.rowCount, result.NeedsFuncResult(RowCountName), "should need row count")
 			assert.Equal(tc.udv, len(result.NeedUserDefinedVariables), "count of user defined variables")
 			assert.Equal(tc.autocommit, result.NeedsSysVar(sysvars.Autocommit.Name), "should need :__vtautocommit")
+			assert.Equal(tc.foreignKeyChecks, result.NeedsSysVar(sysvars.ForeignKeyChecks), "should need :__vtforeignKeyChecks")
 			assert.Equal(tc.clientFoundRows, result.NeedsSysVar(sysvars.ClientFoundRows.Name), "should need :__vtclientFoundRows")
 			assert.Equal(tc.skipQueryPlanCache, result.NeedsSysVar(sysvars.SkipQueryPlanCache.Name), "should need :__vtskipQueryPlanCache")
 			assert.Equal(tc.sqlSelectLimit, result.NeedsSysVar(sysvars.SQLSelectLimit.Name), "should need :__vtsqlSelectLimit")
 			assert.Equal(tc.transactionMode, result.NeedsSysVar(sysvars.TransactionMode.Name), "should need :__vttransactionMode")
 			assert.Equal(tc.workload, result.NeedsSysVar(sysvars.Workload.Name), "should need :__vtworkload")
+			assert.Equal(tc.queryTimeout, result.NeedsSysVar(sysvars.QueryTimeout.Name), "should need :__vtquery_timeout")
 			assert.Equal(tc.ddlStrategy, result.NeedsSysVar(sysvars.DDLStrategy.Name), "should need ddlStrategy")
+			assert.Equal(tc.migrationContext, result.NeedsSysVar(sysvars.MigrationContext.Name), "should need migrationContext")
 			assert.Equal(tc.sessionUUID, result.NeedsSysVar(sysvars.SessionUUID.Name), "should need sessionUUID")
 			assert.Equal(tc.sessionEnableSystemSettings, result.NeedsSysVar(sysvars.SessionEnableSystemSettings.Name), "should need sessionEnableSystemSettings")
 			assert.Equal(tc.rawGTID, result.NeedsSysVar(sysvars.ReadAfterWriteGTID.Name), "should need rawGTID")
@@ -331,6 +384,20 @@ func TestRewrites(in *testing.T) {
 			assert.Equal(tc.socket, result.NeedsSysVar(sysvars.Socket.Name), "should need :__vtsocket")
 		})
 	}
+}
+
+type fakeViews struct{}
+
+func (*fakeViews) FindView(name TableName) SelectStatement {
+	if name.Name.String() != "user_details" {
+		return nil
+	}
+	parser := NewTestParser()
+	statement, err := parser.Parse("select user.id, user.name, user_extra.salary from user join user_extra where user.id = user_extra.user_id")
+	if err != nil {
+		return nil
+	}
+	return statement.(SelectStatement)
 }
 
 func TestRewritesWithSetVarComment(in *testing.T) {
@@ -368,16 +435,17 @@ func TestRewritesWithSetVarComment(in *testing.T) {
 		setVarComment: "AA(a)",
 	}}
 
+	parser := NewTestParser()
 	for _, tc := range tests {
 		in.Run(tc.in, func(t *testing.T) {
 			require := require.New(t)
-			stmt, err := Parse(tc.in)
+			stmt, err := parser.Parse(tc.in)
 			require.NoError(err)
 
-			result, err := RewriteAST(stmt, "ks", SQLSelectLimitUnset, tc.setVarComment, nil)
+			result, err := RewriteAST(stmt, "ks", SQLSelectLimitUnset, tc.setVarComment, nil, nil, &fakeViews{})
 			require.NoError(err)
 
-			expected, err := Parse(tc.expected)
+			expected, err := parser.Parse(tc.expected)
 			require.NoError(err, "test expectation does not parse [%s]", tc.expected)
 
 			assert.Equal(t, String(expected), String(result.AST))
@@ -393,18 +461,40 @@ func TestRewritesSysVar(in *testing.T) {
 		in:       "select @x = @@sql_mode",
 		expected: "select :__vtudvx = :__vtsql_mode as `@x = @@sql_mode` from dual",
 		sysVar:   map[string]string{"sql_mode": "' '"},
+	}, {
+		in:       "SELECT @@tx_isolation",
+		expected: "select @@tx_isolation from dual",
+	}, {
+		in:       "SELECT @@transaction_isolation",
+		expected: "select @@transaction_isolation from dual",
+	}, {
+		in:       "SELECT @@session.transaction_isolation",
+		expected: "select @@session.transaction_isolation from dual",
+	}, {
+		in:       "SELECT @@tx_isolation",
+		sysVar:   map[string]string{"tx_isolation": "'READ-COMMITTED'"},
+		expected: "select :__vttx_isolation as `@@tx_isolation` from dual",
+	}, {
+		in:       "SELECT @@transaction_isolation",
+		sysVar:   map[string]string{"transaction_isolation": "'READ-COMMITTED'"},
+		expected: "select :__vttransaction_isolation as `@@transaction_isolation` from dual",
+	}, {
+		in:       "SELECT @@session.transaction_isolation",
+		sysVar:   map[string]string{"transaction_isolation": "'READ-COMMITTED'"},
+		expected: "select :__vttransaction_isolation as `@@session.transaction_isolation` from dual",
 	}}
 
+	parser := NewTestParser()
 	for _, tc := range tests {
 		in.Run(tc.in, func(t *testing.T) {
 			require := require.New(t)
-			stmt, err := Parse(tc.in)
+			stmt, err := parser.Parse(tc.in)
 			require.NoError(err)
 
-			result, err := RewriteAST(stmt, "ks", SQLSelectLimitUnset, "", tc.sysVar)
+			result, err := RewriteAST(stmt, "ks", SQLSelectLimitUnset, "", tc.sysVar, nil, &fakeViews{})
 			require.NoError(err)
 
-			expected, err := Parse(tc.expected)
+			expected, err := parser.Parse(tc.expected)
 			require.NoError(err, "test expectation does not parse [%s]", tc.expected)
 
 			assert.Equal(t, String(expected), String(result.AST))
@@ -435,8 +525,8 @@ func TestRewritesWithDefaultKeyspace(in *testing.T) {
 		in:       "SELECT 1 from (select 2 from test) t",
 		expected: "SELECT 1 from (select 2 from sys.test) t",
 	}, {
-		in:       "SELECT 1 from test where exists (select 2 from test)",
-		expected: "SELECT 1 from sys.test where exists (select 2 from sys.test)",
+		in:       "SELECT 1 from test where exists(select 2 from test)",
+		expected: "SELECT 1 from sys.test where exists(select 1 from sys.test)",
 	}, {
 		in:       "SELECT 1 from dual",
 		expected: "SELECT 1 from dual",
@@ -445,114 +535,20 @@ func TestRewritesWithDefaultKeyspace(in *testing.T) {
 		expected: "SELECT 2 as `(select 2 from dual)` from DUAL",
 	}}
 
+	parser := NewTestParser()
 	for _, tc := range tests {
 		in.Run(tc.in, func(t *testing.T) {
 			require := require.New(t)
-			stmt, err := Parse(tc.in)
+			stmt, err := parser.Parse(tc.in)
 			require.NoError(err)
 
-			result, err := RewriteAST(stmt, "sys", SQLSelectLimitUnset, "", nil)
+			result, err := RewriteAST(stmt, "sys", SQLSelectLimitUnset, "", nil, nil, &fakeViews{})
 			require.NoError(err)
 
-			expected, err := Parse(tc.expected)
+			expected, err := parser.Parse(tc.expected)
 			require.NoError(err, "test expectation does not parse [%s]", tc.expected)
 
 			assert.Equal(t, String(expected), String(result.AST))
-		})
-	}
-}
-
-func TestRewriteToCNF(in *testing.T) {
-	tests := []struct {
-		in       string
-		expected string
-	}{{
-		in:       "not (not A = 3)",
-		expected: "A = 3",
-	}, {
-		in:       "not (A = 3 and B = 2)",
-		expected: "not A = 3 or not B = 2",
-	}, {
-		in:       "not (A = 3 or B = 2)",
-		expected: "not A = 3 and not B = 2",
-	}, {
-		in:       "A xor B",
-		expected: "(A or B) and not (A and B)",
-	}, {
-		in:       "(A and B) or C",
-		expected: "(A or C) and (B or C)",
-	}, {
-		in:       "C or (A and B)",
-		expected: "(C or A) and (C or B)",
-	}, {
-		in:       "A and A",
-		expected: "A",
-	}, {
-		in:       "A OR A",
-		expected: "A",
-	}, {
-		in:       "A OR (A AND B)",
-		expected: "A",
-	}, {
-		in:       "A OR (B AND A)",
-		expected: "A",
-	}, {
-		in:       "(A AND B) OR A",
-		expected: "A",
-	}, {
-		in:       "(B AND A) OR A",
-		expected: "A",
-	}, {
-		in:       "(A and B) and (B and A)",
-		expected: "A and B",
-	}, {
-		in:       "(A or B) and A",
-		expected: "A",
-	}, {
-		in:       "A and (A or B)",
-		expected: "A",
-	}}
-
-	for _, tc := range tests {
-		in.Run(tc.in, func(t *testing.T) {
-			stmt, err := Parse("SELECT * FROM T WHERE " + tc.in)
-			require.NoError(t, err)
-
-			expr := stmt.(*Select).Where.Expr
-			expr, didRewrite := rewriteToCNFExpr(expr)
-			assert.True(t, didRewrite)
-			assert.Equal(t, tc.expected, String(expr))
-		})
-	}
-}
-
-func TestFixedPointRewriteToCNF(in *testing.T) {
-	tests := []struct {
-		in       string
-		expected string
-	}{{
-		in:       "A xor B",
-		expected: "(A or B) and (not A or not B)",
-	}, {
-		in:       "(A and B) and (B and A) and (B and A) and (A and B)",
-		expected: "A and B",
-	}, {
-		in:       "((A and B) OR (A and C) OR (A and D)) and E and F",
-		expected: "A and ((A or B) and (B or C or A)) and ((A or D) and ((B or A or D) and (B or C or D))) and E and F",
-	}, {
-		in:       "(A and B) OR (A and C)",
-		expected: "A and ((B or A) and (B or C))",
-	}}
-
-	for _, tc := range tests {
-		in.Run(tc.in, func(t *testing.T) {
-			require := require.New(t)
-			stmt, err := Parse("SELECT * FROM T WHERE " + tc.in)
-			require.NoError(err)
-
-			expr := stmt.(*Select).Where.Expr
-			output := RewriteToCNF(expr)
-			assert.Equal(t, tc.expected, String(output))
 		})
 	}
 }

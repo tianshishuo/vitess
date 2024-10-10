@@ -17,16 +17,20 @@ limitations under the License.
 package tabletmanager
 
 import (
+	"context"
 	"fmt"
 	"time"
 
-	"context"
+	"vitess.io/vitess/go/vt/topotools"
+	"vitess.io/vitess/go/vt/vtctl/reparentutil"
 
 	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/mysqlctl"
+	"vitess.io/vitess/go/vt/mysqlctl/backupstats"
 	"vitess.io/vitess/go/vt/topo/topoproto"
 	"vitess.io/vitess/go/vt/vterrors"
 
+	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
@@ -35,8 +39,8 @@ const (
 	backupModeOffline = "offline"
 )
 
-// Backup takes a db backup and sends it to the BackupStorage
-func (tm *TabletManager) Backup(ctx context.Context, concurrency int, logger logutil.Logger, allowPrimary bool) error {
+// Backup takes a db backup and sends it to the BackupStorage.
+func (tm *TabletManager) Backup(ctx context.Context, logger logutil.Logger, req *tabletmanagerdatapb.BackupRequest) error {
 	if tm.Cnf == nil {
 		return fmt.Errorf("cannot perform backup without my.cnf, please restart vttablet with a my.cnf file specified")
 	}
@@ -46,25 +50,31 @@ func (tm *TabletManager) Backup(ctx context.Context, concurrency int, logger log
 	// but the process didn't find out about this.
 	// It is not safe to take backups from tablet in this state
 	currentTablet := tm.Tablet()
-	if !allowPrimary && currentTablet.Type == topodatapb.TabletType_PRIMARY {
-		return fmt.Errorf("type PRIMARY cannot take backup. if you really need to do this, rerun the backup command with -allow_primary")
+	if !req.AllowPrimary && currentTablet.Type == topodatapb.TabletType_PRIMARY {
+		return fmt.Errorf("type PRIMARY cannot take backup. if you really need to do this, rerun the backup command with --allow_primary")
 	}
-	engine, err := mysqlctl.GetBackupEngine()
+
+	backupEngine := ""
+	if req.BackupEngine != nil {
+		backupEngine = *req.BackupEngine
+	}
+
+	engine, err := mysqlctl.GetBackupEngine(backupEngine)
 	if err != nil {
 		return vterrors.Wrap(err, "failed to find backup engine")
 	}
-	// get Tablet info from topo so that it is up to date
+	// Get Tablet info from topo so that it is up to date
 	tablet, err := tm.TopoServer.GetTablet(ctx, tm.tabletAlias)
 	if err != nil {
 		return err
 	}
-	if !allowPrimary && tablet.Type == topodatapb.TabletType_PRIMARY {
-		return fmt.Errorf("type PRIMARY cannot take backup. if you really need to do this, rerun the backup command with -allow_primary")
+	if !req.AllowPrimary && tablet.Type == topodatapb.TabletType_PRIMARY {
+		return fmt.Errorf("type PRIMARY cannot take backup. if you really need to do this, rerun the backup command with --allow_primary")
 	}
 
-	// prevent concurrent backups, and record stats
+	// Prevent concurrent backups, and record stats
 	backupMode := backupModeOnline
-	if engine.ShouldDrainForBackup() {
+	if engine.ShouldDrainForBackup(req) {
 		backupMode = backupModeOffline
 	}
 	if err := tm.beginBackup(backupMode); err != nil {
@@ -72,8 +82,11 @@ func (tm *TabletManager) Backup(ctx context.Context, concurrency int, logger log
 	}
 	defer tm.endBackup(backupMode)
 
+	// Create the logger: tee to console and source.
+	l := logutil.NewTeeLogger(logutil.NewConsoleLogger(), logger)
+
 	var originalType topodatapb.TabletType
-	if engine.ShouldDrainForBackup() {
+	if engine.ShouldDrainForBackup(req) {
 		if err := tm.lock(ctx); err != nil {
 			return err
 		}
@@ -84,75 +97,89 @@ func (tm *TabletManager) Backup(ctx context.Context, concurrency int, logger log
 			return err
 		}
 		originalType = tablet.Type
-		// update our type to BACKUP
+		// Update our type to `BACKUP`.
 		if err := tm.changeTypeLocked(ctx, topodatapb.TabletType_BACKUP, DBActionNone, SemiSyncActionUnset); err != nil {
 			return err
 		}
-		// Tell Orchestrator we're stopped on purpose for some Vitess task.
-		// Do this in the background, as it's best-effort.
-		go func() {
-			if tm.orc == nil {
+
+		// Adding defer to original value in case of any failures.
+		defer func() {
+			bgCtx := context.Background()
+			// Change our type back to the original value.
+			// Original type could be primary so pass in a real value for PrimaryTermStartTime
+			if err := tm.changeTypeLocked(bgCtx, originalType, DBActionNone, SemiSyncActionNone); err != nil {
+				l.Errorf("Failed to change tablet type from %v to %v, error: %v", topodatapb.TabletType_BACKUP, originalType, err)
 				return
 			}
-			if err := tm.orc.BeginMaintenance(tm.Tablet(), "vttablet has been told to run an offline backup"); err != nil {
-				logger.Warningf("Orchestrator BeginMaintenance failed: %v", err)
+
+			// Find the correct primary tablet and set the replication source,
+			// since the primary could have changed while we executed the backup which can
+			// also affect whether we want to send semi sync acks or not.
+			tabletInfo, err := tm.TopoServer.GetTablet(bgCtx, tablet.Alias)
+			if err != nil {
+				l.Errorf("Failed to fetch updated tablet info, error: %v", err)
+				return
+			}
+
+			// Do not do anything for primary tablets or when active reparenting is disabled
+			if mysqlctl.DisableActiveReparents || tabletInfo.Type == topodatapb.TabletType_PRIMARY {
+				return
+			}
+
+			shardPrimary, err := topotools.GetShardPrimaryForTablet(bgCtx, tm.TopoServer, tablet.Tablet)
+			if err != nil {
+				return
+			}
+
+			durabilityName, err := tm.TopoServer.GetKeyspaceDurability(bgCtx, tablet.Keyspace)
+			if err != nil {
+				l.Errorf("Failed to get durability policy, error: %v", err)
+				return
+			}
+			durability, err := reparentutil.GetDurabilityPolicy(durabilityName)
+			if err != nil {
+				l.Errorf("Failed to get durability with name %v, error: %v", durabilityName, err)
+			}
+
+			isSemiSync := reparentutil.IsReplicaSemiSync(durability, shardPrimary.Tablet, tabletInfo.Tablet)
+			semiSyncAction, err := tm.convertBoolToSemiSyncAction(bgCtx, isSemiSync)
+			if err != nil {
+				l.Errorf("Failed to convert bool to semisync action, error: %v", err)
+				return
+			}
+			if err := tm.setReplicationSourceLocked(bgCtx, shardPrimary.Alias, 0, "", false, semiSyncAction, 0); err != nil {
+				l.Errorf("Failed to set replication source, error: %v", err)
 			}
 		}()
 	}
-	// create the loggers: tee to console and source
-	l := logutil.NewTeeLogger(logutil.NewConsoleLogger(), logger)
 
-	// now we can run the backup
+	// Now we can run the backup.
 	backupParams := mysqlctl.BackupParams{
-		Cnf:          tm.Cnf,
-		Mysqld:       tm.MysqlDaemon,
-		Logger:       l,
-		Concurrency:  concurrency,
-		HookExtraEnv: tm.hookExtraEnv(),
-		TopoServer:   tm.TopoServer,
-		Keyspace:     tablet.Keyspace,
-		Shard:        tablet.Shard,
-		TabletAlias:  topoproto.TabletAliasString(tablet.Alias),
-		BackupTime:   time.Now(),
+		Cnf:                  tm.Cnf,
+		Mysqld:               tm.MysqlDaemon,
+		Logger:               l,
+		Concurrency:          int(req.Concurrency),
+		IncrementalFromPos:   req.IncrementalFromPos,
+		HookExtraEnv:         tm.hookExtraEnv(),
+		TopoServer:           tm.TopoServer,
+		Keyspace:             tablet.Keyspace,
+		Shard:                tablet.Shard,
+		TabletAlias:          topoproto.TabletAliasString(tablet.Alias),
+		BackupTime:           time.Now(),
+		Stats:                backupstats.BackupStats(),
+		UpgradeSafe:          req.UpgradeSafe,
+		MysqlShutdownTimeout: mysqlShutdownTimeout,
+		BackupEngine:         backupEngine,
 	}
 
 	returnErr := mysqlctl.Backup(ctx, backupParams)
-
-	if engine.ShouldDrainForBackup() {
-		bgCtx := context.Background()
-		// Starting from here we won't be able to recover if we get stopped by a cancelled
-		// context. It is also possible that the context already timed out during the
-		// above call to Backup. Thus we use the background context to get through to the finish.
-
-		// Change our type back to the original value.
-		// Original type could be primary so pass in a real value for PrimaryTermStartTime
-		if err := tm.changeTypeLocked(bgCtx, originalType, DBActionNone, SemiSyncActionNone); err != nil {
-			// failure in changing the topology type is probably worse,
-			// so returning that (we logged the snapshot error anyway)
-			if returnErr != nil {
-				l.Errorf("mysql backup command returned error: %v", returnErr)
-			}
-			returnErr = err
-		} else {
-			// Tell Orchestrator we're no longer stopped on purpose.
-			// Do this in the background, as it's best-effort.
-			go func() {
-				if tm.orc == nil {
-					return
-				}
-				if err := tm.orc.EndMaintenance(tm.Tablet()); err != nil {
-					logger.Warningf("Orchestrator EndMaintenance failed: %v", err)
-				}
-			}()
-		}
-	}
 
 	return returnErr
 }
 
 // RestoreFromBackup deletes all local data and then restores the data from the latest backup [at
 // or before the backupTime value if specified]
-func (tm *TabletManager) RestoreFromBackup(ctx context.Context, logger logutil.Logger, backupTime time.Time) error {
+func (tm *TabletManager) RestoreFromBackup(ctx context.Context, logger logutil.Logger, request *tabletmanagerdatapb.RestoreFromBackupRequest) error {
 	if err := tm.lock(ctx); err != nil {
 		return err
 	}
@@ -166,13 +193,13 @@ func (tm *TabletManager) RestoreFromBackup(ctx context.Context, logger logutil.L
 		return fmt.Errorf("type PRIMARY cannot restore from backup, if you really need to do this, restart vttablet in replica mode")
 	}
 
-	// create the loggers: tee to console and source
+	// Create the logger: tee to console and source.
 	l := logutil.NewTeeLogger(logutil.NewConsoleLogger(), logger)
 
-	// now we can run restore
-	err = tm.restoreDataLocked(ctx, l, 0 /* waitForBackupInterval */, true /* deleteBeforeRestore */, backupTime)
+	// Now we can run restore.
+	err = tm.restoreDataLocked(ctx, l, 0 /* waitForBackupInterval */, true /* deleteBeforeRestore */, request, mysqlShutdownTimeout)
 
-	// re-run health check to be sure to capture any replication delay
+	// Re-run health check to be sure to capture any replication delay.
 	tm.QueryServiceControl.BroadcastHealth()
 
 	return err
@@ -184,10 +211,10 @@ func (tm *TabletManager) beginBackup(backupMode string) error {
 	if tm._isBackupRunning {
 		return fmt.Errorf("a backup is already running on tablet: %v", tm.tabletAlias)
 	}
-	// when mode is online we don't take the action lock, so we continue to serve,
-	// but let's set _isBackupRunning to true
-	// so that we only allow one online backup at a time
-	// offline backups also run only one at a time because we take the action lock
+	// When mode is online we don't take the action lock, so we continue to serve,
+	// but let's set _isBackupRunning to true.
+	// So that we only allow one online backup at a time.
+	// Offline backups also run only one at a time because we take the action lock
 	// so this is not really needed in that case, however we are using it to record the state
 	tm._isBackupRunning = true
 	statsBackupIsRunning.Set([]string{backupMode}, 1)
@@ -195,8 +222,8 @@ func (tm *TabletManager) beginBackup(backupMode string) error {
 }
 
 func (tm *TabletManager) endBackup(backupMode string) {
-	// now we set _isBackupRunning back to false
-	// have to take the mutex lock before writing to _ fields
+	// Now we set _isBackupRunning back to false.
+	// Have to take the mutex lock before writing to _ fields.
 	tm.mutex.Lock()
 	defer tm.mutex.Unlock()
 	tm._isBackupRunning = false

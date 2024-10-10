@@ -17,11 +17,12 @@ limitations under the License.
 package servenv
 
 import (
-	"flag"
 	"fmt"
 	"runtime"
 	"strconv"
 	"time"
+
+	"github.com/spf13/pflag"
 
 	"vitess.io/vitess/go/stats"
 )
@@ -32,11 +33,16 @@ var (
 	buildTime             = ""
 	buildGitRev           = ""
 	buildGitBranch        = ""
+	statsBuildVersion     *stats.String
 	jenkinsBuildNumberStr = ""
 
-	// Version registers the command line flag to expose build info.
-	Version = flag.Bool("version", false, "print binary version")
+	// version registers the command line flag to expose build info.
+	version bool
 )
+
+func registerVersionFlag(fs *pflag.FlagSet) {
+	fs.BoolVarP(&version, "version", "v", version, "print binary version")
+}
 
 // AppVersion is the struct to store build info.
 var AppVersion versionInfo
@@ -86,10 +92,7 @@ func (v *versionInfo) String() string {
 }
 
 func (v *versionInfo) MySQLVersion() string {
-	if *MySQLServerVersion != "" {
-		return *MySQLServerVersion
-	}
-	return "5.7.9-vitess-" + v.version
+	return mySQLServerVersion
 }
 
 func init() {
@@ -119,6 +122,8 @@ func init() {
 	stats.NewString("BuildHost").Set(AppVersion.buildHost)
 	stats.NewString("BuildUser").Set(AppVersion.buildUser)
 	stats.NewGauge("BuildTimestamp", "build timestamp").Set(AppVersion.buildTime)
+	statsBuildVersion = stats.NewString("BuildVersion")
+	statsBuildVersion.Set(AppVersion.version)
 	stats.NewString("BuildGitRev").Set(AppVersion.buildGitRev)
 	stats.NewString("BuildGitBranch").Set(AppVersion.buildGitBranch)
 	stats.NewGauge("BuildNumber", "build number").Set(AppVersion.jenkinsBuildNumber)
@@ -136,4 +141,6 @@ func init() {
 		fmt.Sprintf("%v", AppVersion.jenkinsBuildNumber),
 	}
 	stats.NewGaugesWithMultiLabels("BuildInformation", "build information exposed via label", buildLabels).Set(buildValues, 1)
+
+	OnParse(registerVersionFlag)
 }

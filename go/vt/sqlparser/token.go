@@ -41,22 +41,21 @@ type Tokenizer struct {
 	lastToken      string
 	posVarIndex    int
 	partialDDL     Statement
-	nesting        int
 	multi          bool
 	specialComment *Tokenizer
 
-	Pos int
-	buf string
+	Pos    int
+	buf    string
+	parser *Parser
 }
 
 // NewStringTokenizer creates a new Tokenizer for the
 // sql string.
-func NewStringTokenizer(sql string) *Tokenizer {
-	checkParserVersionFlag()
-
+func (p *Parser) NewStringTokenizer(sql string) *Tokenizer {
 	return &Tokenizer{
 		buf:      sql,
 		BindVars: make(map[string]struct{}),
+		parser:   p,
 	}
 }
 
@@ -172,7 +171,7 @@ func (tkn *Tokenizer) Scan() (int, string) {
 	case isDigit(ch):
 		return tkn.scanNumber()
 	case ch == ':':
-		return tkn.scanBindVar()
+		return tkn.scanBindVarOrAssignmentExpression()
 	case ch == ';':
 		if tkn.multi {
 			// In multi mode, ';' is treated as EOF. So, we don't advance.
@@ -426,12 +425,25 @@ func (tkn *Tokenizer) scanLiteralIdentifier() (int, string) {
 	}
 }
 
-// scanBindVar scans a bind variable; assumes a ':' has been scanned right before
-func (tkn *Tokenizer) scanBindVar() (int, string) {
+// scanBindVarOrAssignmentExpression scans a bind variable or an assignment expression; assumes a ':' has been scanned right before
+func (tkn *Tokenizer) scanBindVarOrAssignmentExpression() (int, string) {
 	start := tkn.Pos
 	token := VALUE_ARG
 
 	tkn.skip(1)
+	// If : is followed by a digit, then it is an offset value arg. Example - :1, :10
+	if isDigit(tkn.cur()) {
+		tkn.scanMantissa(10)
+		return OFFSET_ARG, tkn.buf[start+1 : tkn.Pos]
+	}
+
+	// If : is followed by a =, then it is an assignment operator
+	if tkn.cur() == '=' {
+		tkn.skip(1)
+		return ASSIGNMENT_OPT, ""
+	}
+
+	// If : is followed by another : it is a list arg. Example ::v1, ::list
 	if tkn.cur() == ':' {
 		token = LIST_ARG
 		tkn.skip(1)
@@ -439,6 +451,7 @@ func (tkn *Tokenizer) scanBindVar() (int, string) {
 	if !isLetter(tkn.cur()) {
 		return LEX_ERROR, tkn.buf[start:tkn.Pos]
 	}
+	// If : is followed by a letter, it is a bindvariable. Example :v1, :v2
 	for {
 		ch := tkn.cur()
 		if !isLetter(ch) && !isDigit(ch) && ch != '.' {
@@ -476,6 +489,12 @@ func (tkn *Tokenizer) scanNumber() (int, string) {
 			token = HEXNUM
 			tkn.skip(1)
 			tkn.scanMantissa(16)
+			goto exit
+		}
+		if tkn.cur() == 'b' || tkn.cur() == 'B' {
+			token = BITNUM
+			tkn.skip(1)
+			tkn.scanMantissa(2)
 			goto exit
 		}
 	}
@@ -584,7 +603,11 @@ func (tkn *Tokenizer) scanStringSlow(buffer *strings.Builder, delim uint16, typ 
 				// String terminates mid escape character.
 				return LEX_ERROR, buffer.String()
 			}
-			if decodedChar := sqltypes.SQLDecodeMap[byte(tkn.cur())]; decodedChar == sqltypes.DontEscape {
+			// Preserve escaping of % and _
+			if tkn.cur() == '%' || tkn.cur() == '_' {
+				buffer.WriteByte('\\')
+				ch = tkn.cur()
+			} else if decodedChar := sqltypes.SQLDecodeMap[byte(tkn.cur())]; decodedChar == sqltypes.DontEscape {
 				ch = tkn.cur()
 			} else {
 				ch = uint16(decodedChar)
@@ -657,9 +680,9 @@ func (tkn *Tokenizer) scanMySQLSpecificComment() (int, string) {
 
 	commentVersion, sql := ExtractMysqlComment(tkn.buf[start:tkn.Pos])
 
-	if MySQLVersion >= commentVersion {
+	if tkn.parser.version >= commentVersion {
 		// Only add the special comment to the tokenizer if the version of MySQL is higher or equal to the comment version
-		tkn.specialComment = NewStringTokenizer(sql)
+		tkn.specialComment = tkn.parser.NewStringTokenizer(sql)
 	}
 
 	return tkn.Scan()
@@ -686,7 +709,6 @@ func (tkn *Tokenizer) reset() {
 	tkn.partialDDL = nil
 	tkn.specialComment = nil
 	tkn.posVarIndex = 0
-	tkn.nesting = 0
 	tkn.SkipToEnd = false
 }
 

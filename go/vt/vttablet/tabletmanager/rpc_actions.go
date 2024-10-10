@@ -17,12 +17,12 @@ limitations under the License.
 package tabletmanager
 
 import (
+	"context"
 	"fmt"
 	"time"
 
+	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/vt/vterrors"
-
-	"context"
 
 	"vitess.io/vitess/go/vt/hook"
 	"vitess.io/vitess/go/vt/mysqlctl"
@@ -66,14 +66,57 @@ func (tm *TabletManager) GetPermissions(ctx context.Context) (*tabletmanagerdata
 	return mysqlctl.GetPermissions(tm.MysqlDaemon)
 }
 
+// GetGlobalStatusVars returns the server's global status variables asked for.
+// An empty/nil variable name parameter slice means you want all of them.
+func (tm *TabletManager) GetGlobalStatusVars(ctx context.Context, variables []string) (map[string]string, error) {
+	return tm.MysqlDaemon.GetGlobalStatusVars(ctx, variables)
+}
+
 // SetReadOnly makes the mysql instance read-only or read-write.
 func (tm *TabletManager) SetReadOnly(ctx context.Context, rdonly bool) error {
 	if err := tm.lock(ctx); err != nil {
 		return err
 	}
 	defer tm.unlock()
+	superRo, err := tm.MysqlDaemon.IsSuperReadOnly(ctx)
+	if err != nil {
+		return err
+	}
 
-	return tm.MysqlDaemon.SetReadOnly(rdonly)
+	if !rdonly && superRo {
+		// If super read only is set, then we need to prepare the transactions before setting read_only OFF.
+		// We need to redo the prepared transactions in read only mode using the dba user to ensure we don't lose them.
+		// setting read_only OFF will also set super_read_only OFF if it was set.
+		// If super read only is already off, then we probably called this function from PRS or some other place
+		// because it is idempotent. We only need to redo prepared transactions the first time we transition from super read only
+		// to read write.
+		return tm.redoPreparedTransactionsAndSetReadWrite(ctx)
+	}
+	return tm.MysqlDaemon.SetReadOnly(ctx, rdonly)
+}
+
+// ChangeTags changes the tablet tags
+func (tm *TabletManager) ChangeTags(ctx context.Context, tabletTags map[string]string, replace bool) (map[string]string, error) {
+	if err := tm.lock(ctx); err != nil {
+		return nil, err
+	}
+	defer tm.unlock()
+
+	tags := tm.tmState.Tablet().Tags
+	if replace || len(tags) == 0 {
+		tags = tabletTags
+	} else {
+		for key, val := range tabletTags {
+			if val == "" {
+				delete(tags, key)
+				continue
+			}
+			tags[key] = val
+		}
+	}
+
+	tm.tmState.ChangeTabletTags(ctx, tags)
+	return tags, nil
 }
 
 // ChangeType changes the tablet type
@@ -82,14 +125,18 @@ func (tm *TabletManager) ChangeType(ctx context.Context, tabletType topodatapb.T
 		return err
 	}
 	defer tm.unlock()
-	return tm.changeTypeLocked(ctx, tabletType, DBActionNone, convertBoolToSemiSyncAction(semiSync))
+
+	semiSyncAction, err := tm.convertBoolToSemiSyncAction(ctx, semiSync)
+	if err != nil {
+		return err
+	}
+
+	return tm.changeTypeLocked(ctx, tabletType, DBActionNone, semiSyncAction)
 }
 
-// ChangeType changes the tablet type
+// changeTypeLocked changes the tablet type under a lock
 func (tm *TabletManager) changeTypeLocked(ctx context.Context, tabletType topodatapb.TabletType, action DBAction, semiSync SemiSyncAction) error {
-	// We don't want to allow multiple callers to claim a tablet as drained. There is a race that could happen during
-	// horizontal resharding where two vtworkers will try to DRAIN the same tablet. This check prevents that race from
-	// causing errors.
+	// We don't want to allow multiple callers to claim a tablet as drained.
 	if tabletType == topodatapb.TabletType_DRAINED && tm.Tablet().Type == topodatapb.TabletType_DRAINED {
 		return fmt.Errorf("Tablet: %v, is already drained", tm.tabletAlias)
 	}
@@ -99,7 +146,7 @@ func (tm *TabletManager) changeTypeLocked(ctx context.Context, tabletType topoda
 	}
 
 	// Let's see if we need to fix semi-sync acking.
-	if err := tm.fixSemiSyncAndReplication(tm.Tablet().Type, semiSync); err != nil {
+	if err := tm.fixSemiSyncAndReplication(ctx, tm.Tablet().Type, semiSync); err != nil {
 		return vterrors.Wrap(err, "fixSemiSyncAndReplication failed, may not ack correctly")
 	}
 	return nil
@@ -144,9 +191,24 @@ func (tm *TabletManager) RunHealthCheck(ctx context.Context) {
 	tm.QueryServiceControl.BroadcastHealth()
 }
 
-func convertBoolToSemiSyncAction(semiSync bool) SemiSyncAction {
-	if semiSync {
-		return SemiSyncActionSet
+func (tm *TabletManager) convertBoolToSemiSyncAction(ctx context.Context, semiSync bool) (SemiSyncAction, error) {
+	semiSyncExtensionLoaded, err := tm.MysqlDaemon.SemiSyncExtensionLoaded(ctx)
+	if err != nil {
+		return SemiSyncActionNone, err
 	}
-	return SemiSyncActionUnset
+
+	switch semiSyncExtensionLoaded {
+	case mysql.SemiSyncTypeSource, mysql.SemiSyncTypeMaster:
+		if semiSync {
+			return SemiSyncActionSet, nil
+		} else {
+			return SemiSyncActionUnset, nil
+		}
+	default:
+		if semiSync {
+			return SemiSyncActionNone, vterrors.VT09013()
+		} else {
+			return SemiSyncActionNone, nil
+		}
+	}
 }

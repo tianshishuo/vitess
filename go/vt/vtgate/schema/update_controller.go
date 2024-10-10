@@ -20,7 +20,7 @@ import (
 	"sync"
 	"time"
 
-	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/mysql/sqlerror"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 
@@ -84,9 +84,9 @@ func (u *updateController) consume() {
 // checkIfWeShouldIgnoreKeyspace inspects an error and
 // will mark a keyspace as failed and won't try to load more information from it
 func checkIfWeShouldIgnoreKeyspace(err error) bool {
-	sqlErr := mysql.NewSQLErrorFromError(err).(*mysql.SQLError)
-	if sqlErr.Num == mysql.ERBadDb || sqlErr.Num == mysql.ERNoSuchTable {
-		// if we are missing the db or table, not point in retrying
+	sqlErr := sqlerror.NewSQLErrorFromError(err).(*sqlerror.SQLError)
+	if sqlErr.Num == sqlerror.ERBadDb || sqlErr.Num == sqlerror.ERNoSuchTable {
+		// if we are missing the db or table, no point in retrying
 		return true
 	}
 	return false
@@ -97,6 +97,8 @@ func (u *updateController) getItemFromQueueLocked() *discovery.TabletHealth {
 	itemsCount := len(u.queue.items)
 	// Only when we want to update selected tables.
 	if u.loaded {
+		// We are trying to minimize the vttablet calls here by merging all the table/view changes received into a single changed item
+		// with all the table and view names.
 		for i := 1; i < itemsCount; i++ {
 			for _, table := range u.queue.items[i].Stats.TableSchemaChanged {
 				found := false
@@ -110,6 +112,18 @@ func (u *updateController) getItemFromQueueLocked() *discovery.TabletHealth {
 					item.Stats.TableSchemaChanged = append(item.Stats.TableSchemaChanged, table)
 				}
 			}
+			for _, view := range u.queue.items[i].Stats.ViewSchemaChanged {
+				found := false
+				for _, itemView := range item.Stats.ViewSchemaChanged {
+					if itemView == view {
+						found = true
+						break
+					}
+				}
+				if !found {
+					item.Stats.ViewSchemaChanged = append(item.Stats.ViewSchemaChanged, view)
+				}
+			}
 		}
 	}
 	// emptying queue's items as all items from 0 to i (length of the queue) are merged
@@ -119,7 +133,7 @@ func (u *updateController) getItemFromQueueLocked() *discovery.TabletHealth {
 
 func (u *updateController) add(th *discovery.TabletHealth) {
 	// For non-primary tablet health, there is no schema tracking.
-	if th.Tablet.Type != topodatapb.TabletType_PRIMARY {
+	if th.Target.TabletType != topodatapb.TabletType_PRIMARY {
 		return
 	}
 
@@ -134,11 +148,11 @@ func (u *updateController) add(th *discovery.TabletHealth) {
 	}
 
 	// If the keyspace schema is loaded and there is no schema change detected. Then there is nothing to process.
-	if len(th.Stats.TableSchemaChanged) == 0 && u.loaded {
+	if len(th.Stats.TableSchemaChanged) == 0 && len(th.Stats.ViewSchemaChanged) == 0 && !th.Stats.UdfsChanged && u.loaded {
 		return
 	}
 
-	if len(th.Stats.TableSchemaChanged) > 0 && u.ignore {
+	if (len(th.Stats.TableSchemaChanged) > 0 || len(th.Stats.ViewSchemaChanged) > 0 || th.Stats.UdfsChanged) && u.ignore {
 		// we got an update for this keyspace - we need to stop ignoring it, and reload everything
 		u.ignore = false
 		u.loaded = false

@@ -18,12 +18,12 @@ package discovery
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"sync"
 
 	"google.golang.org/protobuf/proto"
 
-	"vitess.io/vitess/go/sync2"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/topoproto"
 	"vitess.io/vitess/go/vt/vterrors"
@@ -35,10 +35,6 @@ import (
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 )
 
-var (
-	currentTabletUID sync2.AtomicInt32
-)
-
 // This file contains the definitions for a FakeHealthCheck class to
 // simulate a HealthCheck module. Note it is not in a sub-package because
 // otherwise it couldn't be used in this package's tests because of
@@ -47,17 +43,19 @@ var (
 // NewFakeHealthCheck returns the fake healthcheck object.
 func NewFakeHealthCheck(ch chan *TabletHealth) *FakeHealthCheck {
 	return &FakeHealthCheck{
-		items: make(map[string]*fhcItem),
-		ch:    ch,
+		items:      make(map[string]*fhcItem),
+		itemsAlias: make(map[string]*fhcItem),
+		ch:         ch,
 	}
 }
 
 // FakeHealthCheck implements discovery.HealthCheck.
 type FakeHealthCheck struct {
 	// mu protects the items map
-	mu    sync.RWMutex
-	items map[string]*fhcItem
-
+	mu               sync.RWMutex
+	items            map[string]*fhcItem
+	itemsAlias       map[string]*fhcItem
+	currentTabletUID uint32
 	// channel to return on subscribe. Pass nil if no subscribe should not return a channel
 	ch chan *TabletHealth
 }
@@ -90,6 +88,24 @@ func (fhc *FakeHealthCheck) GetHealthyTabletStats(target *querypb.Target) []*Tab
 		}
 	}
 	return result
+}
+
+// GetTabletHealthByAlias results the TabletHealth of the tablet that matches the given alias
+func (fhc *FakeHealthCheck) GetTabletHealthByAlias(alias *topodatapb.TabletAlias) (*TabletHealth, error) {
+	return fhc.GetTabletHealth("", alias)
+}
+
+// GetTabletHealth results the TabletHealth of the tablet that matches the given alias
+func (fhc *FakeHealthCheck) GetTabletHealth(kst KeyspaceShardTabletType, alias *topodatapb.TabletAlias) (*TabletHealth, error) {
+	fhc.mu.Lock()
+	defer fhc.mu.Unlock()
+
+	if hd, ok := fhc.itemsAlias[alias.String()]; ok {
+		if hd.ts.Tablet.Alias.String() == alias.String() {
+			return hd.ts, nil
+		}
+	}
+	return nil, fmt.Errorf("could not find tablet: %s", alias.String())
 }
 
 // Subscribe returns the channel in the struct. Subscribe should only be called in one place for this fake health check
@@ -160,6 +176,11 @@ func (fhc *FakeHealthCheck) SetTabletType(tablet *topodatapb.Tablet, tabletType 
 func (fhc *FakeHealthCheck) Unsubscribe(c chan *TabletHealth) {
 }
 
+// GetLoadTabletsTrigger is not implemented.
+func (fhc *FakeHealthCheck) GetLoadTabletsTrigger() chan struct{} {
+	return nil
+}
+
 // AddTablet adds the tablet.
 func (fhc *FakeHealthCheck) AddTablet(tablet *topodatapb.Tablet) {
 	key := TabletToMapKey(tablet)
@@ -179,6 +200,7 @@ func (fhc *FakeHealthCheck) AddTablet(tablet *topodatapb.Tablet) {
 	fhc.mu.Lock()
 	defer fhc.mu.Unlock()
 	fhc.items[key] = item
+	fhc.itemsAlias[tablet.Alias.String()] = item
 }
 
 // RemoveTablet removes the tablet.
@@ -207,7 +229,7 @@ func (fhc *FakeHealthCheck) ReplaceTablet(old, new *topodatapb.Tablet) {
 }
 
 // TabletConnection returns the TabletConn of the given tablet.
-func (fhc *FakeHealthCheck) TabletConnection(alias *topodatapb.TabletAlias, target *querypb.Target) (queryservice.QueryService, error) {
+func (fhc *FakeHealthCheck) TabletConnection(ctx context.Context, alias *topodatapb.TabletAlias, target *querypb.Target) (queryservice.QueryService, error) {
 	aliasStr := topoproto.TabletAliasString(alias)
 	fhc.mu.RLock()
 	defer fhc.mu.RUnlock()
@@ -221,19 +243,57 @@ func (fhc *FakeHealthCheck) TabletConnection(alias *topodatapb.TabletAlias, targ
 
 // CacheStatus returns the status for each tablet
 func (fhc *FakeHealthCheck) CacheStatus() TabletsCacheStatusList {
+	tcsMap := fhc.CacheStatusMap()
+	tcsl := make(TabletsCacheStatusList, 0, len(tcsMap))
+	for _, tcs := range tcsMap {
+		tcsl = append(tcsl, tcs)
+	}
+	sort.Sort(tcsl)
+	return tcsl
+}
+
+// HealthyStatus returns the status for each healthy tablet
+func (fhc *FakeHealthCheck) HealthyStatus() TabletsCacheStatusList {
+	tcsMap := fhc.CacheStatusMap()
+	tcsl := make(TabletsCacheStatusList, 0, len(tcsMap))
+	for _, tcs := range tcsMap {
+		tcsl = append(tcsl, tcs)
+	}
+	sort.Sort(tcsl)
+	return tcsl
+}
+
+// CacheStatusMap returns a map of the health check cache.
+func (fhc *FakeHealthCheck) CacheStatusMap() map[string]*TabletsCacheStatus {
+	tcsMap := make(map[string]*TabletsCacheStatus)
+	fhc.mu.Lock()
+	defer fhc.mu.Unlock()
+	for _, ths := range fhc.items {
+		key := fmt.Sprintf("%v.%v.%v.%v", ths.ts.Tablet.Alias.Cell, ths.ts.Target.Keyspace, ths.ts.Target.Shard, ths.ts.Target.TabletType.String())
+		var tcs *TabletsCacheStatus
+		var ok bool
+		if tcs, ok = tcsMap[key]; !ok {
+			tcs = &TabletsCacheStatus{
+				Cell:   ths.ts.Tablet.Alias.Cell,
+				Target: ths.ts.Target,
+			}
+			tcsMap[key] = tcs
+		}
+		tcs.TabletsStats = append(tcs.TabletsStats, ths.ts)
+	}
+	return tcsMap
+}
+
+// UpdateHealth adds a TabletHealth for the tablet defined in th.
+func (fhc *FakeHealthCheck) UpdateHealth(th *TabletHealth) {
 	fhc.mu.Lock()
 	defer fhc.mu.Unlock()
 
-	stats := make(TabletsCacheStatusList, 0, len(fhc.items))
-	for _, item := range fhc.items {
-		stats = append(stats, &TabletsCacheStatus{
-			Cell:         "FakeCell",
-			Target:       item.ts.Target,
-			TabletsStats: TabletStatsList{item.ts},
-		})
+	key := TabletToMapKey(th.Tablet)
+	if t, ok := fhc.items[key]; ok {
+		t.ts = th
+		fhc.itemsAlias[th.Tablet.Alias.String()].ts = th
 	}
-	sort.Sort(stats)
-	return stats
 }
 
 // Close is not implemented.
@@ -251,6 +311,7 @@ func (fhc *FakeHealthCheck) Reset() {
 	defer fhc.mu.Unlock()
 
 	fhc.items = make(map[string]*fhcItem)
+	fhc.currentTabletUID = 0
 }
 
 // AddFakeTablet inserts a fake entry into FakeHealthCheck.
@@ -258,18 +319,18 @@ func (fhc *FakeHealthCheck) Reset() {
 // The Listener is called, as if AddTablet had been called.
 // For flexibility the connection is created via a connFactory callback
 func (fhc *FakeHealthCheck) AddFakeTablet(cell, host string, port int32, keyspace, shard string, tabletType topodatapb.TabletType, serving bool, reparentTS int64, err error, connFactory func(*topodatapb.Tablet) queryservice.QueryService) queryservice.QueryService {
+	fhc.mu.Lock()
+	defer fhc.mu.Unlock()
+
 	// tabletUID must be unique
-	currentTabletUID.Add(1)
-	uid := currentTabletUID.Get()
-	t := topo.NewTablet(uint32(uid), cell, host)
+	fhc.currentTabletUID++
+	t := topo.NewTablet(fhc.currentTabletUID, cell, host)
 	t.Keyspace = keyspace
 	t.Shard = shard
 	t.Type = tabletType
 	t.PortMap["vt"] = port
 	key := TabletToMapKey(t)
 
-	fhc.mu.Lock()
-	defer fhc.mu.Unlock()
 	item := fhc.items[key]
 	if item == nil {
 		item = &fhcItem{
@@ -278,6 +339,7 @@ func (fhc *FakeHealthCheck) AddFakeTablet(cell, host string, port int32, keyspac
 			},
 		}
 		fhc.items[key] = item
+		fhc.itemsAlias[t.Alias.String()] = item
 	}
 	item.ts.Target = &querypb.Target{
 		Keyspace:   keyspace,
@@ -314,12 +376,24 @@ func (fhc *FakeHealthCheck) GetAllTablets() map[string]*topodatapb.Tablet {
 	return res
 }
 
+// BroadcastAll broadcasts all the tablets' healthchecks
+func (fhc *FakeHealthCheck) BroadcastAll() {
+	if fhc.ch == nil {
+		return
+	}
+	fhc.mu.Lock()
+	defer fhc.mu.Unlock()
+	for _, item := range fhc.items {
+		fhc.ch <- simpleCopy(item.ts)
+	}
+}
+
 func simpleCopy(th *TabletHealth) *TabletHealth {
 	return &TabletHealth{
 		Conn:                 th.Conn,
-		Tablet:               proto.Clone(th.Tablet).(*topodatapb.Tablet),
-		Target:               proto.Clone(th.Target).(*querypb.Target),
-		Stats:                proto.Clone(th.Stats).(*querypb.RealtimeStats),
+		Tablet:               th.Tablet.CloneVT(),
+		Target:               th.Target.CloneVT(),
+		Stats:                th.Stats.CloneVT(),
 		LastError:            th.LastError,
 		PrimaryTermStartTime: th.PrimaryTermStartTime,
 		Serving:              th.Serving,

@@ -20,12 +20,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/concurrency"
+	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/topoproto"
-	"vitess.io/vitess/go/vt/vtgate/evalengine"
+	"vitess.io/vitess/go/vt/vtctl/workflow/common"
+	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vttablet/tmclient"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
@@ -36,9 +40,6 @@ const (
 	// are prefixed by.
 	VExecTableQualifier = "_vt"
 
-	// SchemaMigrationsTableName is the unqualified name of the schema
-	// migrations table supported by vexec.
-	SchemaMigrationsTableName = "schema_migrations"
 	// VReplicationLogTableName is the unqualified name of the vreplication_log
 	// table supported by vexec.
 	VReplicationLogTableName = "vreplication_log"
@@ -95,6 +96,9 @@ type VExec struct {
 	// to support running in modes like:
 	// - Execute serially rather than concurrently.
 	// - Only return error if greater than some percentage of the targets fail.
+
+	parser      *sqlparser.Parser
+	shardSubset []string
 }
 
 // NewVExec returns a new instance suitable for making vexec queries to a given
@@ -102,13 +106,22 @@ type VExec struct {
 // string). The provided topo server is used to look up target tablets for
 // queries. A given instance will discover targets exactly once for its
 // lifetime, so to force a refresh, create another instance.
-func NewVExec(keyspace string, workflow string, ts *topo.Server, tmc tmclient.TabletManagerClient) *VExec {
+func NewVExec(keyspace string, workflow string, ts *topo.Server, tmc tmclient.TabletManagerClient, parser *sqlparser.Parser) *VExec {
 	return &VExec{
 		ts:       ts,
 		tmc:      tmc,
 		keyspace: keyspace,
 		workflow: workflow,
+		parser:   parser,
 	}
+}
+
+func (vx *VExec) SetShardSubset(shardSubset []string) {
+	vx.shardSubset = shardSubset
+}
+
+func (vx *VExec) GetShardSubset() []string {
+	return vx.shardSubset
 }
 
 // QueryContext executes the given vexec query, returning a mapping of tablet
@@ -127,7 +140,7 @@ func (vx *VExec) QueryContext(ctx context.Context, query string) (map[*topo.Tabl
 		}
 	}
 
-	stmt, err := sqlparser.Parse(query)
+	stmt, err := vx.parser.Parse(query)
 	if err != nil {
 		return nil, err
 	}
@@ -137,7 +150,7 @@ func (vx *VExec) QueryContext(ctx context.Context, query string) (map[*topo.Tabl
 		return nil, err
 	}
 
-	planner, err := vx.GetPlanner(ctx, table)
+	planner, err := vx.getPlanner(ctx, table)
 	if err != nil {
 		return nil, err
 	}
@@ -150,25 +163,70 @@ func (vx *VExec) QueryContext(ctx context.Context, query string) (map[*topo.Tabl
 	return qp.ExecuteScatter(ctx, vx.primaries...)
 }
 
+// CallbackContext executes the given callback, returning a mapping of tablet
+// to querypb.QueryResult.
+//
+// On first use, QueryContext will also cause the VExec instance to discover
+// target tablets from the topo; that target list will be reused for all future
+// callbacks executed by this instance.
+func (vx *VExec) CallbackContext(ctx context.Context, callback func(context.Context, *topo.TabletInfo) (*querypb.QueryResult, error)) (map[*topo.TabletInfo]*querypb.QueryResult, error) {
+	if vx.primaries == nil {
+		if err := vx.initialize(ctx); err != nil {
+			return nil, err
+		}
+	}
+	return vx.execCallback(ctx, callback)
+}
+
+// execCallback runs the provided callback function on backend shard primaries.
+// It collects query results from all shards and returns an aggregate (UNION
+// ALL -like) result.
+// Note: any nil results from the callback are ignored.
+func (vx *VExec) execCallback(ctx context.Context, callback func(context.Context, *topo.TabletInfo) (*querypb.QueryResult, error)) (map[*topo.TabletInfo]*querypb.QueryResult, error) {
+	var (
+		wg sync.WaitGroup
+		mu sync.Mutex
+
+		allErrors = &concurrency.AllErrorRecorder{}
+		results   = make(map[*topo.TabletInfo]*querypb.QueryResult)
+	)
+	for _, primary := range vx.primaries {
+		wg.Add(1)
+		go func(ctx context.Context, primary *topo.TabletInfo) {
+			defer wg.Done()
+			qr, err := callback(ctx, primary)
+			if err != nil {
+				allErrors.RecordError(err)
+			} else {
+				if qr == nil {
+					log.Infof("Callback returned nil result for tablet %s-%s", primary.Alias.Cell, primary.Alias.Uid)
+					return // no result
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				results[primary] = qr
+			}
+		}(ctx, primary)
+	}
+	wg.Wait()
+	return results, allErrors.AggrError(vterrors.Aggregate)
+}
+
 func (vx *VExec) initialize(ctx context.Context) error {
 	vx.primaries = nil
 
-	getShardsCtx, getShardsCancel := context.WithTimeout(ctx, *topo.RemoteOperationTimeout)
+	getShardsCtx, getShardsCancel := context.WithTimeout(ctx, topo.RemoteOperationTimeout)
 	defer getShardsCancel()
 
-	shards, err := vx.ts.GetShardNames(getShardsCtx, vx.keyspace)
+	shards, err := common.GetShards(getShardsCtx, vx.ts, vx.keyspace, vx.shardSubset)
 	if err != nil {
 		return err
-	}
-
-	if len(shards) == 0 {
-		return fmt.Errorf("%w %s", ErrNoShardsForKeyspace, vx.keyspace)
 	}
 
 	primaries := make([]*topo.TabletInfo, 0, len(shards))
 
 	for _, shard := range shards {
-		ctx, cancel := context.WithTimeout(ctx, *topo.RemoteOperationTimeout)
+		ctx, cancel := context.WithTimeout(ctx, topo.RemoteOperationTimeout)
 		defer cancel()
 
 		si, err := vx.ts.GetShard(ctx, vx.keyspace, shard)
@@ -197,13 +255,13 @@ func (vx *VExec) initialize(ctx context.Context) error {
 	return nil
 }
 
-// GetPlanner returns an appropriate implementation of a QueryPlanner, depending
+// getPlanner returns an appropriate implementation of a QueryPlanner, depending
 // on the table being queried.
 //
-// On first use, GetPlanner will also cause the VExec instance to discover
+// On first use, getPlanner will also cause the VExec instance to discover
 // target tablets from the topo; that target list will be reused for all future
 // queries made by this instance.
-func (vx *VExec) GetPlanner(ctx context.Context, table string) (QueryPlanner, error) { // TODO: private?
+func (vx *VExec) getPlanner(ctx context.Context, table string) (QueryPlanner, error) {
 	if vx.primaries == nil {
 		if err := vx.initialize(ctx); err != nil {
 			return nil, fmt.Errorf("error while initializing target list: %w", err)
@@ -227,7 +285,7 @@ func (vx *VExec) GetPlanner(ctx context.Context, table string) (QueryPlanner, er
 			tabletStreamIDMap[aliasStr] = make([]int64, len(qr.Rows))
 
 			for i, row := range qr.Rows {
-				id, err := evalengine.ToInt64(row[0])
+				id, err := row[0].ToCastInt64()
 				if err != nil {
 					return nil, err
 				}
@@ -237,8 +295,6 @@ func (vx *VExec) GetPlanner(ctx context.Context, table string) (QueryPlanner, er
 		}
 
 		return NewVReplicationLogQueryPlanner(vx.tmc, tabletStreamIDMap), nil
-	case qualifiedTableName(SchemaMigrationsTableName):
-		return nil, errors.New("Schema Migrations not yet supported in new workflow package")
 	default:
 		return nil, fmt.Errorf("%w: %v", ErrUnsupportedTable, table)
 	}
@@ -252,6 +308,7 @@ func (vx *VExec) WithWorkflow(workflow string) *VExec {
 		ts:        vx.ts,
 		tmc:       vx.tmc,
 		primaries: vx.primaries,
+		parser:    vx.parser,
 		workflow:  workflow,
 	}
 }
@@ -259,9 +316,9 @@ func (vx *VExec) WithWorkflow(workflow string) *VExec {
 func extractTableName(stmt sqlparser.Statement) (string, error) {
 	switch stmt := stmt.(type) {
 	case *sqlparser.Update:
-		return sqlparser.String(stmt.TableExprs), nil
+		return sqlparser.ToString(stmt.TableExprs), nil
 	case *sqlparser.Delete:
-		return sqlparser.String(stmt.TableExprs), nil
+		return sqlparser.ToString(stmt.TableExprs), nil
 	case *sqlparser.Insert:
 		return sqlparser.String(stmt.Table), nil
 	case *sqlparser.Select:

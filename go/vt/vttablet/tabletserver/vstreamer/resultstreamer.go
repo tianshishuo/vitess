@@ -23,8 +23,12 @@ import (
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/dbconfigs"
-	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
+	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/sqlparser"
+	vttablet "vitess.io/vitess/go/vt/vttablet/common"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/throttle/throttlerapp"
+
+	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 )
 
 // resultStreamer streams the results of the requested query
@@ -37,7 +41,7 @@ type resultStreamer struct {
 
 	cp        dbconfigs.Connector
 	query     string
-	tableName sqlparser.TableIdent
+	tableName sqlparser.IdentifierCS
 	send      func(*binlogdatapb.VStreamResultsResponse) error
 	vse       *Engine
 	pktsize   PacketSizer
@@ -52,7 +56,7 @@ func newResultStreamer(ctx context.Context, cp dbconfigs.Connector, query string
 		query:   query,
 		send:    send,
 		vse:     vse,
-		pktsize: DefaultPacketSizer(),
+		pktsize: DefaultPacketSizer(vttablet.VStreamerUseDynamicPacketSize, vttablet.VStreamerDefaultPacketSize),
 	}
 }
 
@@ -61,7 +65,7 @@ func (rs *resultStreamer) Cancel() {
 }
 
 func (rs *resultStreamer) Stream() error {
-	_, fromTable, err := analyzeSelect(rs.query)
+	_, fromTable, err := analyzeSelect(rs.query, rs.vse.env.Environment().Parser())
 	if err != nil {
 		return err
 	}
@@ -72,7 +76,10 @@ func (rs *resultStreamer) Stream() error {
 		return err
 	}
 	defer conn.Close()
-	gtid, err := conn.streamWithSnapshot(rs.ctx, rs.tableName.String(), rs.query)
+	gtid, rotatedLog, err := conn.streamWithSnapshot(rs.ctx, rs.tableName.String(), rs.query)
+	if rotatedLog {
+		rs.vse.vstreamerFlushedBinlogs.Add(1)
+	}
 	if err != nil {
 		return err
 	}
@@ -93,6 +100,8 @@ func (rs *resultStreamer) Stream() error {
 
 	response := &binlogdatapb.VStreamResultsResponse{}
 	byteCount := 0
+	loggerName := fmt.Sprintf("%s (%v)", rs.vse.GetTabletInfo(), rs.tableName)
+	logger := logutil.NewThrottledLogger(loggerName, throttledLoggerInterval)
 	for {
 		select {
 		case <-rs.ctx.Done():
@@ -101,7 +110,8 @@ func (rs *resultStreamer) Stream() error {
 		}
 
 		// check throttler.
-		if !rs.vse.throttlerClient.ThrottleCheckOKOrWait(rs.ctx) {
+		if _, ok := rs.vse.throttlerClient.ThrottleCheckOKOrWaitAppName(rs.ctx, throttlerapp.ResultStreamerName); !ok {
+			logger.Infof("throttled.")
 			continue
 		}
 

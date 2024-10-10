@@ -24,14 +24,17 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"vitess.io/vitess/go/mysql/collations/colldata"
+
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/mysql/collations"
-	"vitess.io/vitess/go/mysql/collations/internal/charset"
+	"vitess.io/vitess/go/mysql/collations/charset"
 	"vitess.io/vitess/go/mysql/collations/remote"
 	"vitess.io/vitess/go/sqltypes"
 )
-
-var defaultenv = collations.Local()
 
 type testweight struct {
 	collation string
@@ -49,18 +52,15 @@ func testRemoteWeights(t *testing.T, golden io.Writer, cases []testweight) {
 
 	for _, tc := range cases {
 		t.Run(tc.collation, func(t *testing.T) {
-			local := defaultenv.LookupByName(tc.collation)
+			local := collations.MySQL8().LookupByName(tc.collation)
 			remote := remote.NewCollation(conn, tc.collation)
-			localResult := local.WeightString(nil, tc.input, 0)
+			localResult := colldata.Lookup(local).WeightString(nil, tc.input, 0)
 			remoteResult := remote.WeightString(nil, tc.input, 0)
 
 			if err := remote.LastError(); err != nil {
 				t.Fatalf("remote collation failed: %v", err)
 			}
-
-			if !bytes.Equal(localResult, remoteResult) {
-				t.Errorf("expected WEIGHT_STRING(%#v) = %#v (got %#v)", tc.input, remoteResult, localResult)
-			}
+			assert.True(t, bytes.Equal(localResult, remoteResult), "expected WEIGHT_STRING(%#v) = %#v (got %#v)", tc.input, remoteResult, localResult)
 
 			if golden != nil {
 				fmt.Fprintf(golden, "{\n\tcollation: %q,\n\texpected: %#v,\n},\n", tc.collation, remoteResult)
@@ -85,17 +85,16 @@ func testRemoteComparison(t *testing.T, golden io.Writer, cases []testcmp) {
 
 	for _, tc := range cases {
 		t.Run(tc.collation, func(t *testing.T) {
-			local := defaultenv.LookupByName(tc.collation)
+			local := collations.MySQL8().LookupByName(tc.collation)
 			remote := remote.NewCollation(conn, tc.collation)
-			localResult := normalizecmp(local.Collate(tc.left, tc.right, false))
+			localResult := normalizecmp(colldata.Lookup(local).Collate(tc.left, tc.right, false))
 			remoteResult := remote.Collate(tc.left, tc.right, false)
 
 			if err := remote.LastError(); err != nil {
 				t.Fatalf("remote collation failed: %v", err)
 			}
-			if localResult != remoteResult {
-				t.Errorf("expected STRCMP(%q, %q) = %d (got %d)", string(tc.left), string(tc.right), remoteResult, localResult)
-			}
+			assert.Equal(t, remoteResult, localResult, "expected STRCMP(%q, %q) = %d (got %d)", string(tc.left), string(tc.right), remoteResult, localResult)
+
 			if golden != nil {
 				fmt.Fprintf(golden, "{\n\tcollation: %q,\n\tleft: %#v,\n\tright: %#v,\n\texpected: %d,\n},\n",
 					tc.collation, tc.left, tc.right, remoteResult)
@@ -104,22 +103,18 @@ func testRemoteComparison(t *testing.T, golden io.Writer, cases []testcmp) {
 	}
 }
 
-func verifyTranscoding(t *testing.T, local collations.Collation, remote *remote.Collation, text []byte) []byte {
+func verifyTranscoding(t *testing.T, local colldata.Collation, remote *remote.Collation, text []byte) []byte {
 	transRemote, err := charset.ConvertFromUTF8(nil, remote.Charset(), text)
-	if err != nil {
-		t.Fatalf("remote transcoding failed: %v", err)
-	}
+	require.NoError(t, err, "remote transcoding failed: %v", err)
 
 	transLocal, _ := charset.ConvertFromUTF8(nil, local.Charset(), text)
-	if !bytes.Equal(transLocal, transRemote) {
-		t.Fatalf("transcoding mismatch with %s (%d, charset: %s)\ninput:\n%s\nremote:\n%s\nlocal:\n%s\n",
-			local.Name(), local.ID(), local.Charset().Name(),
-			hex.Dump(text), hex.Dump(transRemote), hex.Dump(transLocal))
-	}
+	require.True(t, bytes.Equal(transLocal, transRemote), "transcoding mismatch with %s (%d, charset: %s)\ninput:\n%s\nremote:\n%s\nlocal:\n%s\n", local.Name(), local.ID(), local.Charset().Name(),
+		hex.Dump(text), hex.Dump(transRemote), hex.Dump(transLocal))
+
 	return transLocal
 }
 
-func verifyWeightString(t *testing.T, local collations.Collation, remote *remote.Collation, text []byte) {
+func verifyWeightString(t *testing.T, local colldata.Collation, remote *remote.Collation, text []byte) {
 	localResult := local.WeightString(nil, text, 0)
 	remoteResult := remote.WeightString(nil, text, 0)
 
@@ -145,9 +140,8 @@ func verifyWeightString(t *testing.T, local collations.Collation, remote *remote
 
 func exec(t *testing.T, conn *mysql.Conn, query string) *sqltypes.Result {
 	res, err := conn.ExecuteFetch(query, -1, true)
-	if err != nil {
-		t.Fatalf("failed to execute %q: %v", query, err)
-	}
+	require.NoError(t, err, "failed to execute %q: %v", query, err)
+
 	return res
 }
 

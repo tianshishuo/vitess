@@ -26,9 +26,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"vitess.io/vitess/go/vt/log"
-
+	"vitess.io/vitess/go/constants/sidecar"
 	"vitess.io/vitess/go/test/endtoend/cluster"
+	"vitess.io/vitess/go/vt/log"
 )
 
 var (
@@ -84,7 +84,7 @@ func TestMain(m *testing.M) {
 		if err := clusterInstance.StartTopo(); err != nil {
 			return 1, err
 		}
-		if err := clusterInstance.VtctlProcess.CreateKeyspace(keyspaceName); err != nil {
+		if err := clusterInstance.VtctlProcess.CreateKeyspace(keyspaceName, sidecar.DefaultName, ""); err != nil {
 			return 1, err
 		}
 
@@ -108,10 +108,13 @@ func TestShardedKeyspace(t *testing.T) {
 
 	shard1Primary := shard1.Vttablets[0]
 	shard2Primary := shard2.Vttablets[0]
-	err := clusterInstance.VtctlclientProcess.InitializeShard(keyspaceName, shard1.Name, cell, shard1Primary.TabletUID)
+	err := clusterInstance.VtctldClientProcess.InitializeShard(keyspaceName, shard1.Name, cell, shard1Primary.TabletUID)
 	require.Nil(t, err)
-	err = clusterInstance.VtctlclientProcess.InitializeShard(keyspaceName, shard2.Name, cell, shard2Primary.TabletUID)
+	err = clusterInstance.VtctldClientProcess.InitializeShard(keyspaceName, shard2.Name, cell, shard2Primary.TabletUID)
 	require.Nil(t, err)
+
+	err = clusterInstance.StartVTOrc(keyspaceName)
+	require.NoError(t, err)
 
 	// apply the schema on the first shard through vtctl, so all tablets
 	// are the same.
@@ -122,7 +125,7 @@ func TestShardedKeyspace(t *testing.T) {
 	_, err = shard2Primary.VttabletProcess.QueryTablet(sqlSchemaReverse, keyspaceName, true)
 	require.Nil(t, err)
 
-	if err = clusterInstance.VtctlclientProcess.ApplyVSchema(keyspaceName, vSchema); err != nil {
+	if err = clusterInstance.VtctldClientProcess.ApplyVSchema(keyspaceName, vSchema); err != nil {
 		log.Error(err.Error())
 		return
 	}
@@ -133,13 +136,13 @@ func TestShardedKeyspace(t *testing.T) {
 		shard2Primary.Alias,
 		shard2.Vttablets[1].Alias)
 
-	_ = clusterInstance.VtctlclientProcess.ExecuteCommand("SetReadWrite", shard1Primary.Alias)
-	_ = clusterInstance.VtctlclientProcess.ExecuteCommand("SetReadWrite", shard2Primary.Alias)
+	_ = clusterInstance.VtctldClientProcess.ExecuteCommand("SetWritable", shard1Primary.Alias, "true")
+	_ = clusterInstance.VtctldClientProcess.ExecuteCommand("SetWritable", shard2Primary.Alias, "true")
 
 	_, _ = shard1Primary.VttabletProcess.QueryTablet("insert into vt_select_test (id, msg) values (1, 'test 1')", keyspaceName, true)
 	_, _ = shard2Primary.VttabletProcess.QueryTablet("insert into vt_select_test (id, msg) values (10, 'test 10')", keyspaceName, true)
 
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("Validate", "-ping-tablets")
+	err = clusterInstance.VtctldClientProcess.ExecuteCommand("Validate", "--ping-tablets")
 	require.Nil(t, err)
 
 	rows, err := shard1Primary.VttabletProcess.QueryTablet("select id, msg from vt_select_test order by id", keyspaceName, true)
@@ -161,9 +164,9 @@ func TestShardedKeyspace(t *testing.T) {
 	assert.Contains(t, output, shard1Primary.Alias+": CREATE TABLE")
 	assert.Contains(t, output, shard2Primary.Alias+": CREATE TABLE")
 
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("ValidateVersionShard", fmt.Sprintf("%s/%s", keyspaceName, shard1.Name))
+	err = clusterInstance.VtctldClientProcess.ExecuteCommand("ValidateVersionShard", fmt.Sprintf("%s/%s", keyspaceName, shard1.Name))
 	require.Nil(t, err)
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("GetPermissions", shard1.Vttablets[1].Alias)
+	err = clusterInstance.VtctldClientProcess.ExecuteCommand("GetPermissions", shard1.Vttablets[1].Alias)
 	require.Nil(t, err)
 	err = clusterInstance.VtctlclientProcess.ExecuteCommand("ValidatePermissionsShard", fmt.Sprintf("%s/%s", keyspaceName, shard1.Name))
 	require.Nil(t, err)
@@ -181,7 +184,7 @@ func TestShardedKeyspace(t *testing.T) {
 
 func reloadSchemas(t *testing.T, aliases ...string) {
 	for _, alias := range aliases {
-		if err := clusterInstance.VtctlclientProcess.ExecuteCommand("ReloadSchema", alias); err != nil {
+		if err := clusterInstance.VtctldClientProcess.ExecuteCommand("ReloadSchema", alias); err != nil {
 			assert.Fail(t, "Unable to reload schema")
 		}
 
@@ -213,7 +216,11 @@ func initCluster(shardNames []string, totalTabletsRequired int) {
 				tablet.Type = "primary"
 			}
 			// Start Mysqlctl process
-			tablet.MysqlctlProcess = *cluster.MysqlCtlProcessInstance(tablet.TabletUID, tablet.MySQLPort, clusterInstance.TmpDirectory)
+			mysqlctlProcess, err := cluster.MysqlCtlProcessInstance(tablet.TabletUID, tablet.MySQLPort, clusterInstance.TmpDirectory)
+			if err != nil {
+				return
+			}
+			tablet.MysqlctlProcess = *mysqlctlProcess
 			proc, err := tablet.MysqlctlProcess.StartProcess()
 			if err != nil {
 				return
@@ -234,7 +241,6 @@ func initCluster(shardNames []string, totalTabletsRequired int) {
 				clusterInstance.Hostname,
 				clusterInstance.TmpDirectory,
 				clusterInstance.VtTabletExtraArgs,
-				clusterInstance.EnableSemiSync,
 				clusterInstance.DefaultCharset)
 			tablet.Alias = tablet.VttabletProcess.TabletPath
 

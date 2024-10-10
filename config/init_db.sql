@@ -1,25 +1,22 @@
-# This file is executed immediately after mysql_install_db,
-# to initialize a fresh data directory.
-
-###############################################################################
-# WARNING: This sql is *NOT* safe for production use,
-#          as it contains default well-known users and passwords.
-#          Care should be taken to change these users and passwords
-#          for production.
-###############################################################################
+# This file is executed immediately after initializing a fresh data directory.
 
 ###############################################################################
 # Equivalent of mysql_secure_installation
 ###############################################################################
+# We need to ensure that super_read_only is disabled so that we can execute
+# these commands. Note that disabling it does NOT disable read_only.
+# We save the current value so that we only re-enable it at the end if it was
+# enabled before.
+
+SET @original_super_read_only=IF(@@global.super_read_only=1, 'ON', 'OFF');
+SET GLOBAL super_read_only='OFF';
 
 # Changes during the init db should not make it to the binlog.
 # They could potentially create errant transactions on replicas.
 SET sql_log_bin = 0;
-# Remove anonymous users.
-DELETE FROM mysql.user WHERE User = '';
 
-# Disable remote root access (only allow UNIX socket).
-DELETE FROM mysql.user WHERE User = 'root' AND Host != 'localhost';
+# Remove anonymous users & disable remote root access (only allow UNIX socket).
+DROP USER IF EXISTS ''@'%', ''@'localhost', 'root'@'%';
 
 # Remove test database.
 DROP DATABASE IF EXISTS test;
@@ -28,33 +25,17 @@ DROP DATABASE IF EXISTS test;
 # Vitess defaults
 ###############################################################################
 
-# Vitess-internal database.
-CREATE DATABASE IF NOT EXISTS _vt;
-# Note that definitions of local_metadata and shard_metadata should be the same
-# as in production which is defined in go/vt/mysqlctl/metadata_tables.go.
-CREATE TABLE IF NOT EXISTS _vt.local_metadata (
-  name VARCHAR(255) NOT NULL,
-  value VARCHAR(255) NOT NULL,
-  db_name VARBINARY(255) NOT NULL,
-  PRIMARY KEY (db_name, name)
-  ) ENGINE=InnoDB;
-CREATE TABLE IF NOT EXISTS _vt.shard_metadata (
-  name VARCHAR(255) NOT NULL,
-  value MEDIUMBLOB NOT NULL,
-  db_name VARBINARY(255) NOT NULL,
-  PRIMARY KEY (db_name, name)
-  ) ENGINE=InnoDB;
-
 # Admin user with all privileges.
 CREATE USER 'vt_dba'@'localhost';
 GRANT ALL ON *.* TO 'vt_dba'@'localhost';
 GRANT GRANT OPTION ON *.* TO 'vt_dba'@'localhost';
+GRANT PROXY ON ''@'' TO 'vt_dba'@'localhost' WITH GRANT OPTION;
 
 # User for app traffic, with global read-write access.
 CREATE USER 'vt_app'@'localhost';
 GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, RELOAD, PROCESS, FILE,
   REFERENCES, INDEX, ALTER, SHOW DATABASES, CREATE TEMPORARY TABLES,
-  LOCK TABLES, EXECUTE, REPLICATION SLAVE, REPLICATION CLIENT, CREATE VIEW,
+  LOCK TABLES, EXECUTE, REPLICATION CLIENT, CREATE VIEW,
   SHOW VIEW, CREATE ROUTINE, ALTER ROUTINE, CREATE USER, EVENT, TRIGGER
   ON *.* TO 'vt_app'@'localhost';
 
@@ -75,8 +56,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, RELOAD, PROCESS, FILE,
 CREATE USER 'vt_repl'@'%';
 GRANT REPLICATION SLAVE ON *.* TO 'vt_repl'@'%';
 
-# User for Vitess filtered replication (binlog player).
-# Same permissions as vt_app.
+# User for Vitess VReplication (base vstreamers and vplayer).
 CREATE USER 'vt_filtered'@'localhost';
 GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, RELOAD, PROCESS, FILE,
   REFERENCES, INDEX, ALTER, SHOW DATABASES, CREATE TEMPORARY TABLES,
@@ -91,14 +71,8 @@ GRANT SELECT, PROCESS, SUPER, REPLICATION CLIENT, RELOAD
 GRANT SELECT, UPDATE, DELETE, DROP
   ON performance_schema.* TO 'vt_monitoring'@'localhost';
 
-# User for Orchestrator (https://github.com/openark/orchestrator).
-CREATE USER 'orc_client_user'@'%' IDENTIFIED BY 'orc_client_user_password';
-GRANT SUPER, PROCESS, REPLICATION SLAVE, RELOAD
-  ON *.* TO 'orc_client_user'@'%';
-GRANT SELECT
-  ON _vt.* TO 'orc_client_user'@'%';
+# custom sql is used to add custom scripts like creating users/passwords. We use it in our tests
+# {{custom_sql}}
 
-FLUSH PRIVILEGES;
-
-RESET SLAVE ALL;
-RESET MASTER;
+# We need to set super_read_only back to what it was before
+SET GLOBAL super_read_only=IFNULL(@original_super_read_only, 'ON');

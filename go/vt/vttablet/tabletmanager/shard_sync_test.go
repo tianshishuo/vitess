@@ -44,10 +44,11 @@ const (
 )
 
 func TestShardSync(t *testing.T) {
-	ctx := context.Background()
-	ts := memorytopo.NewServer("cell1")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ts := memorytopo.NewServer(ctx, "cell1")
 	statsTabletTypeCount.ResetAll()
-	tm := newTestTM(t, ts, 100, keyspace, shard)
+	tm := newTestTM(t, ts, 100, keyspace, shard, nil)
 	defer tm.Stop()
 
 	// update the primary info in the shard record and set it to nil

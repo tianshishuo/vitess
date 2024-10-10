@@ -18,10 +18,11 @@ package vtgate
 
 import (
 	"fmt"
-	"html/template"
 	"net/http"
 	"sync/atomic"
 	"time"
+
+	"github.com/google/safehtml/template"
 
 	"vitess.io/vitess/go/vt/logz"
 
@@ -61,8 +62,7 @@ func (e *Executor) gatherScatterStats() (statsResults, error) {
 	plans := make([]*engine.Plan, 0)
 	routes := make([]*engine.Route, 0)
 	// First we go over all plans and collect statistics and all query plans for scatter queries
-	e.plans.ForEach(func(value interface{}) bool {
-		plan := value.(*engine.Plan)
+	e.ForEachPlan(func(plan *engine.Plan) bool {
 		scatter := engine.Find(findScatter, plan.Instructions)
 		readOnly := !engine.Exists(isUpdating, plan.Instructions)
 		isScatter := scatter != nil
@@ -109,7 +109,7 @@ func (e *Executor) gatherScatterStats() (statsResults, error) {
 			PercentTimeOfScatters:  100 * float64(execTime) / float64(scatterExecTime),
 			PercentCountOfReads:    100 * float64(execCount) / float64(readOnlyCount),
 			PercentCountOfScatters: 100 * float64(execCount) / float64(scatterCount),
-			From:                   route.Keyspace.Name + "." + route.TableName,
+			From:                   route.Keyspace.Name + "." + route.GetTableName(),
 			Count:                  execCount,
 		}
 	}

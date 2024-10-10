@@ -18,31 +18,60 @@ package planbuilder
 
 import (
 	"vitess.io/vitess/go/vt/key"
-	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/engine"
 	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
+	"vitess.io/vitess/go/vt/vtgate/vindexes"
 )
 
-func buildPlanForBypass(stmt sqlparser.Statement, _ *sqlparser.ReservedVars, vschema plancontext.VSchema) (engine.Primitive, error) {
-	switch vschema.Destination().(type) {
-	case key.DestinationExactKeyRange:
-		if _, ok := stmt.(*sqlparser.Insert); ok {
-			return nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "INSERT not supported when targeting a key range: %s", vschema.TargetString())
-		}
-	}
-
+func buildPlanForBypass(stmt sqlparser.Statement, _ *sqlparser.ReservedVars, vschema plancontext.VSchema) (*planResult, error) {
 	keyspace, err := vschema.DefaultKeyspace()
 	if err != nil {
 		return nil, err
 	}
-	return &engine.Send{
+	switch dest := vschema.Destination().(type) {
+	case key.DestinationExactKeyRange:
+		if _, ok := stmt.(*sqlparser.Insert); ok {
+			return nil, vterrors.VT03023(vschema.TargetString())
+		}
+	case key.DestinationShard:
+		if !vschema.IsShardRoutingEnabled() {
+			break
+		}
+		shard := string(dest)
+		targetKeyspace, err := GetShardRoute(vschema, keyspace.Name, shard)
+		if err != nil {
+			return nil, err
+		}
+		if targetKeyspace != nil {
+			keyspace = targetKeyspace
+		}
+	}
+
+	hints := &queryHints{}
+	if comments, ok := stmt.(sqlparser.Commented); ok {
+		if qh := getHints(comments.GetParsedComments()); qh != nil {
+			hints = qh
+		}
+	}
+
+	send := &engine.Send{
 		Keyspace:             keyspace,
 		TargetDestination:    vschema.Destination(),
 		Query:                sqlparser.String(stmt),
 		IsDML:                sqlparser.IsDMLStatement(stmt),
 		SingleShardOnly:      false,
-		MultishardAutocommit: sqlparser.MultiShardAutocommitDirective(stmt),
-	}, nil
+		MultishardAutocommit: hints.multiShardAutocommit,
+		QueryTimeout:         hints.queryTimeout,
+	}
+	return newPlanResult(send), nil
+}
+
+func GetShardRoute(vschema plancontext.VSchema, keyspace, shard string) (*vindexes.Keyspace, error) {
+	targetKeyspaceName, err := vschema.FindRoutedShard(keyspace, shard)
+	if err != nil {
+		return nil, err
+	}
+	return vschema.FindKeyspace(targetKeyspaceName)
 }

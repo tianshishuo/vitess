@@ -17,18 +17,22 @@ limitations under the License.
 package grpcvtctlclient
 
 import (
-	"flag"
+	"context"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"testing"
 
+	"github.com/spf13/pflag"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 
+	"vitess.io/vitess/go/vt/grpcclient"
 	"vitess.io/vitess/go/vt/servenv"
 	"vitess.io/vitess/go/vt/vtctl/grpcvtctlserver"
 	"vitess.io/vitess/go/vt/vtctl/vtctlclienttest"
+	"vitess.io/vitess/go/vt/vtenv"
 
 	vtctlservicepb "vitess.io/vitess/go/vt/proto/vtctlservice"
 )
@@ -36,7 +40,9 @@ import (
 // the test here creates a fake server implementation, a fake client
 // implementation, and runs the test suite against the setup.
 func TestVtctlServer(t *testing.T) {
-	ts := vtctlclienttest.CreateTopoServer(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ts := vtctlclienttest.CreateTopoServer(t, ctx)
 
 	// Listen on a random port
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -47,11 +53,11 @@ func TestVtctlServer(t *testing.T) {
 
 	// Create a gRPC server and listen on the port
 	server := grpc.NewServer()
-	vtctlservicepb.RegisterVtctlServer(server, grpcvtctlserver.NewVtctlServer(ts))
+	vtctlservicepb.RegisterVtctlServer(server, grpcvtctlserver.NewVtctlServer(vtenv.NewTestEnv(), ts))
 	go server.Serve(listener)
 
 	// Create a VtctlClient gRPC client to talk to the fake server
-	client, err := gRPCVtctlClientFactory(fmt.Sprintf("localhost:%v", port))
+	client, err := gRPCVtctlClientFactory(ctx, fmt.Sprintf("localhost:%v", port))
 	if err != nil {
 		t.Fatalf("Cannot create client: %v", err)
 	}
@@ -63,7 +69,9 @@ func TestVtctlServer(t *testing.T) {
 // the test here creates a fake server implementation, a fake client with auth
 // implementation, and runs the test suite against the setup.
 func TestVtctlAuthClient(t *testing.T) {
-	ts := vtctlclienttest.CreateTopoServer(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ts := vtctlclienttest.CreateTopoServer(t, ctx)
 
 	// Listen on a random port
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -79,7 +87,7 @@ func TestVtctlAuthClient(t *testing.T) {
 	opts = append(opts, grpc.UnaryInterceptor(servenv.FakeAuthUnaryInterceptor))
 	server := grpc.NewServer(opts...)
 
-	vtctlservicepb.RegisterVtctlServer(server, grpcvtctlserver.NewVtctlServer(ts))
+	vtctlservicepb.RegisterVtctlServer(server, grpcvtctlserver.NewVtctlServer(vtenv.NewTestEnv(), ts))
 	go server.Serve(listener)
 
 	authJSON := `{
@@ -99,10 +107,17 @@ func TestVtctlAuthClient(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	flag.Set("grpc_auth_static_client_creds", f.Name())
+	fs := pflag.NewFlagSet("", pflag.ContinueOnError)
+	grpcclient.RegisterFlags(fs)
+
+	err = fs.Parse([]string{
+		"--grpc_auth_static_client_creds",
+		f.Name(),
+	})
+	require.NoError(t, err, "failed to set `--grpc_auth_static_client_creds=%s`", f.Name())
 
 	// Create a VtctlClient gRPC client to talk to the fake server
-	client, err := gRPCVtctlClientFactory(fmt.Sprintf("localhost:%v", port))
+	client, err := gRPCVtctlClientFactory(ctx, fmt.Sprintf("localhost:%v", port))
 	if err != nil {
 		t.Fatalf("Cannot create client: %v", err)
 	}

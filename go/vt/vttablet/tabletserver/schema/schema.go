@@ -20,6 +20,8 @@ import (
 	"sync"
 	"time"
 
+	"vitess.io/vitess/go/vt/log"
+
 	"vitess.io/vitess/go/vt/sqlparser"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
@@ -30,6 +32,7 @@ const (
 	NoType = iota
 	Sequence
 	Message
+	View
 )
 
 // TypeNames allows to fetch a the type name for a table.
@@ -38,11 +41,12 @@ var TypeNames = []string{
 	"none",
 	"sequence",
 	"message",
+	"view",
 }
 
 // Table contains info about a table.
 type Table struct {
-	Name      sqlparser.TableIdent
+	Name      sqlparser.IdentifierCS
 	Fields    []*querypb.Field
 	PKColumns []int
 	Type      int
@@ -58,7 +62,7 @@ type Table struct {
 	AllocatedSize uint64
 }
 
-// SequenceInfo contains info specific to sequence tabels.
+// SequenceInfo contains info specific to sequence tables.
 // It must be locked before accessing the values inside.
 // If CurVal==LastVal, we have to cache new values.
 // When the schema is first loaded, the values are all 0,
@@ -67,6 +71,23 @@ type SequenceInfo struct {
 	sync.Mutex
 	NextVal int64
 	LastVal int64
+}
+
+// Reset clears the cache for the sequence. This is called to ensure that we always start with a fresh cache,
+// when a new primary is elected, and, when a table is moved into a new keyspace.
+// When we first need a new value from a sequence, i.e. when the schema engine sees a uninitialized sequence, it will
+// get the next set of values from the backing sequence table and cache them.
+func (seq *SequenceInfo) Reset() {
+	seq.Lock()
+	defer seq.Unlock()
+	seq.NextVal = 0
+	seq.LastVal = 0
+}
+
+func (seq *SequenceInfo) String() {
+	seq.Lock()
+	defer seq.Unlock()
+	log.Infof("SequenceInfo: NextVal: %d, LastVal: %d", seq.NextVal, seq.LastVal)
 }
 
 // MessageInfo contains info specific to message tables.
@@ -107,15 +128,16 @@ type MessageInfo struct {
 }
 
 // NewTable creates a new Table.
-func NewTable(name string) *Table {
+func NewTable(name string, tableType int) *Table {
 	return &Table{
-		Name: sqlparser.NewTableIdent(name),
+		Name: sqlparser.NewIdentifierCS(name),
+		Type: tableType,
 	}
 }
 
 // FindColumn finds a column in the table. It returns the index if found.
 // Otherwise, it returns -1.
-func (ta *Table) FindColumn(name sqlparser.ColIdent) int {
+func (ta *Table) FindColumn(name sqlparser.IdentifierCI) int {
 	for i, col := range ta.Fields {
 		if name.EqualString(col.Name) {
 			return i

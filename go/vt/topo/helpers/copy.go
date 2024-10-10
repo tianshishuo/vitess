@@ -20,27 +20,31 @@ package helpers
 
 import (
 	"context"
+	"fmt"
 
 	"google.golang.org/protobuf/proto"
 
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/vtgate/vindexes"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 // CopyKeyspaces will create the keyspaces in the destination topo.
-func CopyKeyspaces(ctx context.Context, fromTS, toTS *topo.Server) {
+func CopyKeyspaces(ctx context.Context, fromTS, toTS *topo.Server, parser *sqlparser.Parser) error {
 	keyspaces, err := fromTS.GetKeyspaces(ctx)
 	if err != nil {
-		log.Fatalf("GetKeyspaces: %v", err)
+		return fmt.Errorf("GetKeyspaces: %w", err)
 	}
 
 	for _, keyspace := range keyspaces {
 
 		ki, err := fromTS.GetKeyspace(ctx, keyspace)
 		if err != nil {
-			log.Fatalf("GetKeyspace(%v): %v", keyspace, err)
+			return fmt.Errorf("GetKeyspace(%v): %w", keyspace, err)
 		}
 
 		if err := toTS.CreateKeyspace(ctx, keyspace, ki.Keyspace); err != nil {
@@ -54,6 +58,11 @@ func CopyKeyspaces(ctx context.Context, fromTS, toTS *topo.Server) {
 		vs, err := fromTS.GetVSchema(ctx, keyspace)
 		switch {
 		case err == nil:
+			_, err = vindexes.BuildKeyspace(vs, parser)
+			if err != nil {
+				log.Errorf("BuildKeyspace(%v): %v", keyspace, err)
+				break
+			}
 			if err := toTS.SaveVSchema(ctx, keyspace, vs); err != nil {
 				log.Errorf("SaveVSchema(%v): %v", keyspace, err)
 			}
@@ -63,64 +72,67 @@ func CopyKeyspaces(ctx context.Context, fromTS, toTS *topo.Server) {
 			log.Errorf("GetVSchema(%v): %v", keyspace, err)
 		}
 	}
+
+	return nil
 }
 
 // CopyShards will create the shards in the destination topo.
-func CopyShards(ctx context.Context, fromTS, toTS *topo.Server) {
+func CopyShards(ctx context.Context, fromTS, toTS *topo.Server) error {
 	keyspaces, err := fromTS.GetKeyspaces(ctx)
 	if err != nil {
-		log.Fatalf("fromTS.GetKeyspaces: %v", err)
+		return fmt.Errorf("fromTS.GetKeyspaces: %w", err)
 	}
 
 	for _, keyspace := range keyspaces {
 		shards, err := fromTS.GetShardNames(ctx, keyspace)
 		if err != nil {
-			log.Fatalf("GetShardNames(%v): %v", keyspace, err)
-			return
+			return fmt.Errorf("GetShardNames(%v): %w", keyspace, err)
 		}
 
 		for _, shard := range shards {
 
 			si, err := fromTS.GetShard(ctx, keyspace, shard)
 			if err != nil {
-				log.Fatalf("GetShard(%v, %v): %v", keyspace, shard, err)
+				return fmt.Errorf("GetShard(%v, %v): %w", keyspace, shard, err)
 			}
 
 			if err := toTS.CreateShard(ctx, keyspace, shard); err != nil {
 				if topo.IsErrType(err, topo.NodeExists) {
 					log.Warningf("shard %v/%v already exists", keyspace, shard)
 				} else {
-					log.Fatalf("CreateShard(%v, %v): %v", keyspace, shard, err)
+					return fmt.Errorf("CreateShard(%v, %v): %w", keyspace, shard, err)
 				}
 			}
 			if _, err := toTS.UpdateShardFields(ctx, keyspace, shard, func(toSI *topo.ShardInfo) error {
-				toSI.Shard = proto.Clone(si.Shard).(*topodatapb.Shard)
+				toSI.Shard = si.Shard.CloneVT()
 				return nil
 			}); err != nil {
-				log.Fatalf("UpdateShardFields(%v, %v): %v", keyspace, shard, err)
+				return fmt.Errorf("UpdateShardFields(%v, %v): %w", keyspace, shard, err)
 			}
 		}
 	}
+
+	return nil
 }
 
 // CopyTablets will create the tablets in the destination topo.
-func CopyTablets(ctx context.Context, fromTS, toTS *topo.Server) {
+func CopyTablets(ctx context.Context, fromTS, toTS *topo.Server) error {
 	cells, err := fromTS.GetKnownCells(ctx)
 	if err != nil {
-		log.Fatalf("fromTS.GetKnownCells: %v", err)
+		return fmt.Errorf("fromTS.GetKnownCells: %w", err)
 	}
 
 	for _, cell := range cells {
 		tabletAliases, err := fromTS.GetTabletAliasesByCell(ctx, cell)
 		if err != nil {
-			log.Fatalf("GetTabletsByCell(%v): %v", cell, err)
+			return fmt.Errorf("GetTabletsByCell(%v): %w", cell, err)
 		} else {
 			for _, tabletAlias := range tabletAliases {
 
 				// read the source tablet
 				ti, err := fromTS.GetTablet(ctx, tabletAlias)
 				if err != nil {
-					log.Fatalf("GetTablet(%v): %v", tabletAlias, err)
+					return fmt.Errorf("GetTablet(%v): %w", tabletAlias, err)
 				}
 
 				// try to create the destination
@@ -134,42 +146,62 @@ func CopyTablets(ctx context.Context, fromTS, toTS *topo.Server) {
 					})
 				}
 				if err != nil {
-					log.Fatalf("CreateTablet(%v): %v", tabletAlias, err)
+					return fmt.Errorf("CreateTablet(%v): %w", tabletAlias, err)
 				}
 			}
 		}
 	}
+
+	return nil
 }
 
 // CopyShardReplications will create the ShardReplication objects in
 // the destination topo.
-func CopyShardReplications(ctx context.Context, fromTS, toTS *topo.Server) {
+func CopyShardReplications(ctx context.Context, fromTS, toTS *topo.Server) error {
 	keyspaces, err := fromTS.GetKeyspaces(ctx)
 	if err != nil {
-		log.Fatalf("fromTS.GetKeyspaces: %v", err)
+		return fmt.Errorf("fromTS.GetKeyspaces: %w", err)
 	}
 
 	cells, err := fromTS.GetCellInfoNames(ctx)
 	if err != nil {
-		log.Fatalf("GetCellInfoNames(): %v", err)
+		return fmt.Errorf("GetCellInfoNames(): %w", err)
 	}
 
 	for _, keyspace := range keyspaces {
 		shards, err := fromTS.GetShardNames(ctx, keyspace)
 		if err != nil {
-			log.Fatalf("GetShardNames(%v): %v", keyspace, err)
+			return fmt.Errorf("GetShardNames(%v): %w", keyspace, err)
 		}
 
 		for _, shard := range shards {
 			for _, cell := range cells {
 				sri, err := fromTS.GetShardReplication(ctx, cell, keyspace, shard)
 				if err != nil {
-					log.Fatalf("GetShardReplication(%v, %v, %v): %v", cell, keyspace, shard, err)
-					continue
+					return fmt.Errorf("GetShardReplication(%v, %v, %v): %w", cell, keyspace, shard, err)
+				}
+
+				sriNodes := map[string]struct{}{}
+				for _, node := range sri.Nodes {
+					sriNodes[topoproto.TabletAliasString(node.TabletAlias)] = struct{}{}
 				}
 
 				if err := toTS.UpdateShardReplicationFields(ctx, cell, keyspace, shard, func(oldSR *topodatapb.ShardReplication) error {
+					var nodes []*topodatapb.ShardReplication_Node
+					for _, oldNode := range oldSR.Nodes {
+						if _, ok := sriNodes[topoproto.TabletAliasString(oldNode.TabletAlias)]; ok {
+							continue
+						}
+
+						nodes = append(nodes, oldNode)
+					}
+
+					nodes = append(nodes, sri.ShardReplication.Nodes...)
+					// Even though ShardReplication currently only has the .Nodes field,
+					// keeping the proto.Merge call here prevents this copy from
+					// unintentionally breaking if we add new fields.
 					proto.Merge(oldSR, sri.ShardReplication)
+					oldSR.Nodes = nodes
 					return nil
 				}); err != nil {
 					log.Warningf("UpdateShardReplicationFields(%v, %v, %v): %v", cell, keyspace, shard, err)
@@ -177,15 +209,19 @@ func CopyShardReplications(ctx context.Context, fromTS, toTS *topo.Server) {
 			}
 		}
 	}
+
+	return nil
 }
 
 // CopyRoutingRules will create the routing rules in the destination topo.
-func CopyRoutingRules(ctx context.Context, fromTS, toTS *topo.Server) {
+func CopyRoutingRules(ctx context.Context, fromTS, toTS *topo.Server) error {
 	rr, err := fromTS.GetRoutingRules(ctx)
 	if err != nil {
-		log.Fatalf("GetRoutingRules: %v", err)
+		return fmt.Errorf("GetRoutingRules: %w", err)
 	}
 	if err := toTS.SaveRoutingRules(ctx, rr); err != nil {
 		log.Errorf("SaveRoutingRules(%v): %v", rr, err)
 	}
+
+	return nil
 }

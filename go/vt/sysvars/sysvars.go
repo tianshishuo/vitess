@@ -16,6 +16,8 @@ limitations under the License.
 
 package sysvars
 
+import "sync"
+
 // This information lives here, because it's needed from the vtgate planbuilder, the vtgate engine,
 // and the AST rewriter, that happens to live in sqlparser.
 
@@ -37,13 +39,25 @@ type SystemVariable struct {
 	Name string
 
 	SupportSetVar bool
+
+	Case StorageCase
 }
+
+type StorageCase int
+
+const (
+	SCSame StorageCase = iota
+	SCUpper
+	SCLower
+)
 
 // System Settings
 var (
 	on      = "1"
 	off     = "0"
 	utf8mb4 = "'utf8mb4'"
+
+	ForeignKeyChecks = "foreign_key_checks"
 
 	Autocommit                  = SystemVariable{Name: "autocommit", IsBoolean: true, Default: on}
 	Charset                     = SystemVariable{Name: "charset", Default: utf8mb4, IdentifierAsString: true}
@@ -58,9 +72,13 @@ var (
 	TransactionReadOnly         = SystemVariable{Name: "transaction_read_only", IsBoolean: true, Default: off}
 	TxReadOnly                  = SystemVariable{Name: "tx_read_only", IsBoolean: true, Default: off}
 	Workload                    = SystemVariable{Name: "workload", IdentifierAsString: true}
+	QueryTimeout                = SystemVariable{Name: "query_timeout"}
 
 	// Online DDL
-	DDLStrategy    = SystemVariable{Name: "ddl_strategy", IdentifierAsString: true}
+	DDLStrategy      = SystemVariable{Name: "ddl_strategy", IdentifierAsString: true}
+	MigrationContext = SystemVariable{Name: "migration_context", IdentifierAsString: true}
+
+	// Version
 	Version        = SystemVariable{Name: "version"}
 	VersionComment = SystemVariable{Name: "version_comment"}
 
@@ -82,10 +100,12 @@ var (
 		Charset,
 		Names,
 		SessionUUID,
+		MigrationContext,
 		SessionEnableSystemSettings,
 		ReadAfterWriteGTID,
 		ReadAfterWriteTimeOut,
 		SessionTrackGTIDs,
+		QueryTimeout,
 	}
 
 	ReadOnly = []SystemVariable{
@@ -168,9 +188,10 @@ var (
 		{Name: "end_markers_in_json", IsBoolean: true, SupportSetVar: true},
 		{Name: "eq_range_index_dive_limit", SupportSetVar: true},
 		{Name: "explicit_defaults_for_timestamp"},
-		{Name: "foreign_key_checks", IsBoolean: true, SupportSetVar: true},
+		{Name: ForeignKeyChecks, IsBoolean: true, SupportSetVar: true},
 		{Name: "group_concat_max_len", SupportSetVar: true},
 		{Name: "information_schema_stats_expiry"},
+		{Name: "innodb_lock_wait_timeout"},
 		{Name: "max_heap_table_size", SupportSetVar: true},
 		{Name: "max_seeks_for_key", SupportSetVar: true},
 		{Name: "max_tmp_tables"},
@@ -183,8 +204,6 @@ var (
 		{Name: "optimizer_trace_features"},
 		{Name: "optimizer_trace_limit"},
 		{Name: "optimizer_trace_max_mem_size"},
-		{Name: "transaction_isolation"},
-		{Name: "tx_isolation"},
 		{Name: "optimizer_trace_offset"},
 		{Name: "parser_max_mem_size"},
 		{Name: "profiling", IsBoolean: true},
@@ -205,7 +224,9 @@ var (
 		{Name: "sql_warnings", IsBoolean: true},
 		{Name: "time_zone"},
 		{Name: "tmp_table_size", SupportSetVar: true},
+		{Name: "transaction_isolation", Case: SCUpper},
 		{Name: "transaction_prealloc_size"},
+		{Name: "tx_isolation", Case: SCUpper},
 		{Name: "unique_checks", IsBoolean: true, SupportSetVar: true},
 		{Name: "updatable_views_with_limit", IsBoolean: true, SupportSetVar: true},
 	}
@@ -226,7 +247,6 @@ var (
 		{Name: "collation_server"},
 		{Name: "completion_type"},
 		{Name: "div_precision_increment", SupportSetVar: true},
-		{Name: "innodb_lock_wait_timeout"},
 		{Name: "interactive_timeout"},
 		{Name: "lc_time_names"},
 		{Name: "lock_wait_timeout", SupportSetVar: true},
@@ -260,5 +280,25 @@ func GetInterestingVariables() []string {
 	res = append(res, Version.Name)
 	res = append(res, VersionComment.Name)
 	res = append(res, Socket.Name)
+
+	for _, variable := range UseReservedConn {
+		if variable.SupportSetVar {
+			res = append(res, variable.Name)
+		}
+	}
 	return res
+}
+
+var vitessAwareVariableNames map[string]struct{}
+var vitessAwareInit sync.Once
+
+func IsVitessAware(sysv string) bool {
+	vitessAwareInit.Do(func() {
+		vitessAwareVariableNames = make(map[string]struct{}, len(VitessAware))
+		for _, v := range VitessAware {
+			vitessAwareVariableNames[v.Name] = struct{}{}
+		}
+	})
+	_, found := vitessAwareVariableNames[sysv]
+	return found
 }

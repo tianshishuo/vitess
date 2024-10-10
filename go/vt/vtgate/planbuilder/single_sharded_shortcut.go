@@ -22,13 +22,15 @@ import (
 
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vtgate/engine"
+	"vitess.io/vitess/go/vt/vtgate/planbuilder/operators"
+	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
 	"vitess.io/vitess/go/vt/vtgate/semantics"
 	"vitess.io/vitess/go/vt/vtgate/vindexes"
 )
 
-func unshardedShortcut(stmt sqlparser.SelectStatement, ks *vindexes.Keyspace, semTable *semantics.SemTable) (logicalPlan, error) {
+func selectUnshardedShortcut(ctx *plancontext.PlanningContext, stmt sqlparser.SelectStatement, ks *vindexes.Keyspace) (engine.Primitive, []string, error) {
 	// this method is used when the query we are handling has all tables in the same unsharded keyspace
-	sqlparser.Rewrite(stmt, func(cursor *sqlparser.Cursor) bool {
+	sqlparser.SafeRewrite(stmt, nil, func(cursor *sqlparser.Cursor) bool {
 		switch node := cursor.Node().(type) {
 		case sqlparser.SelectExpr:
 			removeKeyspaceFromSelectExpr(node)
@@ -38,46 +40,70 @@ func unshardedShortcut(stmt sqlparser.SelectStatement, ks *vindexes.Keyspace, se
 			})
 		}
 		return true
-	}, nil)
+	})
 
-	tableNames, err := getTableNames(semTable)
+	tableNames, err := getTableNames(ctx.SemTable)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	plan := &routeGen4{
-		eroute: &engine.Route{
-			RoutingParameters: &engine.RoutingParameters{
-				Opcode:   engine.Unsharded,
-				Keyspace: ks,
-			},
-			TableName: strings.Join(tableNames, ", "),
+	eroute := &engine.Route{
+		RoutingParameters: &engine.RoutingParameters{
+			Opcode:   engine.Unsharded,
+			Keyspace: ks,
 		},
-		Select: stmt,
+		TableName: strings.Join(escapedTableNames(tableNames), ", "),
 	}
-	if err := plan.WireupGen4(semTable); err != nil {
-		return nil, err
+	prim, err := WireupRoute(ctx, eroute, stmt)
+	if err != nil {
+		return nil, nil, err
 	}
-	return plan, nil
+	return prim, operators.QualifiedTableNames(ks, tableNames), nil
 }
 
-func getTableNames(semTable *semantics.SemTable) ([]string, error) {
-	tableNameMap := map[string]interface{}{}
+func escapedTableNames(tableNames []sqlparser.TableName) []string {
+	escaped := make([]string, len(tableNames))
+	for i, tableName := range tableNames {
+		escaped[i] = sqlparser.String(tableName)
+	}
+	return escaped
+}
+
+func getTableNames(semTable *semantics.SemTable) ([]sqlparser.TableName, error) {
+	tableNameMap := make(map[string]sqlparser.TableName)
 
 	for _, tableInfo := range semTable.Tables {
 		tblObj := tableInfo.GetVindexTable()
-		var name string
-		if tableInfo.IsInfSchema() {
-			name = "tableName"
-		} else {
-			name = sqlparser.String(tblObj.Name)
+		if tblObj == nil {
+			// probably a derived table
+			continue
 		}
-		tableNameMap[name] = nil
+		if tableInfo.IsInfSchema() {
+			tableNameMap["tableName"] = sqlparser.TableName{
+				Name: sqlparser.NewIdentifierCS("tableName"),
+			}
+		} else {
+			tableNameMap[sqlparser.String(tblObj.Name)] = sqlparser.TableName{
+				Name: tblObj.Name,
+			}
+		}
 	}
-
-	var tableNames []string
-	for name := range tableNameMap {
-		tableNames = append(tableNames, name)
+	var keys []string
+	for k := range tableNameMap {
+		keys = append(keys, k)
 	}
-	sort.Strings(tableNames)
+	sort.Strings(keys)
+	var tableNames []sqlparser.TableName
+	for _, k := range keys {
+		tableNames = append(tableNames, tableNameMap[k])
+	}
 	return tableNames, nil
+}
+
+func removeKeyspaceFromSelectExpr(expr sqlparser.SelectExpr) {
+	switch expr := expr.(type) {
+	case *sqlparser.AliasedExpr:
+		sqlparser.RemoveKeyspaceInCol(expr.Expr)
+	case *sqlparser.StarExpr:
+		expr.TableName.Qualifier = sqlparser.NewIdentifierCS("")
+	}
 }

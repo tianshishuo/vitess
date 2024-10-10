@@ -24,8 +24,6 @@ import (
 	"fmt"
 	"testing"
 
-	"google.golang.org/protobuf/proto"
-
 	"github.com/stretchr/testify/require"
 	"golang.org/x/net/nettest"
 	"google.golang.org/grpc"
@@ -43,7 +41,7 @@ import (
 // implementation, then runs the test func with a client created to point at
 // that server.
 func WithTestServer(
-	t *testing.T,
+	ctx context.Context, t *testing.T,
 	server vtctlservicepb.VtctldServer,
 	test func(t *testing.T, client vtctldclient.VtctldClient),
 ) {
@@ -58,8 +56,9 @@ func WithTestServer(
 	go s.Serve(lis)
 	defer s.Stop()
 
-	client, err := vtctldclient.New("grpc", lis.Addr().String())
+	client, err := vtctldclient.New(ctx, "grpc", lis.Addr().String())
 	require.NoError(t, err, "cannot create vtctld client")
+	defer client.Close()
 
 	test(t, client)
 }
@@ -68,7 +67,7 @@ func WithTestServer(
 // implementations, and then runs the test func with N clients created, where
 // clients[i] points at servers[i].
 func WithTestServers(
-	t *testing.T,
+	ctx context.Context, t *testing.T,
 	test func(t *testing.T, clients ...vtctldclient.VtctldClient),
 	servers ...vtctlservicepb.VtctldServer,
 ) {
@@ -92,7 +91,7 @@ func WithTestServers(
 
 		// Start up a test server for the head of our server slice, accumulate
 		// the resulting client, and recurse on the tail of our server slice.
-		WithTestServer(t, servers[0], func(t *testing.T, client vtctldclient.VtctldClient) {
+		WithTestServer(ctx, t, servers[0], func(t *testing.T, client vtctldclient.VtctldClient) {
 			clients = append(clients, client)
 			withTestServers(t, servers[1:]...)
 		})
@@ -105,7 +104,7 @@ func WithTestServers(
 // could not be added. It shallow copies the proto struct to prevent XXX_ fields
 // from changing in the marshalling.
 func AddKeyspace(ctx context.Context, t *testing.T, ts *topo.Server, ks *vtctldatapb.Keyspace) {
-	err := ts.CreateKeyspace(ctx, ks.Name, proto.Clone(ks.Keyspace).(*topodatapb.Keyspace))
+	err := ts.CreateKeyspace(ctx, ks.Name, ks.Keyspace.CloneVT())
 	require.NoError(t, err)
 }
 
@@ -148,7 +147,8 @@ type AddTabletOptions struct {
 // shard to serving. If that shard record already has a serving primary, then
 // AddTablet will fail the test.
 func AddTablet(ctx context.Context, t *testing.T, ts *topo.Server, tablet *topodatapb.Tablet, opts *AddTabletOptions) {
-	tablet = proto.Clone(tablet).(*topodatapb.Tablet)
+	t.Helper()
+	tablet = tablet.CloneVT()
 	if opts == nil {
 		opts = &AddTabletOptions{}
 	}
@@ -199,6 +199,7 @@ func AddTablet(ctx context.Context, t *testing.T, ts *topo.Server, tablet *topod
 // AddTablets adds a list of tablets to the topology. See AddTablet for more
 // details.
 func AddTablets(ctx context.Context, t *testing.T, ts *topo.Server, opts *AddTabletOptions, tablets ...*topodatapb.Tablet) {
+	t.Helper()
 	for _, tablet := range tablets {
 		AddTablet(ctx, t, ts, tablet, opts)
 	}

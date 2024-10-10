@@ -4,6 +4,8 @@ concurrency:
   group: format('{0}-{1}', ${{"{{"}} github.ref {{"}}"}}, '{{.Name}}')
   cancel-in-progress: true
 
+permissions: read-all
+
 env:
   LAUNCHABLE_ORGANIZATION: "vitess"
   LAUNCHABLE_WORKSPACE: "vitess-app"
@@ -12,31 +14,125 @@ env:
 jobs:
   build:
     name: Run endtoend tests on {{.Name}}
-    {{if .Ubuntu20}}runs-on: ubuntu-20.04{{else}}runs-on: ubuntu-18.04{{end}}
+    runs-on: {{if .Cores16}}gh-hosted-runners-16cores-1{{else}}ubuntu-latest{{end}}
 
     steps:
-    - name: Set up Go
-      uses: actions/setup-go@v2
+    - name: Skip CI
+      run: |
+        if [[ "{{"${{contains( github.event.pull_request.labels.*.name, 'Skip CI')}}"}}" == "true" ]]; then
+          echo "skipping CI due to the 'Skip CI' label"
+          exit 1
+        fi
+
+    - name: Check if workflow needs to be skipped
+      id: skip-workflow
+      run: |
+        skip='false'
+        if [[ "{{"${{github.event.pull_request}}"}}" ==  "" ]] && [[ "{{"${{github.ref}}"}}" != "refs/heads/main" ]] && [[ ! "{{"${{github.ref}}"}}" =~ ^refs/heads/release-[0-9]+\.[0-9]$ ]] && [[ ! "{{"${{github.ref}}"}}" =~ "refs/tags/.*" ]]; then
+          skip='true'
+        fi
+        echo Skip ${skip}
+        echo "skip-workflow=${skip}" >> $GITHUB_OUTPUT
+
+        PR_DATA=$(curl -s\
+          -H "{{"Authorization: token ${{ secrets.GITHUB_TOKEN }}"}}" \
+          -H "Accept: application/vnd.github.v3+json" \
+          "{{"https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}"}}")
+        draft=$(echo "$PR_DATA" | jq .draft -r)
+        echo "is_draft=${draft}" >> $GITHUB_OUTPUT
+
+    {{if .MemoryCheck}}
+
+    - name: Check Memory
+      run: |
+        totalMem=$(free -g | awk 'NR==2 {print $2}')
+        echo "total memory $totalMem GB"
+        if [[ "$totalMem" -lt 15 ]]; then 
+          echo "Less memory than required"
+          exit 1
+        fi
+
+    {{end}}
+
+    - name: Check out code
+      if: steps.skip-workflow.outputs.skip-workflow == 'false'
+      uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+
+    - name: Check for changes in relevant files
+      if: steps.skip-workflow.outputs.skip-workflow == 'false'
+      uses: dorny/paths-filter@ebc4d7e9ebcb0b1eb21480bb8f43113e996ac77a # v3.0.1
+      id: changes
       with:
-        go-version: 1.17
+        token: ''
+        filters: |
+          end_to_end:
+            - 'go/**/*.go'
+            - 'go/vt/sidecardb/**/*.sql'
+            - 'go/test/endtoend/onlineddl/vrepl_suite/**'
+            - 'test.go'
+            - 'Makefile'
+            - 'build.env'
+            - 'go.sum'
+            - 'go.mod'
+            - 'proto/*.proto'
+            - 'tools/**'
+            - 'config/**'
+            - 'bootstrap.sh'
+            - '.github/workflows/{{.FileName}}'
+            {{- if or (contains .Name "onlineddl") (contains .Name "schemadiff") }}
+            - 'go/test/endtoend/onlineddl/vrepl_suite/testdata'
+            {{- end}}
+
+    - name: Set up Go
+      if: steps.skip-workflow.outputs.skip-workflow == 'false' && steps.changes.outputs.end_to_end == 'true'
+      uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32 # v5.0.2
+      with:
+        go-version-file: go.mod
 
     - name: Set up python
-      uses: actions/setup-python@v2
+      if: steps.skip-workflow.outputs.skip-workflow == 'false' && steps.changes.outputs.end_to_end == 'true'
+      uses: actions/setup-python@39cd14951b08e74b54015e9e001cdefcf80e669f # v5.1.1
 
     - name: Tune the OS
+      if: steps.skip-workflow.outputs.skip-workflow == 'false' && steps.changes.outputs.end_to_end == 'true'
       run: |
-        echo '1024 65535' | sudo tee -a /proc/sys/net/ipv4/ip_local_port_range
+        # Limit local port range to not use ports that overlap with server side
+        # ports that we listen on.
+        sudo sysctl -w net.ipv4.ip_local_port_range="22768 65535"
         # Increase the asynchronous non-blocking I/O. More information at https://dev.mysql.com/doc/refman/5.7/en/innodb-parameters.html#sysvar_innodb_use_native_aio
         echo "fs.aio-max-nr = 1048576" | sudo tee -a /etc/sysctl.conf
         sudo sysctl -p /etc/sysctl.conf
 
-    - name: Check out code
-      uses: actions/checkout@v2
-
     - name: Get dependencies
+      if: steps.skip-workflow.outputs.skip-workflow == 'false' && steps.changes.outputs.end_to_end == 'true'
       run: |
-        sudo apt-get update
-        sudo apt-get install -y mysql-server mysql-client make unzip g++ etcd curl git wget eatmydata
+        {{if .InstallXtraBackup}}
+
+        # Setup Percona Server for MySQL 8.0
+        sudo apt-get -qq update
+        sudo apt-get -qq install -y lsb-release gnupg2 curl
+        wget https://repo.percona.com/apt/percona-release_latest.$(lsb_release -sc)_all.deb
+        sudo DEBIAN_FRONTEND="noninteractive" dpkg -i percona-release_latest.$(lsb_release -sc)_all.deb
+        sudo percona-release setup ps80
+        sudo apt-get -qq update
+
+        # Install everything else we need, and configure
+        sudo apt-get -qq install -y percona-server-server percona-server-client make unzip g++ etcd git wget eatmydata xz-utils libncurses5
+
+        {{else}}
+
+        # Get key to latest MySQL repo
+        sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys A8D3785C
+        # Setup MySQL 8.0
+        wget -c https://dev.mysql.com/get/mysql-apt-config_0.8.32-1_all.deb
+        echo mysql-apt-config mysql-apt-config/select-server select mysql-8.0 | sudo debconf-set-selections
+        sudo DEBIAN_FRONTEND="noninteractive" dpkg -i mysql-apt-config*
+        sudo apt-get -qq update
+        # Install everything else we need, and configure
+        sudo apt-get -qq install -y mysql-server mysql-shell mysql-client make unzip g++ etcd curl git wget eatmydata xz-utils libncurses5
+
+        {{end}}
+
         sudo service mysql stop
         sudo service etcd stop
         sudo ln -s /etc/apparmor.d/usr.sbin.mysqld /etc/apparmor.d/disable/
@@ -44,27 +140,25 @@ jobs:
         go mod download
 
         # install JUnit report formatter
-        go get -u github.com/vitessio/go-junit-report@HEAD
+        go install github.com/vitessio/go-junit-report@HEAD
 
         {{if .InstallXtraBackup}}
 
-        wget https://repo.percona.com/apt/percona-release_latest.$(lsb_release -sc)_all.deb
-        sudo apt-get install -y gnupg2
-        sudo dpkg -i percona-release_latest.$(lsb_release -sc)_all.deb
-        sudo apt-get update
-        sudo apt-get install percona-xtrabackup-24
+        sudo apt-get -qq install -y percona-xtrabackup-80 lz4
 
         {{end}}
 
     {{if .MakeTools}}
 
     - name: Installing zookeeper and consul
+      if: steps.skip-workflow.outputs.skip-workflow == 'false' && steps.changes.outputs.end_to_end == 'true'
       run: |
           make tools
 
     {{end}}
 
     - name: Setup launchable dependencies
+      if: steps.skip-workflow.outputs.is_draft == 'false' && steps.skip-workflow.outputs.skip-workflow == 'false' && steps.changes.outputs.end_to_end == 'true' && github.base_ref == 'main'
       run: |
         # Get Launchable CLI installed. If you can, make it a part of the builder image to speed things up
         pip3 install --user launchable~=1.0 > /dev/null
@@ -73,24 +167,62 @@ jobs:
         launchable verify || true
 
         # Tell Launchable about the build you are producing and testing
-        launchable record build --name "$GITHUB_RUN_ID" --source .
+        launchable record build --name "$GITHUB_RUN_ID" --no-commit-collection --source .
 
     - name: Run cluster endtoend test
-      timeout-minutes: 30
+      if: steps.skip-workflow.outputs.skip-workflow == 'false' && steps.changes.outputs.end_to_end == 'true'
+      timeout-minutes: 45
       run: |
+        # We set the VTDATAROOT to the /tmp folder to reduce the file path of mysql.sock file
+        # which musn't be more than 107 characters long.
+        export VTDATAROOT="/tmp/"
         source build.env
 
-        set -x
+        set -exo pipefail
+
+        {{if .LimitResourceUsage}}
+        # Increase our open file descriptor limit as we could hit this
+        ulimit -n 65536
+        cat <<-EOF>>./config/mycnf/mysql8026.cnf
+        innodb_buffer_pool_dump_at_shutdown=OFF
+        innodb_buffer_pool_in_core_file=OFF
+        innodb_buffer_pool_load_at_startup=OFF
+        innodb_buffer_pool_size=64M
+        innodb_doublewrite=OFF
+        innodb_flush_log_at_trx_commit=0
+        innodb_flush_method=O_DIRECT
+        innodb_numa_interleave=ON
+        innodb_adaptive_hash_index=OFF
+        sync_binlog=0
+        sync_relay_log=0
+        performance_schema=OFF
+        slow-query-log=OFF
+        EOF
+        {{end}}
+
+        {{if .EnableBinlogTransactionCompression}}
+        cat <<-EOF>>./config/mycnf/mysql8026.cnf
+        binlog-transaction-compression=ON
+        EOF
+        {{end}}
 
         # run the tests however you normally do, then produce a JUnit XML file
-        eatmydata -- go run test.go -docker=false -follow -shard {{.Shard}} | tee -a output.txt | go-junit-report -set-exit-code > report.xml
+        eatmydata -- go run test.go -docker={{if .Docker}}true -flavor={{.Platform}}{{else}}false{{end}} -follow -shard {{.Shard}}{{if .PartialKeyspace}} -partial-keyspace=true {{end}}{{if .BuildTag}} -build-tag={{.BuildTag}} {{end}} | tee -a output.txt | go-junit-report -set-exit-code > report.xml
 
-    - name: Print test output and Record test result in launchable
+    - name: Print test output and Record test result in launchable if PR is not a draft
+      if: steps.skip-workflow.outputs.skip-workflow == 'false' && steps.changes.outputs.end_to_end == 'true' && always()
       run: |
-        # send recorded tests to launchable
-        launchable record tests --build "$GITHUB_RUN_ID" go-test . || true
+        if [[ "{{"${{steps.skip-workflow.outputs.is_draft}}"}}" ==  "false" ]]; then
+          # send recorded tests to launchable
+          launchable record tests --build "$GITHUB_RUN_ID" go-test . || true
+        fi
 
         # print test output
         cat output.txt
-      if: always()
 
+    - name: Test Summary
+      if: steps.skip-workflow.outputs.skip-workflow == 'false' && steps.changes.outputs.end_to_end == 'true' && always()
+      uses: test-summary/action@31493c76ec9e7aa675f1585d3ed6f1da69269a86 # v2.4
+      with:
+        paths: "report.xml"
+        show: "fail"

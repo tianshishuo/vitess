@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"vitess.io/vitess/go/mysql/sqlerror"
 	"vitess.io/vitess/go/test/endtoend/utils"
 
 	"github.com/stretchr/testify/assert"
@@ -34,53 +35,51 @@ import (
 func TestSetSysVarSingle(t *testing.T) {
 	defer cluster.PanicHandler(t)
 	ctx := context.Background()
-	vtParams := mysql.ConnParams{
-		Host: "localhost",
-		Port: clusterInstance.VtgateMySQLPort,
-	}
 	type queriesWithExpectations struct {
-		name, expr, expected string
+		name, expr string
+		expected   []string
 	}
 
 	queries := []queriesWithExpectations{{
 		name:     "default_storage_engine", // ignored
 		expr:     "INNODB",
-		expected: `[[VARCHAR("InnoDB")]]`,
+		expected: []string{`[[VARCHAR("InnoDB")]]`},
 	}, {
 		name:     "character_set_client", // check and ignored
 		expr:     "utf8mb4",
-		expected: `[[VARCHAR("utf8mb4")]]`,
+		expected: []string{`[[VARCHAR("utf8mb4")]]`, `[[VARCHAR("utf8")]]`},
 	}, {
 		name:     "character_set_client", // ignored so will keep the actual value
 		expr:     "@charvar",
-		expected: `[[VARCHAR("utf8mb4")]]`,
+		expected: []string{`[[VARCHAR("utf8mb4")]]`, `[[VARCHAR("utf8")]]`},
 	}, {
 		name:     "sql_mode", // use reserved conn
 		expr:     "''",
-		expected: `[[VARCHAR("")]]`,
+		expected: []string{`[[VARCHAR("")]]`},
 	}, {
 		name:     "sql_mode", // use reserved conn
 		expr:     `concat(@@sql_mode,"NO_ZERO_DATE")`,
-		expected: `[[VARCHAR("NO_ZERO_DATE")]]`,
+		expected: []string{`[[VARCHAR("NO_ZERO_DATE")]]`},
 	}, {
 		name:     "sql_mode", // use reserved conn
 		expr:     "@@sql_mode",
-		expected: `[[VARCHAR("NO_ZERO_DATE")]]`,
+		expected: []string{`[[VARCHAR("NO_ZERO_DATE")]]`},
 	}, {
 		name:     "SQL_SAFE_UPDATES", // use reserved conn
 		expr:     "1",
-		expected: "[[INT64(1)]]",
+		expected: []string{"[[INT64(1)]]"},
 	}, {
 		name:     "sql_auto_is_null", // ignored so will keep the actual value
 		expr:     "on",
-		expected: `[[INT64(0)]]`,
+		expected: []string{`[[INT64(0)]]`},
 	}, {
 		name:     "sql_notes", // use reserved conn
 		expr:     "off",
-		expected: "[[INT64(0)]]",
+		expected: []string{"[[INT64(0)]]"},
 	}}
 
 	conn, err := mysql.Connect(ctx, &vtParams)
+
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -88,16 +87,12 @@ func TestSetSysVarSingle(t *testing.T) {
 		query := fmt.Sprintf("set %s = %s", q.name, q.expr)
 		t.Run(fmt.Sprintf("%d-%s", i, query), func(t *testing.T) {
 			utils.Exec(t, conn, query)
-			utils.AssertMatches(t, conn, fmt.Sprintf("select @@%s", q.name), q.expected)
+			utils.AssertMatchesAny(t, conn, fmt.Sprintf("select @@%s", q.name), q.expected...)
 		})
 	}
 }
 
 func TestSetSystemVariable(t *testing.T) {
-	vtParams := mysql.ConnParams{
-		Host: "localhost",
-		Port: clusterInstance.VtgateMySQLPort,
-	}
 	conn, err := mysql.Connect(context.Background(), &vtParams)
 	require.NoError(t, err)
 	defer conn.Close()
@@ -116,10 +111,6 @@ func TestSetSystemVariable(t *testing.T) {
 }
 
 func TestSetSystemVarWithTxFailure(t *testing.T) {
-	vtParams := mysql.ConnParams{
-		Host: "localhost",
-		Port: clusterInstance.VtgateMySQLPort,
-	}
 
 	conn, err := mysql.Connect(context.Background(), &vtParams)
 	require.NoError(t, err)
@@ -148,10 +139,6 @@ func TestSetSystemVarWithTxFailure(t *testing.T) {
 }
 
 func TestSetSystemVarWithConnectionTimeout(t *testing.T) {
-	vtParams := mysql.ConnParams{
-		Host: "localhost",
-		Port: clusterInstance.VtgateMySQLPort,
-	}
 
 	conn, err := mysql.Connect(context.Background(), &vtParams)
 	require.NoError(t, err)
@@ -170,10 +157,6 @@ func TestSetSystemVarWithConnectionTimeout(t *testing.T) {
 }
 
 func TestSetSystemVariableAndThenSuccessfulTx(t *testing.T) {
-	vtParams := mysql.ConnParams{
-		Host: "localhost",
-		Port: clusterInstance.VtgateMySQLPort,
-	}
 
 	conn, err := mysql.Connect(context.Background(), &vtParams)
 	require.NoError(t, err)
@@ -189,10 +172,6 @@ func TestSetSystemVariableAndThenSuccessfulTx(t *testing.T) {
 }
 
 func TestSetSystemVariableAndThenSuccessfulAutocommitDML(t *testing.T) {
-	vtParams := mysql.ConnParams{
-		Host: "localhost",
-		Port: clusterInstance.VtgateMySQLPort,
-	}
 
 	conn, err := mysql.Connect(context.Background(), &vtParams)
 	require.NoError(t, err)
@@ -219,10 +198,6 @@ func TestSetSystemVariableAndThenSuccessfulAutocommitDML(t *testing.T) {
 }
 
 func TestStartTxAndSetSystemVariableAndThenSuccessfulCommit(t *testing.T) {
-	vtParams := mysql.ConnParams{
-		Host: "localhost",
-		Port: clusterInstance.VtgateMySQLPort,
-	}
 
 	conn, err := mysql.Connect(context.Background(), &vtParams)
 	require.NoError(t, err)
@@ -238,11 +213,9 @@ func TestStartTxAndSetSystemVariableAndThenSuccessfulCommit(t *testing.T) {
 }
 
 func TestSetSystemVarAutocommitWithConnError(t *testing.T) {
-	vtParams := mysql.ConnParams{
-		Host: "localhost",
-		Port: clusterInstance.VtgateMySQLPort,
+	if clusterInstance.HasPartialKeyspaces {
+		t.Skip("For partial keyspaces, kill is called on the source keyspace but queries execute on the target, so this test will fail")
 	}
-
 	conn, err := mysql.Connect(context.Background(), &vtParams)
 	require.NoError(t, err)
 	defer conn.Close()
@@ -269,10 +242,6 @@ func TestSetSystemVarAutocommitWithConnError(t *testing.T) {
 }
 
 func TestSetSystemVarInTxWithConnError(t *testing.T) {
-	vtParams := mysql.ConnParams{
-		Host: "localhost",
-		Port: clusterInstance.VtgateMySQLPort,
-	}
 
 	conn, err := mysql.Connect(context.Background(), &vtParams)
 	require.NoError(t, err)
@@ -303,11 +272,24 @@ func TestSetSystemVarInTxWithConnError(t *testing.T) {
 	utils.AssertMatches(t, conn, "select id, @@sql_safe_updates from test where id = 4", "[[INT64(4) INT64(1)]]")
 }
 
-func TestEnableSystemSettings(t *testing.T) {
-	vtParams := mysql.ConnParams{
-		Host: "localhost",
-		Port: clusterInstance.VtgateMySQLPort,
+func BenchmarkReservedConnFieldQuery(b *testing.B) {
+	conn, err := mysql.Connect(context.Background(), &vtParams)
+	require.NoError(b, err)
+	defer conn.Close()
+
+	utils.Exec(b, conn, "delete from test")
+	utils.Exec(b, conn, "insert into test (id, val1) values (1, 'toto'), (4, 'tata')")
+
+	// set sql_mode to empty to force the use of reserved connection
+	utils.Exec(b, conn, "set sql_mode = ''")
+	utils.AssertMatches(b, conn, "select 	@@sql_mode", `[[VARCHAR("")]]`)
+
+	for i := 0; i < b.N; i++ {
+		utils.Exec(b, conn, "select id, val1 from test")
 	}
+}
+
+func TestEnableSystemSettings(t *testing.T) {
 	conn, err := mysql.Connect(context.Background(), &vtParams)
 	require.NoError(t, err)
 	defer conn.Close()
@@ -335,10 +317,6 @@ func TestEnableSystemSettings(t *testing.T) {
 
 // Tests type consitency through multiple queries
 func TestSystemVariableType(t *testing.T) {
-	vtParams := mysql.ConnParams{
-		Host: "localhost",
-		Port: clusterInstance.VtgateMySQLPort,
-	}
 	conn, err := mysql.Connect(context.Background(), &vtParams)
 	require.NoError(t, err)
 	defer conn.Close()
@@ -358,10 +336,6 @@ func TestSystemVariableType(t *testing.T) {
 }
 
 func TestSysvarSocket(t *testing.T) {
-	vtParams := mysql.ConnParams{
-		Host: "localhost",
-		Port: clusterInstance.VtgateMySQLPort,
-	}
 	conn, err := mysql.Connect(context.Background(), &vtParams)
 	require.NoError(t, err)
 	defer conn.Close()
@@ -371,18 +345,14 @@ func TestSysvarSocket(t *testing.T) {
 
 	_, err = utils.ExecAllowError(t, conn, "set socket = '/any/path'")
 	require.Error(t, err)
-	sqlErr, ok := err.(*mysql.SQLError)
+	sqlErr, ok := err.(*sqlerror.SQLError)
 	require.True(t, ok, "not a mysql error: %T", err)
-	assert.Equal(t, mysql.ERIncorrectGlobalLocalVar, sqlErr.Number())
-	assert.Equal(t, mysql.SSUnknownSQLState, sqlErr.SQLState())
-	assert.Equal(t, "variable 'socket' is a read only variable (errno 1238) (sqlstate HY000) during query: set socket = '/any/path'", sqlErr.Error())
+	assert.Equal(t, sqlerror.ERIncorrectGlobalLocalVar, sqlErr.Number())
+	assert.Equal(t, sqlerror.SSUnknownSQLState, sqlErr.SQLState())
+	assert.Equal(t, "VT03010: variable 'socket' is a read only variable (errno 1238) (sqlstate HY000) during query: set socket = '/any/path'", sqlErr.Error())
 }
 
 func TestReservedConnInStreaming(t *testing.T) {
-	vtParams := mysql.ConnParams{
-		Host: "localhost",
-		Port: clusterInstance.VtgateMySQLPort,
-	}
 
 	conn, err := mysql.Connect(context.Background(), &vtParams)
 	require.NoError(t, err)
@@ -399,10 +369,6 @@ func TestReservedConnInStreaming(t *testing.T) {
 }
 
 func TestUnifiedOlapAndOltp(t *testing.T) {
-	vtParams := mysql.ConnParams{
-		Host: "localhost",
-		Port: clusterInstance.VtgateMySQLPort,
-	}
 
 	conn, err := mysql.Connect(context.Background(), &vtParams)
 	require.NoError(t, err)
@@ -455,4 +421,75 @@ func checkOltpAndOlapInterchangingTx(t *testing.T, conn *mysql.Conn) {
 	// check in olap
 	utils.Exec(t, conn, "set workload = oltp")
 	utils.AssertMatches(t, conn, "select id, val1 from test where id = 80", "[[INT64(80) NULL]]")
+}
+
+func TestSysVarTxIsolation(t *testing.T) {
+	conn, err := mysql.Connect(context.Background(), &vtParams)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	// will run every check twice to see that the isolation level is set for all the queries in the session and
+
+	// default from mysql
+	utils.AssertMatches(t, conn, "select @@transaction_isolation", `[[VARCHAR("REPEATABLE-READ")]]`)
+	// ensuring it goes to mysql
+	utils.AssertContains(t, conn, "select @@transaction_isolation, connection_id()", `REPEATABLE-READ`)
+	// second run, ensuring it has the same value.
+	utils.AssertContains(t, conn, "select @@transaction_isolation, connection_id()", `REPEATABLE-READ`)
+
+	// setting to different value.
+	utils.Exec(t, conn, "set @@transaction_isolation = 'read-committed'")
+	utils.AssertMatches(t, conn, "select @@transaction_isolation", `[[VARCHAR("READ-COMMITTED")]]`)
+	// ensuring it goes to mysql
+	utils.AssertContains(t, conn, "select @@transaction_isolation, connection_id()", `READ-COMMITTED`)
+	// second run, to ensuring the setting is applied on the session and not just on next query after settings.
+	utils.AssertContains(t, conn, "select @@transaction_isolation, connection_id()", `READ-COMMITTED`)
+
+	// changing setting to different value.
+	utils.Exec(t, conn, "set session transaction isolation level read uncommitted")
+	utils.AssertMatches(t, conn, "select @@transaction_isolation", `[[VARCHAR("READ-UNCOMMITTED")]]`)
+	// ensuring it goes to mysql
+	utils.AssertContains(t, conn, "select @@transaction_isolation, connection_id()", `READ-UNCOMMITTED`)
+	// second run, to ensuring the setting is applied on the session and not just on next query after settings.
+	utils.AssertContains(t, conn, "select @@transaction_isolation, connection_id()", `READ-UNCOMMITTED`)
+
+	// changing setting to different value.
+	utils.Exec(t, conn, "set transaction isolation level serializable")
+	utils.AssertMatches(t, conn, "select @@transaction_isolation", `[[VARCHAR("SERIALIZABLE")]]`)
+	// ensuring it goes to mysql
+	utils.AssertContains(t, conn, "select @@transaction_isolation, connection_id()", `SERIALIZABLE`)
+	// second run, to ensuring the setting is applied on the session and not just on next query after settings.
+	utils.AssertContains(t, conn, "select @@transaction_isolation, connection_id()", `SERIALIZABLE`)
+}
+
+// TestSysVarInnodbWaitTimeout tests the innodb_lock_wait_timeout system variable
+func TestSysVarInnodbWaitTimeout(t *testing.T) {
+	conn, err := mysql.Connect(context.Background(), &vtParams)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	// default from mysql
+	utils.AssertMatches(t, conn, "select @@innodb_lock_wait_timeout", `[[UINT64(20)]]`)
+	utils.AssertMatches(t, conn, "select @@global.innodb_lock_wait_timeout", `[[UINT64(20)]]`)
+	// ensuring it goes to mysql
+	utils.AssertContains(t, conn, "select @@innodb_lock_wait_timeout", `UINT64(20)`)
+	utils.AssertContains(t, conn, "select @@global.innodb_lock_wait_timeout", `UINT64(20)`)
+
+	// setting to different value.
+	utils.Exec(t, conn, "set @@innodb_lock_wait_timeout = 120")
+	utils.AssertMatches(t, conn, "select @@innodb_lock_wait_timeout", `[[INT64(120)]]`)
+	// ensuring it goes to mysql
+	utils.AssertContains(t, conn, "select @@global.innodb_lock_wait_timeout, connection_id()", `UINT64(20)`)
+	utils.AssertContains(t, conn, "select @@innodb_lock_wait_timeout, connection_id()", `INT64(120)`)
+	// second run, to ensuring the setting is applied on the session and not just on next query after settings.
+	utils.AssertContains(t, conn, "select @@innodb_lock_wait_timeout, connection_id()", `INT64(120)`)
+
+	// changing setting to different value.
+	utils.Exec(t, conn, "set @@innodb_lock_wait_timeout = 240")
+	utils.AssertMatches(t, conn, "select @@innodb_lock_wait_timeout", `[[INT64(240)]]`)
+	// ensuring it goes to mysql
+	utils.AssertContains(t, conn, "select @@global.innodb_lock_wait_timeout, connection_id()", `UINT64(20)`)
+	utils.AssertContains(t, conn, "select @@innodb_lock_wait_timeout, connection_id()", `INT64(240)`)
+	// second run, to ensuring the setting is applied on the session and not just on next query after settings.
+	utils.AssertContains(t, conn, "select @@innodb_lock_wait_timeout, connection_id()", `INT64(240)`)
 }

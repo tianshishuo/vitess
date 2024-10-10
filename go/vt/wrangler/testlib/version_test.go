@@ -17,6 +17,7 @@ limitations under the License.
 package testlib
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -25,10 +26,12 @@ import (
 	"time"
 
 	"vitess.io/vitess/go/vt/discovery"
+	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/vtenv"
+	"vitess.io/vitess/go/vt/vttablet/tmclient"
 
 	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
-	"vitess.io/vitess/go/vt/vttablet/tmclient"
 	"vitess.io/vitess/go/vt/wrangler"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -53,7 +56,7 @@ func expvarHandler(gitRev *string) func(http.ResponseWriter, *http.Request) {
 			http.Error(w, fmt.Sprintf("cannot marshal json: %s", err), http.StatusInternalServerError)
 			return
 		}
-		fmt.Fprintf(w, string(result)+"\n")
+		fmt.Fprint(w, string(result)+"\n")
 	}
 }
 
@@ -64,14 +67,12 @@ func TestVersion(t *testing.T) {
 	}()
 	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
 
-	// We need to run this test with the /debug/vars version of the
-	// plugin.
-	wrangler.ResetDebugVarsGetVersion()
-
 	// Initialize our environment
-	ts := memorytopo.NewServer("cell1", "cell2")
-	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
-	vp := NewVtctlPipe(t, ts)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ts := memorytopo.NewServer(ctx, "cell1", "cell2")
+	wr := wrangler.New(vtenv.NewTestEnv(), logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
+	vp := NewVtctlPipe(ctx, t, ts)
 	defer vp.Close()
 
 	// couple tablets is enough
@@ -90,6 +91,13 @@ func TestVersion(t *testing.T) {
 
 	// sourceReplica loop
 	sourceReplicaGitRev := "fake git rev"
+	sourceReplica.FakeMysqlDaemon.SetReplicationSourceInputs = append(sourceReplica.FakeMysqlDaemon.SetReplicationSourceInputs, topoproto.MysqlAddr(sourcePrimary.Tablet))
+	sourceReplica.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
+		// These 3 statements come from tablet startup
+		"STOP REPLICA",
+		"FAKE SET SOURCE",
+		"START REPLICA",
+	}
 	sourceReplica.StartActionLoop(t, wr)
 	sourceReplica.HTTPServer.Handler.(*http.ServeMux).HandleFunc("/debug/vars", expvarHandler(&sourceReplicaGitRev))
 	defer sourceReplica.StopActionLoop(t)

@@ -17,6 +17,7 @@ limitations under the License.
 package vtgate
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"os"
@@ -27,15 +28,16 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
-
-	"vitess.io/vitess/go/trace"
-
-	"context"
+	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/mysql/replication"
 	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/test/utils"
+	"vitess.io/vitess/go/trace"
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	"vitess.io/vitess/go/vt/tlstest"
+	"vitess.io/vitess/go/vt/vtenv"
 )
 
 type testHandler struct {
@@ -64,12 +66,24 @@ func (th *testHandler) ComStmtExecute(c *mysql.Conn, prepare *mysql.PrepareData,
 	return nil
 }
 
-func (th *testHandler) ComBinlogDumpGTID(c *mysql.Conn, gtidSet mysql.GTIDSet) error {
+func (th *testHandler) ComRegisterReplica(c *mysql.Conn, replicaHost string, replicaPort uint16, replicaUser string, replicaPassword string) error {
+	return nil
+}
+
+func (th *testHandler) ComBinlogDump(c *mysql.Conn, logFile string, binlogPos uint32) error {
+	return nil
+}
+
+func (th *testHandler) ComBinlogDumpGTID(c *mysql.Conn, logFile string, logPos uint64, gtidSet replication.GTIDSet) error {
 	return nil
 }
 
 func (th *testHandler) WarningCount(c *mysql.Conn) uint16 {
 	return 0
+}
+
+func (th *testHandler) Env() *vtenv.Environment {
+	return vtenv.NewTestEnv()
 }
 
 func TestConnectionUnixSocket(t *testing.T) {
@@ -237,6 +251,7 @@ func newTestAuthServerStatic() *mysql.AuthServerStatic {
 
 func TestDefaultWorkloadEmpty(t *testing.T) {
 	vh := &vtgateHandler{}
+	mysqlDefaultWorkload = int32(querypb.ExecuteOptions_OLTP)
 	sess := vh.session(&mysql.Conn{})
 	if sess.Options.Workload != querypb.ExecuteOptions_OLTP {
 		t.Fatalf("Expected default workload OLTP")
@@ -262,11 +277,9 @@ func TestInitTLSConfigWithServerCA(t *testing.T) {
 
 func testInitTLSConfig(t *testing.T, serverCA bool) {
 	// Create the certs.
-	root, err := os.MkdirTemp("", "TestInitTLSConfig")
-	if err != nil {
-		t.Fatalf("TempDir failed: %v", err)
-	}
-	defer os.RemoveAll(root)
+	ctx := utils.LeakCheckContext(t)
+
+	root := t.TempDir()
 	tlstest.CreateCA(root)
 	tlstest.CreateCRL(root, tlstest.CA)
 	tlstest.CreateSignedCert(root, tlstest.CA, "01", "server", "server.example.com")
@@ -276,20 +289,136 @@ func testInitTLSConfig(t *testing.T, serverCA bool) {
 		serverCACert = path.Join(root, "ca-cert.pem")
 	}
 
-	listener := &mysql.Listener{}
-	if err := initTLSConfig(listener, path.Join(root, "server-cert.pem"), path.Join(root, "server-key.pem"), path.Join(root, "ca-cert.pem"), path.Join(root, "ca-crl.pem"), serverCACert, true, tls.VersionTLS12); err != nil {
+	srv := &mysqlServer{tcpListener: &mysql.Listener{}}
+	if err := initTLSConfig(ctx, srv, path.Join(root, "server-cert.pem"), path.Join(root, "server-key.pem"), path.Join(root, "ca-cert.pem"), path.Join(root, "ca-crl.pem"), serverCACert, true, tls.VersionTLS12); err != nil {
 		t.Fatalf("init tls config failure due to: +%v", err)
 	}
 
-	serverConfig := listener.TLSConfig.Load()
+	serverConfig := srv.tcpListener.TLSConfig.Load()
 	if serverConfig == nil {
 		t.Fatalf("init tls config shouldn't create nil server config")
 	}
 
-	sigChan <- syscall.SIGHUP
+	srv.sigChan <- syscall.SIGHUP
 	time.Sleep(100 * time.Millisecond) // wait for signal handler
 
-	if listener.TLSConfig.Load() == serverConfig {
+	if srv.tcpListener.TLSConfig.Load() == serverConfig {
 		t.Fatalf("init tls config should have been recreated after SIGHUP")
 	}
+}
+
+// TestKillMethods test the mysql plugin for kill method calls.
+func TestKillMethods(t *testing.T) {
+	executor, _, _, _, _ := createExecutorEnv(t)
+	vh := newVtgateHandler(&VTGate{executor: executor})
+
+	// connection does not exist
+	err := vh.KillQuery(12345)
+	assert.ErrorContains(t, err, "Unknown thread id: 12345 (errno 1094) (sqlstate HY000)")
+
+	err = vh.KillConnection(context.Background(), 12345)
+	assert.ErrorContains(t, err, "Unknown thread id: 12345 (errno 1094) (sqlstate HY000)")
+
+	// add a connection
+	mysqlConn := mysql.GetTestConn()
+	mysqlConn.ConnectionID = 1
+	vh.connections[1] = mysqlConn
+
+	// connection exists
+
+	// updating context.
+	cancelCtx, cancelFunc := context.WithCancel(context.Background())
+	mysqlConn.UpdateCancelCtx(cancelFunc)
+
+	// kill query
+	err = vh.KillQuery(1)
+	assert.NoError(t, err)
+	require.EqualError(t, cancelCtx.Err(), "context canceled")
+
+	// updating context.
+	cancelCtx, cancelFunc = context.WithCancel(context.Background())
+	mysqlConn.UpdateCancelCtx(cancelFunc)
+
+	// kill connection
+	err = vh.KillConnection(context.Background(), 1)
+	assert.NoError(t, err)
+	require.EqualError(t, cancelCtx.Err(), "context canceled")
+	require.True(t, mysqlConn.IsMarkedForClose())
+}
+
+func TestGracefulShutdown(t *testing.T) {
+	executor, _, _, _, _ := createExecutorEnv(t)
+
+	vh := newVtgateHandler(&VTGate{executor: executor, timings: timings, rowsReturned: rowsReturned, rowsAffected: rowsAffected, queryTextCharsProcessed: queryTextCharsProcessed})
+	th := &testHandler{}
+	listener, err := mysql.NewListener("tcp", "127.0.0.1:", mysql.NewAuthServerNone(), th, 0, 0, false, false, 0, 0)
+	require.NoError(t, err)
+	defer listener.Close()
+
+	// add a connection
+	mysqlConn := mysql.GetTestServerConn(listener)
+	mysqlConn.ConnectionID = 1
+	mysqlConn.UserData = &mysql.StaticUserData{}
+	vh.connections[1] = mysqlConn
+
+	err = vh.ComQuery(mysqlConn, "select 1", func(result *sqltypes.Result) error {
+		return nil
+	})
+	assert.NoError(t, err)
+
+	listener.Shutdown()
+
+	err = vh.ComQuery(mysqlConn, "select 1", func(result *sqltypes.Result) error {
+		return nil
+	})
+	require.EqualError(t, err, "Server shutdown in progress (errno 1053) (sqlstate 08S01)")
+
+	require.True(t, mysqlConn.IsMarkedForClose())
+}
+
+func TestGracefulShutdownWithTransaction(t *testing.T) {
+	executor, _, _, _, _ := createExecutorEnv(t)
+
+	vh := newVtgateHandler(&VTGate{executor: executor, timings: timings, rowsReturned: rowsReturned, rowsAffected: rowsAffected, queryTextCharsProcessed: queryTextCharsProcessed})
+	th := &testHandler{}
+	listener, err := mysql.NewListener("tcp", "127.0.0.1:", mysql.NewAuthServerNone(), th, 0, 0, false, false, 0, 0)
+	require.NoError(t, err)
+	defer listener.Close()
+
+	// add a connection
+	mysqlConn := mysql.GetTestServerConn(listener)
+	mysqlConn.ConnectionID = 1
+	mysqlConn.UserData = &mysql.StaticUserData{}
+	vh.connections[1] = mysqlConn
+
+	err = vh.ComQuery(mysqlConn, "BEGIN", func(result *sqltypes.Result) error {
+		return nil
+	})
+	assert.NoError(t, err)
+
+	err = vh.ComQuery(mysqlConn, "select 1", func(result *sqltypes.Result) error {
+		return nil
+	})
+	assert.NoError(t, err)
+
+	listener.Shutdown()
+
+	err = vh.ComQuery(mysqlConn, "select 1", func(result *sqltypes.Result) error {
+		return nil
+	})
+	assert.NoError(t, err)
+
+	err = vh.ComQuery(mysqlConn, "COMMIT", func(result *sqltypes.Result) error {
+		return nil
+	})
+	assert.NoError(t, err)
+
+	require.False(t, mysqlConn.IsMarkedForClose())
+
+	err = vh.ComQuery(mysqlConn, "select 1", func(result *sqltypes.Result) error {
+		return nil
+	})
+	require.EqualError(t, err, "Server shutdown in progress (errno 1053) (sqlstate 08S01)")
+
+	require.True(t, mysqlConn.IsMarkedForClose())
 }

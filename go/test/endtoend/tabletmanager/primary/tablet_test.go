@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+	http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,21 +16,18 @@ limitations under the License.
 package primary
 
 import (
-	"encoding/json"
+	"context"
 	"flag"
 	"fmt"
 	"net/http"
 	"os"
 	"testing"
 
-	"vitess.io/vitess/go/json2"
-
-	"vitess.io/vitess/go/test/endtoend/cluster"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	querypb "vitess.io/vitess/go/vt/proto/query"
+	"vitess.io/vitess/go/test/endtoend/cluster"
+
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
@@ -87,12 +84,10 @@ func TestMain(m *testing.M) {
 
 		// Set extra tablet args for lock timeout
 		clusterInstance.VtTabletExtraArgs = []string{
-			"-lock_tables_timeout", "5s",
-			"-watch_replication_stream",
-			"-enable_replication_reporter",
+			"--lock_tables_timeout", "5s",
+			"--watch_replication_stream",
+			"--enable_replication_reporter",
 		}
-		// We do not need semiSync for this test case.
-		clusterInstance.EnableSemiSync = false
 
 		// Start keyspace
 		keyspace := &cluster.Keyspace{
@@ -125,88 +120,82 @@ func TestRepeatedInitShardPrimary(t *testing.T) {
 	// Test that using InitShardPrimary can go back and forth between 2 hosts.
 
 	// Make replica tablet as primary
-	err := clusterInstance.VtctlclientProcess.InitShardPrimary(keyspaceName, shardName, cell, replicaTablet.TabletUID)
-	require.Nil(t, err)
+	err := clusterInstance.VtctldClientProcess.InitShardPrimary(keyspaceName, shardName, cell, replicaTablet.TabletUID)
+	require.NoError(t, err)
 
 	// Run health check on both, make sure they are both healthy.
 	// Also make sure the types are correct.
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("RunHealthCheck", primaryTablet.Alias)
-	require.Nil(t, err)
+	err = clusterInstance.VtctldClientProcess.ExecuteCommand("RunHealthCheck", primaryTablet.Alias)
+	require.NoError(t, err)
 	checkHealth(t, primaryTablet.HTTPPort, false)
 
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("RunHealthCheck", replicaTablet.Alias)
-	require.Nil(t, err)
+	err = clusterInstance.VtctldClientProcess.ExecuteCommand("RunHealthCheck", replicaTablet.Alias)
+	require.NoError(t, err)
 	checkHealth(t, replicaTablet.HTTPPort, false)
 
 	checkTabletType(t, primaryTablet.Alias, "REPLICA")
 	checkTabletType(t, replicaTablet.Alias, "PRIMARY")
 
 	// Come back to the original tablet.
-	err = clusterInstance.VtctlclientProcess.InitShardPrimary(keyspaceName, shardName, cell, primaryTablet.TabletUID)
-	require.Nil(t, err)
+	err = clusterInstance.VtctldClientProcess.InitShardPrimary(keyspaceName, shardName, cell, primaryTablet.TabletUID)
+	require.NoError(t, err)
 
 	// Run health check on both, make sure they are both healthy.
 	// Also make sure the types are correct.
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("RunHealthCheck", primaryTablet.Alias)
-	require.Nil(t, err)
+	err = clusterInstance.VtctldClientProcess.ExecuteCommand("RunHealthCheck", primaryTablet.Alias)
+	require.NoError(t, err)
 	checkHealth(t, primaryTablet.HTTPPort, false)
 
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("RunHealthCheck", replicaTablet.Alias)
-	require.Nil(t, err)
+	err = clusterInstance.VtctldClientProcess.ExecuteCommand("RunHealthCheck", replicaTablet.Alias)
+	require.NoError(t, err)
 	checkHealth(t, replicaTablet.HTTPPort, false)
 
 	checkTabletType(t, primaryTablet.Alias, "PRIMARY")
 	checkTabletType(t, replicaTablet.Alias, "REPLICA")
 }
 
-func TestPrimaryRestartSetsTERTimestamp(t *testing.T) {
+func TestPrimaryRestartSetsPTSTimestamp(t *testing.T) {
 	defer cluster.PanicHandler(t)
-	// Test that TER timestamp is set when we restart the PRIMARY vttablet.
-	// TER = TabletExternallyReparented.
-	// See StreamHealthResponse.tablet_externally_reparented_timestamp for details.
+	// Test that PTS timestamp is set when we restart the PRIMARY vttablet.
+	// PTS = PrimaryTermStart.
+	// See StreamHealthResponse.primary_term_start_timestamp for details.
 
 	// Make replica as primary
-	err := clusterInstance.VtctlclientProcess.InitShardPrimary(keyspaceName, shardName, cell, replicaTablet.TabletUID)
-	require.Nil(t, err)
+	err := clusterInstance.VtctldClientProcess.InitShardPrimary(keyspaceName, shardName, cell, replicaTablet.TabletUID)
+	require.NoError(t, err)
 
 	err = replicaTablet.VttabletProcess.WaitForTabletStatus("SERVING")
-	require.Nil(t, err)
+	require.NoError(t, err)
 
-	// Capture the current TER.
-	result, err := clusterInstance.VtctlclientProcess.ExecuteCommandWithOutput(
-		"VtTabletStreamHealth", "-count", "1", replicaTablet.Alias)
-	require.Nil(t, err)
+	// Capture the current PTS.
+	shrs, err := clusterInstance.StreamTabletHealth(context.Background(), &replicaTablet, 1)
+	require.NoError(t, err)
 
-	var streamHealthRes1 querypb.StreamHealthResponse
-	err = json.Unmarshal([]byte(result), &streamHealthRes1)
-	require.Nil(t, err)
+	streamHealthRes1 := shrs[0]
 	actualType := streamHealthRes1.GetTarget().GetTabletType()
 	tabletType := topodatapb.TabletType_value["PRIMARY"]
 	got := fmt.Sprintf("%d", actualType)
 	want := fmt.Sprintf("%d", tabletType)
 	assert.Equal(t, want, got)
-	assert.NotNil(t, streamHealthRes1.GetTabletExternallyReparentedTimestamp())
-	assert.True(t, streamHealthRes1.GetTabletExternallyReparentedTimestamp() > 0,
-		"TER on PRIMARY must be set after InitShardPrimary")
+	assert.NotNil(t, streamHealthRes1.GetPrimaryTermStartTimestamp())
+	assert.True(t, streamHealthRes1.GetPrimaryTermStartTimestamp() > 0,
+		"PTS on PRIMARY must be set after InitShardPrimary")
 
 	// Restart the PRIMARY vttablet and test again
 
 	// kill the newly promoted primary tablet
 	err = replicaTablet.VttabletProcess.TearDown()
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	// Start Vttablet
-	err = clusterInstance.StartVttablet(&replicaTablet, "SERVING", false, cell, keyspaceName, hostname, shardName)
-	require.Nil(t, err)
+	err = clusterInstance.StartVttablet(&replicaTablet, false, "SERVING", false, cell, keyspaceName, hostname, shardName)
+	require.NoError(t, err)
 
-	// Make sure that the TER did not change
-	result, err = clusterInstance.VtctlclientProcess.ExecuteCommandWithOutput(
-		"VtTabletStreamHealth", "-count", "1", replicaTablet.Alias)
-	require.Nil(t, err)
+	// Make sure that the PTS did not change
+	shrs, err = clusterInstance.StreamTabletHealth(context.Background(), &replicaTablet, 1)
+	require.NoError(t, err)
 
-	var streamHealthRes2 querypb.StreamHealthResponse
-	err = json.Unmarshal([]byte(result), &streamHealthRes2)
-	require.Nil(t, err)
+	streamHealthRes2 := shrs[0]
 
 	actualType = streamHealthRes2.GetTarget().GetTabletType()
 	tabletType = topodatapb.TabletType_value["PRIMARY"]
@@ -214,25 +203,26 @@ func TestPrimaryRestartSetsTERTimestamp(t *testing.T) {
 	want = fmt.Sprintf("%d", tabletType)
 	assert.Equal(t, want, got)
 
-	assert.NotNil(t, streamHealthRes2.GetTabletExternallyReparentedTimestamp())
-	assert.True(t, streamHealthRes2.GetTabletExternallyReparentedTimestamp() == streamHealthRes1.GetTabletExternallyReparentedTimestamp(),
+	assert.NotNil(t, streamHealthRes2.GetPrimaryTermStartTimestamp())
+	assert.True(t, streamHealthRes2.GetPrimaryTermStartTimestamp() == streamHealthRes1.GetPrimaryTermStartTimestamp(),
 		fmt.Sprintf("When the PRIMARY vttablet was restarted, "+
-			"the TER timestamp must be set by reading the old value from the tablet record. Old: %d, New: %d",
-			streamHealthRes1.GetTabletExternallyReparentedTimestamp(),
-			streamHealthRes2.GetTabletExternallyReparentedTimestamp()))
+			"the PTS timestamp must be set by reading the old value from the tablet record. Old: %d, New: %d",
+			streamHealthRes1.GetPrimaryTermStartTimestamp(),
+			streamHealthRes2.GetPrimaryTermStartTimestamp()))
 
 	// Reset primary
-	err = clusterInstance.VtctlclientProcess.InitShardPrimary(keyspaceName, shardName, cell, primaryTablet.TabletUID)
-	require.Nil(t, err)
+	err = clusterInstance.VtctldClientProcess.InitShardPrimary(keyspaceName, shardName, cell, primaryTablet.TabletUID)
+	require.NoError(t, err)
 	err = primaryTablet.VttabletProcess.WaitForTabletStatus("SERVING")
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 }
 
 func checkHealth(t *testing.T, port int, shouldError bool) {
 	url := fmt.Sprintf("http://localhost:%d/healthz", port)
 	resp, err := http.Get(url)
-	require.Nil(t, err)
+	require.NoError(t, err)
+	defer resp.Body.Close()
 	if shouldError {
 		assert.True(t, resp.StatusCode > 400)
 	} else {
@@ -241,12 +231,8 @@ func checkHealth(t *testing.T, port int, shouldError bool) {
 }
 
 func checkTabletType(t *testing.T, tabletAlias string, typeWant string) {
-	result, err := clusterInstance.VtctlclientProcess.ExecuteCommandWithOutput("GetTablet", tabletAlias)
-	require.Nil(t, err)
-
-	var tablet topodatapb.Tablet
-	err = json2.Unmarshal([]byte(result), &tablet)
-	require.Nil(t, err)
+	tablet, err := clusterInstance.VtctldClientProcess.GetTablet(tabletAlias)
+	require.NoError(t, err)
 
 	actualType := tablet.GetType()
 	got := fmt.Sprintf("%d", actualType)

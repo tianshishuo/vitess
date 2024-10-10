@@ -18,359 +18,47 @@ package vtgate
 
 import (
 	"bytes"
+	"context"
+	_ "embed"
 	"fmt"
 	"strconv"
 	"strings"
 	"testing"
 
-	"vitess.io/vitess/go/vt/log"
-
-	"vitess.io/vitess/go/vt/topo"
-
-	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
-
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/stretchr/testify/assert"
-
-	"context"
-
-	"vitess.io/vitess/go/cache"
+	"vitess.io/vitess/go/cache/theine"
+	"vitess.io/vitess/go/constants/sidecar"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/streamlog"
+	"vitess.io/vitess/go/test/utils"
 	"vitess.io/vitess/go/vt/discovery"
 	"vitess.io/vitess/go/vt/key"
-	"vitess.io/vitess/go/vt/srvtopo"
-	"vitess.io/vitess/go/vt/vtgate/vindexes"
-	"vitess.io/vitess/go/vt/vttablet/sandboxconn"
-
+	"vitess.io/vitess/go/vt/log"
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
+	"vitess.io/vitess/go/vt/sidecardb"
+	"vitess.io/vitess/go/vt/srvtopo"
+	"vitess.io/vitess/go/vt/vtenv"
+	"vitess.io/vitess/go/vt/vtgate/engine"
+	"vitess.io/vitess/go/vt/vtgate/logstats"
+	"vitess.io/vitess/go/vt/vtgate/vindexes"
+	"vitess.io/vitess/go/vt/vttablet/sandboxconn"
 )
 
-var executorVSchema = `
-{
-	"sharded": true,
-	"vindexes": {
-		"hash_index": {
-			"type": "hash"
-		},
-		"music_user_map": {
-			"type": "lookup_hash_unique",
-			"owner": "music",
-			"params": {
-				"table": "music_user_map",
-				"from": "music_id",
-				"to": "user_id"
-			}
-		},
-		"name_user_map": {
-			"type": "lookup_hash",
-			"owner": "user",
-			"params": {
-				"table": "name_user_map",
-				"from": "name",
-				"to": "user_id"
-			}
-		},
-		"name_lastname_keyspace_id_map": {
-			"type": "lookup",
-			"owner": "user2",
-			"params": {
-				"table": "name_lastname_keyspace_id_map",
-				"from": "name,lastname",
-				"to": "keyspace_id"
-			}
-		},
-		"insert_ignore_idx": {
-			"type": "lookup_hash",
-			"owner": "insert_ignore_test",
-			"params": {
-				"table": "ins_lookup",
-				"from": "fromcol",
-				"to": "tocol"
-			}
-		},
-		"idx1": {
-			"type": "hash"
-		},
-		"idx_noauto": {
-			"type": "hash",
-			"owner": "noauto_table"
-		},
-		"keyspace_id": {
-			"type": "numeric"
-		},
-		"krcol_unique_vdx": {
-			"type": "keyrange_lookuper_unique"
-		},
-		"krcol_vdx": {
-			"type": "keyrange_lookuper"
-		},
-    	"t1_lkp_vdx": {
-      		"type": "consistent_lookup_unique",
-      		"params": {
-        		"table": "t1_lkp_idx",
-        		"from": "unq_col",
-        		"to": "keyspace_id"
-      		},
-      		"owner": "t1"
-    	},
-		"t2_wo_lu_vdx": {
-      		"type": "lookup_unique",
-      		"params": {
-        		"table": "TestUnsharded.wo_lu_idx",
-        		"from": "wo_lu_col",
-        		"to": "keyspace_id",
-				"write_only": "true"
-      		},
-      		"owner": "t2_wo_lookup"
-    	},
-		"t2_lu_vdx": {
-      		"type": "lookup_hash_unique",
-      		"params": {
-        		"table": "TestUnsharded.lu_idx",
-        		"from": "lu_col",
-        		"to": "keyspace_id"
-      		},
-      		"owner": "t2_wo_lookup"
-    	},
-		"regional_vdx": {
-			"type": "region_experimental",
-			"params": {
-				"region_bytes": "1"
-			}
-    	},
-		"multicol_vdx": {
-			"type": "multicol",
-			"params": {
-				"column_count": "3",
-				"column_bytes": "1,3,4",
-				"column_vindex": "hash,binary,unicode_loose_xxhash"
-			}
-        }
-	},
-	"tables": {
-		"user": {
-			"column_vindexes": [
-				{
-					"column": "Id",
-					"name": "hash_index"
-				},
-				{
-					"column": "name",
-					"name": "name_user_map"
-				}
-			],
-			"auto_increment": {
-				"column": "id",
-				"sequence": "user_seq"
-			},
-			"columns": [
-				{
-					"name": "textcol",
-					"type": "VARCHAR"
-				}
-			]
-		},
-		"user2": {
-			"column_vindexes": [
-				{
-					"column": "id",
-					"name": "hash_index"
-				},
-				{
-					"columns": ["name", "lastname"],
-					"name": "name_lastname_keyspace_id_map"
-				}
-			]
-		},
-		"user_extra": {
-			"column_vindexes": [
-				{
-					"column": "user_id",
-					"name": "hash_index"
-				}
-			]
-		},
-		"sharded_user_msgs": {
-			"column_vindexes": [
-				{
-					"column": "user_id",
-					"name": "hash_index"
-				}
-			]
-		},
-		"music": {
-			"column_vindexes": [
-				{
-					"column": "user_id",
-					"name": "hash_index"
-				},
-				{
-					"column": "id",
-					"name": "music_user_map"
-				}
-			],
-			"auto_increment": {
-				"column": "id",
-				"sequence": "user_seq"
-			}
-		},
-		"music_extra": {
-			"column_vindexes": [
-				{
-					"column": "user_id",
-					"name": "hash_index"
-				},
-				{
-					"column": "music_id",
-					"name": "music_user_map"
-				}
-			]
-		},
-		"music_extra_reversed": {
-			"column_vindexes": [
-				{
-					"column": "music_id",
-					"name": "music_user_map"
-				},
-				{
-					"column": "user_id",
-					"name": "hash_index"
-				}
-			]
-		},
-		"insert_ignore_test": {
-			"column_vindexes": [
-				{
-					"column": "pv",
-					"name": "music_user_map"
-				},
-				{
-					"column": "owned",
-					"name": "insert_ignore_idx"
-				},
-				{
-					"column": "verify",
-					"name": "hash_index"
-				}
-			]
-		},
-		"noauto_table": {
-			"column_vindexes": [
-				{
-					"column": "id",
-					"name": "idx_noauto"
-				}
-			]
-		},
-		"keyrange_table": {
-			"column_vindexes": [
-				{
-					"column": "krcol_unique",
-					"name": "krcol_unique_vdx"
-				},
-				{
-					"column": "krcol",
-					"name": "krcol_vdx"
-				}
-			]
-		},
-		"ksid_table": {
-			"column_vindexes": [
-				{
-					"column": "keyspace_id",
-					"name": "keyspace_id"
-				}
-			]
-		},
-		"t1": {
-      		"column_vindexes": [
-				{
-				  	"column": "id",
-				  	"name": "hash_index"
-				},
-				{
-				  	"column": "unq_col",
-				  	"name": "t1_lkp_vdx"
-				}
-            ]
-    	},
-		"t1_lkp_idx": {
-			"column_vindexes": [
-				{
-					"column": "unq_col",
-				  	"name": "hash_index"
-				}
-			]
-		},
-		"t2_wo_lookup": {
-      		"column_vindexes": [
-				{
-				  	"column": "id",
-				  	"name": "hash_index"
-				},
-				{
-				  	"column": "wo_lu_col",
-				  	"name": "t2_wo_lu_vdx"
-				},
-				{
-				  	"column": "lu_col",
-				  	"name": "t2_lu_vdx"
-				}
-            ]
-    	},
-		"user_region": {
-			"column_vindexes": [
-				{
-					"columns": ["cola","colb"],
-					"name": "regional_vdx"
-				}
-			]
-    	},
-		"multicoltbl": {
-			"column_vindexes": [
-				{
-					"columns": ["cola","colb","colc"],
-					"name": "multicol_vdx"
-				}
-			]
-		}
-	}
-}
-`
+//go:embed testdata/executorVSchema.json
+var executorVSchema string
+
+//go:embed testdata/unshardedVschema.json
+var unshardedVSchema string
 
 var badVSchema = `
 {
 	"sharded": false,
 	"tables": {
 		"sharded_table": {}
-	}
-}
-`
-
-var unshardedVSchema = `
-{
-	"sharded": false,
-	"tables": {
-		"user_seq": {
-			"type": "sequence"
-		},
-		"music_user_map": {},
-		"name_user_map": {},
-		"name_lastname_keyspace_id_map": {},
-		"user_msgs": {},
-		"ins_lookup": {},
-		"main1": {
-			"auto_increment": {
-				"column": "id",
-				"sequence": "user_seq"
-			}
-		},
-		"wo_lu_idx": {},
-		"lu_idx": {},
-		"simple": {}
 	}
 }
 `
@@ -393,10 +81,10 @@ func (v *keyRangeLookuper) String() string   { return "keyrange_lookuper" }
 func (*keyRangeLookuper) Cost() int          { return 0 }
 func (*keyRangeLookuper) IsUnique() bool     { return false }
 func (*keyRangeLookuper) NeedsVCursor() bool { return false }
-func (*keyRangeLookuper) Verify(vindexes.VCursor, []sqltypes.Value, [][]byte) ([]bool, error) {
+func (*keyRangeLookuper) Verify(context.Context, vindexes.VCursor, []sqltypes.Value, [][]byte) ([]bool, error) {
 	return []bool{}, nil
 }
-func (*keyRangeLookuper) Map(cursor vindexes.VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
+func (*keyRangeLookuper) Map(ctx context.Context, vcursor vindexes.VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
 	return []key.Destination{
 		key.DestinationKeyRange{
 			KeyRange: &topodatapb.KeyRange{
@@ -418,10 +106,10 @@ func (v *keyRangeLookuperUnique) String() string   { return "keyrange_lookuper" 
 func (*keyRangeLookuperUnique) Cost() int          { return 0 }
 func (*keyRangeLookuperUnique) IsUnique() bool     { return true }
 func (*keyRangeLookuperUnique) NeedsVCursor() bool { return false }
-func (*keyRangeLookuperUnique) Verify(vindexes.VCursor, []sqltypes.Value, [][]byte) ([]bool, error) {
+func (*keyRangeLookuperUnique) Verify(context.Context, vindexes.VCursor, []sqltypes.Value, [][]byte) ([]bool, error) {
 	return []bool{}, nil
 }
-func (*keyRangeLookuperUnique) Map(cursor vindexes.VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
+func (*keyRangeLookuperUnique) Map(ctx context.Context, vcursor vindexes.VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
 	return []key.Destination{
 		key.DestinationKeyRange{
 			KeyRange: &topodatapb.KeyRange{
@@ -438,122 +126,135 @@ func newKeyRangeLookuperUnique(name string, params map[string]string) (vindexes.
 func init() {
 	vindexes.Register("keyrange_lookuper", newKeyRangeLookuper)
 	vindexes.Register("keyrange_lookuper_unique", newKeyRangeLookuperUnique)
-	// Use legacy gateway until we can rewrite these tests to use new tabletgateway
-	*GatewayImplementation = GatewayImplementationDiscovery
 }
 
-func createLegacyExecutorEnv() (executor *Executor, sbc1, sbc2, sbclookup *sandboxconn.SandboxConn) {
-	// Use legacy gateway until we can rewrite these tests to use new tabletgateway
-	*GatewayImplementation = GatewayImplementationDiscovery
+func createExecutorEnvCallback(t testing.TB, eachShard func(shard, ks string, tabletType topodatapb.TabletType, conn *sandboxconn.SandboxConn)) (executor *Executor, ctx context.Context) {
+	var cancel context.CancelFunc
+	ctx, cancel = context.WithCancel(context.Background())
 	cell := "aa"
-	hc := discovery.NewFakeLegacyHealthCheck()
-	s := createSandbox("TestExecutor")
+	hc := discovery.NewFakeHealthCheck(make(chan *discovery.TabletHealth))
+
+	s := createSandbox(KsTestSharded)
 	s.VSchema = executorVSchema
-	serv := newSandboxForCells([]string{cell})
-	resolver := newTestLegacyResolver(hc, serv, cell)
-	sbc1 = hc.AddTestTablet(cell, "-20", 1, "TestExecutor", "-20", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	sbc2 = hc.AddTestTablet(cell, "40-60", 1, "TestExecutor", "40-60", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	// Create these connections so scatter queries don't fail.
-	_ = hc.AddTestTablet(cell, "20-40", 1, "TestExecutor", "20-40", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	_ = hc.AddTestTablet(cell, "60-80", 1, "TestExecutor", "60-80", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	_ = hc.AddTestTablet(cell, "80-a0", 1, "TestExecutor", "80-a0", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	_ = hc.AddTestTablet(cell, "a0-c0", 1, "TestExecutor", "a0-c0", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	_ = hc.AddTestTablet(cell, "c0-e0", 1, "TestExecutor", "c0-e0", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	_ = hc.AddTestTablet(cell, "e0-", 1, "TestExecutor", "e0-", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	// Below is needed so that SendAnyWherePlan doesn't fail
-	_ = hc.AddTestTablet(cell, "e0-", 1, "TestXBadVSchema", "-20", topodatapb.TabletType_PRIMARY, true, 1, nil)
-
-	createSandbox(KsTestUnsharded)
-	sbclookup = hc.AddTestTablet(cell, "0", 1, KsTestUnsharded, "0", topodatapb.TabletType_PRIMARY, true, 1, nil)
-
-	// Ues the 'X' in the name to ensure it's not alphabetically first.
+	sb := createSandbox(KsTestUnsharded)
+	sb.VSchema = unshardedVSchema
+	// Use the 'X' in the name to ensure it's not alphabetically first.
 	// Otherwise, it would become the default keyspace for the dual table.
 	bad := createSandbox("TestXBadSharding")
 	bad.VSchema = badVSchema
 
-	getSandbox(KsTestUnsharded).VSchema = unshardedVSchema
-	executor = NewExecutor(context.Background(), serv, cell, resolver, false, false, testBufferSize, cache.DefaultConfig, nil, false)
+	serv := newSandboxForCells(ctx, []string{cell})
+	serv.topoServer.CreateKeyspace(ctx, KsTestSharded, &topodatapb.Keyspace{SidecarDbName: sidecar.DefaultName})
+	// Force a new cache to use for lookups of the sidecar database identifier
+	// in use by each keyspace -- as we want to use a different load function
+	// than the one already created by the vtgate as it uses a different topo.
+	if sdbc, _ := sidecardb.GetIdentifierCache(); sdbc != nil {
+		sdbc.Destroy()
+	}
+	_, created := sidecardb.NewIdentifierCache(func(ctx context.Context, keyspace string) (string, error) {
+		ki, err := serv.topoServer.GetKeyspace(ctx, keyspace)
+		if err != nil {
+			return "", err
+		}
+		return ki.SidecarDbName, nil
+	})
+	if !created {
+		log.Fatal("Failed to [re]create a sidecar database identifier cache!")
+	}
+
+	resolver := newTestResolver(ctx, hc, serv, cell)
+	shards := []string{"-20", "20-40", "40-60", "60-80", "80-a0", "a0-c0", "c0-e0", "e0-"}
+
+	for _, shard := range shards {
+		conn := hc.AddTestTablet(cell, shard, 1, KsTestSharded, shard, topodatapb.TabletType_PRIMARY, true, 1, nil)
+		eachShard(shard, KsTestSharded, topodatapb.TabletType_PRIMARY, conn)
+	}
+
+	eachShard("0", KsTestUnsharded, topodatapb.TabletType_PRIMARY, hc.AddTestTablet(cell, "0", 1, KsTestUnsharded, "0", topodatapb.TabletType_PRIMARY, true, 1, nil))
+	eachShard("0", KsTestUnsharded, topodatapb.TabletType_REPLICA, hc.AddTestTablet(cell, "2", 3, KsTestUnsharded, "0", topodatapb.TabletType_REPLICA, true, 1, nil))
+
+	queryLogger := streamlog.New[*logstats.LogStats]("VTGate", queryLogBufferSize)
+
+	// All these vtgate tests expect plans to be immediately cached after first use;
+	// this is not the actual behavior of the system in a production context because we use a doorkeeper
+	// that sometimes can cause a plan to not be cached the very first time it's seen, to prevent
+	// one-off queries from thrashing the cache. Disable the doorkeeper in the tests to prevent flakiness.
+	plans := theine.NewStore[PlanCacheKey, *engine.Plan](queryPlanCacheMemory, false)
+
+	executor = NewExecutor(ctx, vtenv.NewTestEnv(), serv, cell, resolver, false, false, testBufferSize, plans, nil, false, querypb.ExecuteOptions_Gen4, 0)
+	executor.SetQueryLogger(queryLogger)
 
 	key.AnyShardPicker = DestinationAnyShardPickerFirstShard{}
-	return executor, sbc1, sbc2, sbclookup
+
+	t.Cleanup(func() {
+		defer utils.EnsureNoLeaks(t)
+		executor.Close()
+		cancel()
+	})
+
+	return executor, ctx
 }
 
-func createExecutorEnv() (executor *Executor, sbc1, sbc2, sbclookup *sandboxconn.SandboxConn) {
-	// Use legacy gateway until we can rewrite these tests to use new tabletgateway
-	*GatewayImplementation = tabletGatewayImplementation
+func createExecutorEnv(t testing.TB) (executor *Executor, sbc1, sbc2, sbclookup *sandboxconn.SandboxConn, ctx context.Context) {
+	executor, ctx = createExecutorEnvCallback(t, func(shard, ks string, tabletType topodatapb.TabletType, conn *sandboxconn.SandboxConn) {
+		switch {
+		case ks == KsTestSharded && shard == "-20":
+			sbc1 = conn
+		case ks == KsTestSharded && shard == "40-60":
+			sbc2 = conn
+		case ks == KsTestUnsharded && tabletType == topodatapb.TabletType_PRIMARY:
+			sbclookup = conn
+		}
+	})
+	return
+}
+
+func createCustomExecutor(t testing.TB, vschema string, mysqlVersion string) (executor *Executor, sbc1, sbc2, sbclookup *sandboxconn.SandboxConn, ctx context.Context) {
+	var cancel context.CancelFunc
+	ctx, cancel = context.WithCancel(context.Background())
 	cell := "aa"
 	hc := discovery.NewFakeHealthCheck(nil)
-	s := createSandbox("TestExecutor")
-	s.VSchema = executorVSchema
-	serv := newSandboxForCells([]string{cell})
-	resolver := newTestResolver(hc, serv, cell)
-	sbc1 = hc.AddTestTablet(cell, "-20", 1, "TestExecutor", "-20", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	sbc2 = hc.AddTestTablet(cell, "40-60", 1, "TestExecutor", "40-60", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	// Create these connections so scatter queries don't fail.
-	_ = hc.AddTestTablet(cell, "20-40", 1, "TestExecutor", "20-40", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	_ = hc.AddTestTablet(cell, "60-60", 1, "TestExecutor", "60-80", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	_ = hc.AddTestTablet(cell, "80-a0", 1, "TestExecutor", "80-a0", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	_ = hc.AddTestTablet(cell, "a0-c0", 1, "TestExecutor", "a0-c0", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	_ = hc.AddTestTablet(cell, "c0-e0", 1, "TestExecutor", "c0-e0", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	_ = hc.AddTestTablet(cell, "e0-", 1, "TestExecutor", "e0-", topodatapb.TabletType_PRIMARY, true, 1, nil)
 
-	createSandbox(KsTestUnsharded)
-	_ = topo.NewShardInfo(KsTestUnsharded, "0", &topodatapb.Shard{}, nil)
-	if err := serv.topoServer.CreateKeyspace(ctx, KsTestUnsharded, &topodatapb.Keyspace{}); err != nil {
-		log.Errorf("CreateKeyspace() failed: %v", err)
-	}
-	if err := serv.topoServer.CreateShard(ctx, KsTestUnsharded, "0"); err != nil {
-		log.Errorf("CreateShard(0) failed: %v", err)
-	}
+	s := createSandbox(KsTestSharded)
+	s.VSchema = vschema
+	sb := createSandbox(KsTestUnsharded)
+	sb.VSchema = unshardedVSchema
+
+	serv := newSandboxForCells(ctx, []string{cell})
+	resolver := newTestResolver(ctx, hc, serv, cell)
+	sbc1 = hc.AddTestTablet(cell, "-20", 1, KsTestSharded, "-20", topodatapb.TabletType_PRIMARY, true, 1, nil)
+	sbc2 = hc.AddTestTablet(cell, "40-60", 1, KsTestSharded, "40-60", topodatapb.TabletType_PRIMARY, true, 1, nil)
 	sbclookup = hc.AddTestTablet(cell, "0", 1, KsTestUnsharded, "0", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	tablet := topo.NewTablet(sbclookup.Tablet().Alias.Uid, cell, "0")
-	tablet.Type = topodatapb.TabletType_PRIMARY
-	tablet.Keyspace = KsTestUnsharded
-	tablet.Shard = "0"
-	serv.topoServer.UpdateShardFields(ctx, KsTestUnsharded, "0", func(si *topo.ShardInfo) error {
-		si.PrimaryAlias = tablet.Alias
-		return nil
+
+	queryLogger := streamlog.New[*logstats.LogStats]("VTGate", queryLogBufferSize)
+	plans := DefaultPlanCache()
+	env, err := vtenv.New(vtenv.Options{MySQLServerVersion: mysqlVersion})
+	require.NoError(t, err)
+	executor = NewExecutor(ctx, env, serv, cell, resolver, false, false, testBufferSize, plans, nil, false, querypb.ExecuteOptions_Gen4, 0)
+	executor.SetQueryLogger(queryLogger)
+
+	t.Cleanup(func() {
+		defer utils.EnsureNoLeaks(t)
+		executor.Close()
+		cancel()
 	})
-	if err := serv.topoServer.CreateTablet(ctx, tablet); err != nil {
-		log.Errorf("CreateShard(0) failed: %v", err)
-	}
-	// Ues the 'X' in the name to ensure it's not alphabetically first.
-	// Otherwise, it would become the default keyspace for the dual table.
-	bad := createSandbox("TestXBadSharding")
-	bad.VSchema = badVSchema
 
-	getSandbox(KsTestUnsharded).VSchema = unshardedVSchema
-	executor = NewExecutor(context.Background(), serv, cell, resolver, false, false, testBufferSize, cache.DefaultConfig, nil, false)
-
-	key.AnyShardPicker = DestinationAnyShardPickerFirstShard{}
-	return executor, sbc1, sbc2, sbclookup
+	return executor, sbc1, sbc2, sbclookup, ctx
 }
 
-func createCustomExecutor(vschema string) (executor *Executor, sbc1, sbc2, sbclookup *sandboxconn.SandboxConn) {
+func createCustomExecutorSetValues(t testing.TB, vschema string, values []*sqltypes.Result) (executor *Executor, sbc1, sbc2, sbclookup *sandboxconn.SandboxConn, ctx context.Context) {
+	var cancel context.CancelFunc
+	ctx, cancel = context.WithCancel(context.Background())
 	cell := "aa"
-	hc := discovery.NewFakeLegacyHealthCheck()
-	s := createSandbox("TestExecutor")
+	hc := discovery.NewFakeHealthCheck(nil)
+
+	s := createSandbox(KsTestSharded)
 	s.VSchema = vschema
-	serv := newSandboxForCells([]string{cell})
-	resolver := newTestLegacyResolver(hc, serv, cell)
-	sbc1 = hc.AddTestTablet(cell, "-20", 1, "TestExecutor", "-20", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	sbc2 = hc.AddTestTablet(cell, "40-60", 1, "TestExecutor", "40-60", topodatapb.TabletType_PRIMARY, true, 1, nil)
+	sb := createSandbox(KsTestUnsharded)
+	sb.VSchema = unshardedVSchema
 
-	createSandbox(KsTestUnsharded)
-	sbclookup = hc.AddTestTablet(cell, "0", 1, KsTestUnsharded, "0", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	getSandbox(KsTestUnsharded).VSchema = unshardedVSchema
-
-	executor = NewExecutor(context.Background(), serv, cell, resolver, false, false, testBufferSize, cache.DefaultConfig, nil, false)
-	return executor, sbc1, sbc2, sbclookup
-}
-
-func createCustomExecutorSetValues(vschema string, values []*sqltypes.Result) (executor *Executor, sbc1, sbc2, sbclookup *sandboxconn.SandboxConn) {
-	cell := "aa"
-	hc := discovery.NewFakeLegacyHealthCheck()
-	s := createSandbox("TestExecutor")
-	s.VSchema = vschema
-	serv := newSandboxForCells([]string{cell})
-	resolver := newTestLegacyResolver(hc, serv, cell)
+	serv := newSandboxForCells(ctx, []string{cell})
+	resolver := newTestResolver(ctx, hc, serv, cell)
 	shards := []string{"-20", "20-40", "40-60", "60-80", "80-a0", "a0-c0", "c0-e0", "e0-"}
 	sbcs := []*sandboxconn.SandboxConn{}
 	for _, shard := range shards {
@@ -563,41 +264,72 @@ func createCustomExecutorSetValues(vschema string, values []*sqltypes.Result) (e
 		}
 		sbcs = append(sbcs, sbc)
 	}
-
-	createSandbox(KsTestUnsharded)
 	sbclookup = hc.AddTestTablet(cell, "0", 1, KsTestUnsharded, "0", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	getSandbox(KsTestUnsharded).VSchema = unshardedVSchema
+	queryLogger := streamlog.New[*logstats.LogStats]("VTGate", queryLogBufferSize)
+	plans := DefaultPlanCache()
+	executor = NewExecutor(ctx, vtenv.NewTestEnv(), serv, cell, resolver, false, false, testBufferSize, plans, nil, false, querypb.ExecuteOptions_Gen4, 0)
+	executor.SetQueryLogger(queryLogger)
 
-	executor = NewExecutor(context.Background(), serv, cell, resolver, false, false, testBufferSize, cache.DefaultConfig, nil, false)
-	return executor, sbcs[0], sbcs[1], sbclookup
+	t.Cleanup(func() {
+		defer utils.EnsureNoLeaks(t)
+		executor.Close()
+		cancel()
+	})
+
+	return executor, sbcs[0], sbcs[1], sbclookup, ctx
 }
 
-func executorExecSession(executor *Executor, sql string, bv map[string]*querypb.BindVariable, session *vtgatepb.Session) (*sqltypes.Result, error) {
+func createExecutorEnvWithPrimaryReplicaConn(t testing.TB, ctx context.Context, warmingReadsPercent int) (executor *Executor, primary, replica *sandboxconn.SandboxConn) {
+	var cancel context.CancelFunc
+	ctx, cancel = context.WithCancel(ctx)
+	cell := "aa"
+	hc := discovery.NewFakeHealthCheck(nil)
+	serv := newSandboxForCells(ctx, []string{cell})
+	resolver := newTestResolver(ctx, hc, serv, cell)
+
+	createSandbox(KsTestUnsharded)
+	primary = hc.AddTestTablet(cell, "0", 1, KsTestUnsharded, "0", topodatapb.TabletType_PRIMARY, true, 1, nil)
+	replica = hc.AddTestTablet(cell, "0-replica", 1, KsTestUnsharded, "0", topodatapb.TabletType_REPLICA, true, 1, nil)
+
+	queryLogger := streamlog.New[*logstats.LogStats]("VTGate", queryLogBufferSize)
+	executor = NewExecutor(ctx, vtenv.NewTestEnv(), serv, cell, resolver, false, false, testBufferSize, DefaultPlanCache(), nil, false, querypb.ExecuteOptions_Gen4, warmingReadsPercent)
+	executor.SetQueryLogger(queryLogger)
+
+	t.Cleanup(func() {
+		executor.Close()
+		cancel()
+	})
+	return executor, primary, replica
+}
+
+func executorExecSession(ctx context.Context, executor *Executor, sql string, bv map[string]*querypb.BindVariable, session *vtgatepb.Session) (*sqltypes.Result, error) {
 	return executor.Execute(
-		context.Background(),
+		ctx,
+		nil,
 		"TestExecute",
 		NewSafeSession(session),
 		sql,
 		bv)
 }
 
-func executorExec(executor *Executor, sql string, bv map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
-	return executorExecSession(executor, sql, bv, primarySession)
+func executorExec(ctx context.Context, executor *Executor, session *vtgatepb.Session, sql string, bv map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
+	return executorExecSession(ctx, executor, sql, bv, session)
 }
 
-func executorPrepare(executor *Executor, sql string, bv map[string]*querypb.BindVariable) ([]*querypb.Field, error) {
+func executorPrepare(ctx context.Context, executor *Executor, session *vtgatepb.Session, sql string, bv map[string]*querypb.BindVariable) ([]*querypb.Field, error) {
 	return executor.Prepare(
-		context.Background(),
+		ctx,
 		"TestExecute",
-		NewSafeSession(primarySession),
+		NewSafeSession(session),
 		sql,
 		bv)
 }
 
-func executorStream(executor *Executor, sql string) (qr *sqltypes.Result, err error) {
+func executorStream(ctx context.Context, executor *Executor, sql string) (qr *sqltypes.Result, err error) {
 	results := make(chan *sqltypes.Result, 100)
 	err = executor.StreamExecute(
-		context.Background(),
+		ctx,
+		nil,
 		"TestExecuteStream",
 		NewSafeSession(nil),
 		sql,
@@ -632,11 +364,11 @@ func assertQueries(t *testing.T, sbc *sandboxconn.SandboxConn, wantQueries []*qu
 		if len(wantQueries) < idx {
 			t.Errorf("got more queries than expected")
 		}
-		require.Equal(t, wantQueries[idx].BindVariables, query.BindVariables)
 		got := query.Sql
 		expected := wantQueries[idx].Sql
+		utils.MustMatch(t, expected, got, fmt.Sprintf("query did not match on index: %d", idx))
+		utils.MustMatch(t, wantQueries[idx].BindVariables, query.BindVariables, fmt.Sprintf("bind variables did not match on index: %d", idx))
 		idx++
-		assert.Equal(t, expected, got)
 	}
 }
 
@@ -652,7 +384,11 @@ func assertQueriesWithSavepoint(t *testing.T, sbc *sandboxconn.SandboxConn, want
 			if !strings.HasPrefix(expected, "savepoint") {
 				t.Fatal("savepoint expected")
 			}
-			savepointStore[expected[10:]] = got[10:]
+			if sp, exists := savepointStore[expected[10:]]; exists {
+				assert.Equal(t, sp, got[10:])
+			} else {
+				savepointStore[expected[10:]] = got[10:]
+			}
 			continue
 		}
 		if strings.HasPrefix(got, "rollback to") {
@@ -668,7 +404,7 @@ func assertQueriesWithSavepoint(t *testing.T, sbc *sandboxconn.SandboxConn, want
 
 func testCommitCount(t *testing.T, sbcName string, sbc *sandboxconn.SandboxConn, want int) {
 	t.Helper()
-	if got, want := sbc.CommitCount.Get(), int64(want); got != want {
+	if got, want := sbc.CommitCount.Load(), int64(want); got != want {
 		t.Errorf("%s.CommitCount: %d, want %d\n", sbcName, got, want)
 	}
 }
@@ -681,12 +417,10 @@ func testNonZeroDuration(t *testing.T, what, d string) {
 	}
 }
 
-func getQueryLog(logChan chan interface{}) *LogStats {
-	var log interface{}
-
+func getQueryLog(logChan chan *logstats.LogStats) *logstats.LogStats {
 	select {
-	case log = <-logChan:
-		return log.(*LogStats)
+	case log := <-logChan:
+		return log
 	default:
 		return nil
 	}
@@ -699,32 +433,14 @@ func getQueryLog(logChan chan interface{}) *LogStats {
 // is a repeat query.
 var testPlannedQueries = map[string]bool{}
 
-func testQueryLog(t *testing.T, logChan chan interface{}, method, stmtType, sql string, shardQueries int) *LogStats {
+func testQueryLog(t *testing.T, executor *Executor, logChan chan *logstats.LogStats, method, stmtType, sql string, shardQueries int) *logstats.LogStats {
 	t.Helper()
 
-	return testQueryLogWithSavepoint(t, logChan, method, stmtType, sql, shardQueries, false /* checkSavepoint */)
-}
-
-func testQueryLogWithSavepoint(t *testing.T, logChan chan interface{}, method, stmtType, sql string, shardQueries int, checkSavepoint bool) *LogStats {
-	t.Helper()
-
-	var logStats *LogStats
-
-	if checkSavepoint {
-		logStats = getQueryLog(logChan)
-		require.NotNil(t, logStats)
-	} else {
-		for {
-			logStats = getQueryLog(logChan)
-			require.NotNil(t, logStats)
-			if logStats.Method != "MarkSavepoint" {
-				break
-			}
-		}
-	}
+	logStats := getQueryLog(logChan)
+	require.NotNil(t, logStats)
 
 	var log bytes.Buffer
-	streamlog.GetFormatter(QueryLogger)(&log, nil, logStats)
+	streamlog.GetFormatter(executor.queryLogger)(&log, nil, logStats)
 	fields := strings.Split(log.String(), "\t")
 
 	// fields[0] is the method
@@ -735,11 +451,9 @@ func testQueryLogWithSavepoint(t *testing.T, logChan chan interface{}, method, s
 	checkEqualQuery := true
 	// The internal savepoints are created with uuids so the value of it not known to assert.
 	// Therefore, the equal query check is ignored.
-	if checkSavepoint {
-		switch stmtType {
-		case "SAVEPOINT", "SAVEPOINT_ROLLBACK", "RELEASE":
-			checkEqualQuery = false
-		}
+	switch stmtType {
+	case "SAVEPOINT", "SAVEPOINT_ROLLBACK", "RELEASE":
+		checkEqualQuery = false
 	}
 	// only test the durations if there is no error (fields[16])
 	if fields[16] == "\"\"" {
@@ -782,13 +496,8 @@ func testQueryLogWithSavepoint(t *testing.T, logChan chan interface{}, method, s
 	return logStats
 }
 
-func newTestLegacyResolver(hc discovery.LegacyHealthCheck, serv srvtopo.Server, cell string) *Resolver {
-	sc := newTestLegacyScatterConn(hc, serv, cell)
-	srvResolver := srvtopo.NewResolver(serv, sc.gateway, cell)
-	return NewResolver(srvResolver, serv, cell, sc)
-}
-func newTestResolver(hc discovery.HealthCheck, serv srvtopo.Server, cell string) *Resolver {
-	sc := newTestScatterConn(hc, serv, cell)
+func newTestResolver(ctx context.Context, hc discovery.HealthCheck, serv srvtopo.Server, cell string) *Resolver {
+	sc := newTestScatterConn(ctx, hc, serv, cell)
 	srvResolver := srvtopo.NewResolver(serv, sc.gateway, cell)
 	return NewResolver(srvResolver, serv, cell, sc)
 }

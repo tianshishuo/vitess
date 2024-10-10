@@ -17,22 +17,25 @@ limitations under the License.
 package mysqlctl
 
 import (
+	"bufio"
+	"context"
 	"errors"
-	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
-	"context"
+	"github.com/spf13/pflag"
 
-	"vitess.io/vitess/go/mysql"
-	"vitess.io/vitess/go/stats"
+	"vitess.io/vitess/go/textutil"
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/mysqlctl/backupstats"
 	"vitess.io/vitess/go/vt/mysqlctl/backupstorage"
 	"vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/servenv"
 	"vitess.io/vitess/go/vt/topo/topoproto"
 	"vitess.io/vitess/go/vt/vterrors"
 
@@ -45,6 +48,7 @@ const (
 	// the three bases for files to restore
 	backupInnodbDataHomeDir     = "InnoDBData"
 	backupInnodbLogGroupHomeDir = "InnoDBLog"
+	backupBinlogDir             = "BinLog"
 	backupData                  = "Data"
 
 	// backupManifestFileName is the MANIFEST file name within a backup.
@@ -54,6 +58,11 @@ const (
 	RestoreState = "restore_in_progress"
 	// BackupTimestampFormat is the format in which we save BackupTime and FinishedTime
 	BackupTimestampFormat = "2006-01-02.150405"
+
+	// closeTimeout is the timeout for closing backup files after writing.
+	// The value is a bit arbitrary. How long does it make sense to wait for a Close()? With a cloud-based implementation,
+	// network might be an issue. _Seconds_ are probably too short. The whereabouts of a minute us a reasonable value.
+	closeTimeout = 1 * time.Minute
 )
 
 const (
@@ -69,35 +78,54 @@ var (
 	// but none of them are complete.
 	ErrNoCompleteBackup = errors.New("backup(s) found but none are complete")
 
-	// backupStorageHook contains the hook name to use to process
-	// backup files. If not set, we will not process the files. It is
-	// only used at backup time. Then it is put in the manifest,
-	// and when decoding a backup, it is read from the manifest,
-	// and used as the transform hook name again.
-	backupStorageHook = flag.String("backup_storage_hook", "", "if set, we send the contents of the backup files through this hook.")
-
 	// backupStorageCompress can be set to false to not use gzip
-	// on the backups. Usually would be set if a hook is used, and
-	// the hook compresses the data.
-	backupStorageCompress = flag.Bool("backup_storage_compress", true, "if set, the backup files will be compressed (default is true). Set to false for instance if a backup_storage_hook is specified and it compresses the data.")
+	// on the backups.
+	backupStorageCompress = true
 
 	// backupCompressBlockSize is the splitting size for each
 	// compressed block
-	backupCompressBlockSize = flag.Int("backup_storage_block_size", 250000, "if backup_storage_compress is true, backup_storage_block_size sets the byte size for each block while compressing (default is 250000).")
+	backupCompressBlockSize = 250000
 
 	// backupCompressBlocks is the number of blocks that are processed
 	// once before the writer blocks
-	backupCompressBlocks = flag.Int("backup_storage_number_blocks", 2, "if backup_storage_compress is true, backup_storage_number_blocks sets the number of blocks that can be processed, at once, before the writer blocks, during compression (default is 2). It should be equal to the number of CPUs available for compression")
+	backupCompressBlocks = 2
 
-	backupDuration  = stats.NewGauge("backup_duration_seconds", "How long it took to complete the last backup operation (in seconds)")
-	restoreDuration = stats.NewGauge("restore_duration_seconds", "How long it took to complete the last restore operation (in seconds)")
+	EmptyBackupMessage = "no new data to backup, skipping it"
 )
+
+func init() {
+	for _, cmd := range []string{"vtcombo", "vttablet", "vttestserver", "vtbackup", "vtctld"} {
+		servenv.OnParseFor(cmd, registerBackupFlags)
+	}
+}
+
+func FormatRFC3339(t time.Time) string {
+	return t.Format(time.RFC3339)
+}
+
+func ParseRFC3339(timestamp string) (time.Time, error) {
+	return time.Parse(time.RFC3339, timestamp)
+}
+
+func ParseBinlogTimestamp(timestamp string) (time.Time, error) {
+	return time.Parse("060102 15:04:05", timestamp)
+}
+
+func registerBackupFlags(fs *pflag.FlagSet) {
+	fs.BoolVar(&backupStorageCompress, "backup_storage_compress", backupStorageCompress, "if set, the backup files will be compressed.")
+	fs.IntVar(&backupCompressBlockSize, "backup_storage_block_size", backupCompressBlockSize, "if backup_storage_compress is true, backup_storage_block_size sets the byte size for each block while compressing (default is 250000).")
+	fs.IntVar(&backupCompressBlocks, "backup_storage_number_blocks", backupCompressBlocks, "if backup_storage_compress is true, backup_storage_number_blocks sets the number of blocks that can be processed, in parallel, before the writer blocks, during compression (default is 2). It should be equal to the number of CPUs available for compression.")
+}
 
 // Backup is the main entry point for a backup:
 // - uses the BackupStorage service to store a new backup
 // - shuts down Mysqld during the backup
 // - remember if we were replicating, restore the exact same state
 func Backup(ctx context.Context, params BackupParams) error {
+	if params.Stats == nil {
+		params.Stats = backupstats.NoStats()
+	}
+
 	startTs := time.Now()
 	backupDir := GetBackupDir(params.Keyspace, params.Shard)
 	name := fmt.Sprintf("%v.%v", params.BackupTime.UTC().Format(BackupTimestampFormat), params.TabletAlias)
@@ -107,25 +135,60 @@ func Backup(ctx context.Context, params BackupParams) error {
 		return vterrors.Wrap(err, "unable to get backup storage")
 	}
 	defer bs.Close()
+
+	// Scope bsStats to selected storage engine.
+	bsStats := params.Stats.Scope(
+		backupstats.Component(backupstats.BackupStorage),
+		backupstats.Implementation(
+			textutil.Title(backupstorage.BackupStorageImplementation),
+		),
+	)
+	bs = bs.WithParams(backupstorage.Params{
+		Logger: params.Logger,
+		Stats:  bsStats,
+	})
+
 	bh, err := bs.StartBackup(ctx, backupDir, name)
 	if err != nil {
 		return vterrors.Wrap(err, "StartBackup failed")
 	}
+	params.Logger.Infof("Starting backup %v", bh.Name())
 
-	be, err := GetBackupEngine()
-	if err != nil {
-		return vterrors.Wrap(err, "failed to find backup engine")
+	// Scope stats to selected backup engine.
+	beParams := params.Copy()
+	beParams.Stats = params.Stats.Scope(
+		backupstats.Component(backupstats.BackupEngine),
+		backupstats.Implementation(textutil.Title(backupEngineImplementation)),
+	)
+	var be BackupEngine
+	if isIncrementalBackup(beParams) {
+		// Incremental backups are always done via 'builtin' engine, which copies
+		// appropriate binlog files.
+		be = BackupRestoreEngineMap[builtinBackupEngineName]
+	} else {
+		be, err = GetBackupEngine(params.BackupEngine)
+		if err != nil {
+			return vterrors.Wrap(err, "failed to find backup engine")
+		}
 	}
 
+	params.Logger.Infof("Using backup engine %q", be.Name())
+
 	// Take the backup, and either AbortBackup or EndBackup.
-	usable, err := be.ExecuteBackup(ctx, params, bh)
+	backupResult, err := be.ExecuteBackup(ctx, beParams, bh)
 	logger := params.Logger
 	var finishErr error
-	if usable {
-		finishErr = bh.EndBackup(ctx)
-	} else {
+	switch backupResult {
+	case BackupUnusable:
 		logger.Errorf2(err, "backup is not usable, aborting it")
 		finishErr = bh.AbortBackup(ctx)
+	case BackupEmpty:
+		logger.Infof(EmptyBackupMessage)
+		// While an empty backup is considered "successful", it should leave no trace.
+		// We therefore ensire to clean up an backup files/directories/entries.
+		finishErr = bh.AbortBackup(ctx)
+	case BackupUsable:
+		finishErr = bh.EndBackup(ctx)
 	}
 	if err != nil {
 		if finishErr != nil {
@@ -138,7 +201,8 @@ func Backup(ctx context.Context, params BackupParams) error {
 	}
 
 	// The backup worked, so just return the finish error, if any.
-	backupDuration.Set(int64(time.Since(startTs).Seconds()))
+	backupstats.DeprecatedBackupDurationS.Set(int64(time.Since(startTs).Seconds()))
+	params.Stats.Scope(backupstats.Operation("Backup")).TimedIncrement(time.Since(startTs))
 	return finishErr
 }
 
@@ -259,13 +323,54 @@ func ShouldRestore(ctx context.Context, params RestoreParams) (bool, error) {
 	if err := params.Mysqld.Wait(ctx, params.Cnf); err != nil {
 		return false, err
 	}
+	if err := params.Mysqld.WaitForDBAGrants(ctx, DbaGrantWaitTime); err != nil {
+		params.Logger.Errorf("error waiting for the grants: %v", err)
+		return false, err
+	}
 	return checkNoDB(ctx, params.Mysqld, params.DbName)
+}
+
+// ensureRestoredGTIDPurgedMatchesManifest sees the following: when you restore a full backup, you want the MySQL server to have
+// @@gtid_purged == <gtid-of-backup>. This then also implies that @@gtid_executed equals same value. This is because we restore without
+// any binary logs.
+func ensureRestoredGTIDPurgedMatchesManifest(ctx context.Context, manifest *BackupManifest, params *RestoreParams) error {
+	if manifest == nil {
+		return nil
+	}
+	if manifest.Position.GTIDSet == nil {
+		return nil
+	}
+	gtid := manifest.Position.GTIDSet.String()
+	if gtid == "" {
+		return nil
+	}
+	// Xtrabackup 2.4's restore seems to set @@gtid_purged to be the @@gtid_purged at the time of backup. But this is not
+	// the desired value. We want to set @@gtid_purged to be the @@gtid_executed of the backup.
+	// As reminder, when restoring from a full backup, setting @@gtid_purged also sets @@gtid_executed.
+	restoredGTIDPurgedPos, err := params.Mysqld.GetGTIDPurged(ctx)
+	if err != nil {
+		return vterrors.Wrapf(err, "failed to read gtid_purged after restore")
+	}
+	if restoredGTIDPurgedPos.Equal(manifest.Position) {
+		return nil
+	}
+	params.Logger.Infof("Restore: @@gtid_purged does not equal manifest's GTID position. Setting @@gtid_purged to %v", gtid)
+	// This is not good. We want to apply a new @@gtid_purged value.
+	err = params.Mysqld.SetReplicationPosition(ctx, manifest.Position)
+	if err != nil {
+		return vterrors.Wrap(err, "error setting replication position")
+	}
+	return nil
 }
 
 // Restore is the main entry point for backup restore.  If there is no
 // appropriate backup on the BackupStorage, Restore logs an error
 // and returns ErrNoBackup. Any other error is returned.
 func Restore(ctx context.Context, params RestoreParams) (*BackupManifest, error) {
+	if params.Stats == nil {
+		params.Stats = backupstats.NoStats()
+	}
+
 	startTs := time.Now()
 	// find the right backup handle: most recent one, with a MANIFEST
 	params.Logger.Infof("Restore: looking for a suitable backup to restore")
@@ -275,6 +380,18 @@ func Restore(ctx context.Context, params RestoreParams) (*BackupManifest, error)
 	}
 	defer bs.Close()
 
+	// Scope bsStats to selected storage engine.
+	bsStats := params.Stats.Scope(
+		backupstats.Component(backupstats.BackupStorage),
+		backupstats.Implementation(
+			textutil.Title(backupstorage.BackupStorageImplementation),
+		),
+	)
+	bs = bs.WithParams(backupstorage.Params{
+		Logger: params.Logger,
+		Stats:  bsStats,
+	})
+
 	// Backups are stored in a directory structure that starts with
 	// <keyspace>/<shard>
 	backupDir := GetBackupDir(params.Keyspace, params.Shard)
@@ -282,8 +399,6 @@ func Restore(ctx context.Context, params RestoreParams) (*BackupManifest, error)
 	if err != nil {
 		return nil, vterrors.Wrap(err, "ListBackups failed")
 	}
-
-	metadataManager := &MetadataManager{}
 
 	if len(bhs) == 0 {
 		// There are no backups (not even broken/incomplete ones).
@@ -293,96 +408,119 @@ func Restore(ctx context.Context, params RestoreParams) (*BackupManifest, error)
 			params.Logger.Errorf("mysqld is not running: %v", err)
 			return nil, err
 		}
+		if err = params.Mysqld.WaitForDBAGrants(ctx, DbaGrantWaitTime); err != nil {
+			params.Logger.Errorf("error waiting for the grants: %v", err)
+			return nil, err
+		}
 		// Since this is an empty database make sure we start replication at the beginning
 		if err := params.Mysqld.ResetReplication(ctx); err != nil {
 			params.Logger.Errorf("error resetting replication: %v. Continuing", err)
 		}
 
-		if err := metadataManager.PopulateMetadataTables(params.Mysqld, params.LocalMetadata, params.DbName); err != nil {
-			params.Logger.Errorf("error populating metadata tables: %v. Continuing", err)
-
-		}
 		// Always return ErrNoBackup
 		return nil, ErrNoBackup
 	}
 
-	bh, err := FindBackupToRestore(ctx, params, bhs)
+	restorePath, err := FindBackupToRestore(ctx, params, bhs)
 	if err != nil {
 		return nil, err
 	}
-
+	if restorePath.IsEmpty() {
+		// This condition should not happen; but we validate for sanity
+		return nil, vterrors.Errorf(vtrpc.Code_INTERNAL, "empty restore path")
+	}
+	bh := restorePath.FullBackupHandle()
 	re, err := GetRestoreEngine(ctx, bh)
 	if err != nil {
 		return nil, vterrors.Wrap(err, "Failed to find restore engine")
 	}
-
-	manifest, err := re.ExecuteRestore(ctx, params, bh)
+	params.Logger.Infof("Restore: %v", restorePath.String())
+	if params.DryRun {
+		return nil, nil
+	}
+	// Scope stats to selected backup engine.
+	reParams := params.Copy()
+	reParams.Stats = params.Stats.Scope(
+		backupstats.Component(backupstats.BackupEngine),
+		backupstats.Implementation(textutil.Title(backupEngineImplementation)),
+	)
+	manifest, err := re.ExecuteRestore(ctx, reParams, bh)
 	if err != nil {
 		return nil, err
 	}
 
-	// mysqld needs to be running in order for mysql_upgrade to work.
-	// If we've just restored from a backup from previous MySQL version then mysqld
-	// may fail to start due to a different structure of mysql.* tables. The flag
-	// --skip-grant-tables ensures that these tables are not read until mysql_upgrade
-	// is executed. And since with --skip-grant-tables anyone can connect to MySQL
-	// without password, we are passing --skip-networking to greatly reduce the set
-	// of those who can connect.
-	params.Logger.Infof("Restore: starting mysqld for mysql_upgrade")
-	// Note Start will use dba user for waiting, this is fine, it will be allowed.
-	err = params.Mysqld.Start(context.Background(), params.Cnf, "--skip-grant-tables", "--skip-networking")
-	if err != nil {
-		return nil, err
-	}
-
-	// We disable super_read_only, in case it is in the default MySQL startup
-	// parameters and will be blocking the writes we need to do in
-	// PopulateMetadataTables().  We do it blindly, since
-	// this will fail on MariaDB, which doesn't have super_read_only
-	// This is safe, since we're restarting MySQL after the restore anyway
-	params.Logger.Infof("Restore: disabling super_read_only")
-	if err := params.Mysqld.SetSuperReadOnly(false); err != nil {
-		if strings.Contains(err.Error(), strconv.Itoa(mysql.ERUnknownSystemVariable)) {
-			params.Logger.Warningf("Restore: server does not know about super_read_only, continuing anyway...")
-		} else {
-			params.Logger.Errorf("Restore: unexpected error while trying to set super_read_only: %v", err)
+	if re.ShouldStartMySQLAfterRestore() { // all engines except mysqlshell since MySQL is always running there
+		// mysqld needs to be running in order for mysql_upgrade to work.
+		// If we've just restored from a backup from previous MySQL version then mysqld
+		// may fail to start due to a different structure of mysql.* tables. The flag
+		// --skip-grant-tables ensures that these tables are not read until mysql_upgrade
+		// is executed. And since with --skip-grant-tables anyone can connect to MySQL
+		// without password, we are passing --skip-networking to greatly reduce the set
+		// of those who can connect.
+		params.Logger.Infof("Restore: starting mysqld for mysql_upgrade")
+		// Note Start will use dba user for waiting, this is fine, it will be allowed.
+		if err := params.Mysqld.Start(context.Background(), params.Cnf, "--skip-grant-tables", "--skip-networking"); err != nil {
 			return nil, err
 		}
 	}
 
 	params.Logger.Infof("Restore: running mysql_upgrade")
-	if err := params.Mysqld.RunMysqlUpgrade(); err != nil {
+	if err := params.Mysqld.RunMysqlUpgrade(ctx); err != nil {
 		return nil, vterrors.Wrap(err, "mysql_upgrade failed")
-	}
-
-	// Add backupTime and restorePosition to LocalMetadata
-	params.LocalMetadata["RestoredBackupTime"] = manifest.BackupTime
-	params.LocalMetadata["RestorePosition"] = mysql.EncodePosition(manifest.Position)
-
-	// Populate local_metadata before starting without --skip-networking,
-	// so it's there before we start announcing ourselves.
-	params.Logger.Infof("Restore: populating local_metadata")
-	err = metadataManager.PopulateMetadataTables(params.Mysqld, params.LocalMetadata, params.DbName)
-	if err != nil {
-		return nil, err
 	}
 
 	// The MySQL manual recommends restarting mysqld after running mysql_upgrade,
 	// so that any changes made to system tables take effect.
 	params.Logger.Infof("Restore: restarting mysqld after mysql_upgrade")
-	err = params.Mysqld.Shutdown(context.Background(), params.Cnf, true)
-	if err != nil {
+	if err := params.Mysqld.Shutdown(context.Background(), params.Cnf, true, params.MysqlShutdownTimeout); err != nil {
 		return nil, err
 	}
-	err = params.Mysqld.Start(context.Background(), params.Cnf)
-	if err != nil {
+	if err := params.Mysqld.Start(context.Background(), params.Cnf); err != nil {
+		return nil, err
+	}
+	if err = ensureRestoredGTIDPurgedMatchesManifest(ctx, manifest, &params); err != nil {
 		return nil, err
 	}
 
+	if handles := restorePath.IncrementalBackupHandles(); len(handles) > 0 {
+		params.Logger.Infof("Restore: applying %v incremental backups", len(handles))
+		// Incremental restores are always done via 'builtin' engine, which copies
+		// appropriate binlog files.
+		builtInRE := BackupRestoreEngineMap[builtinBackupEngineName]
+		for _, bh := range handles {
+			manifest, err := builtInRE.ExecuteRestore(ctx, params, bh)
+			if err != nil {
+				return nil, err
+			}
+			params.Logger.Infof("Restore: applied incremental backup: %v", manifest.Position)
+		}
+		params.Logger.Infof("Restore: done applying incremental backups")
+	}
+
+	params.Logger.Infof("Restore: removing state file")
 	if err = removeStateFile(params.Cnf); err != nil {
 		return nil, err
 	}
 
-	restoreDuration.Set(int64(time.Since(startTs).Seconds()))
+	backupstats.DeprecatedRestoreDurationS.Set(int64(time.Since(startTs).Seconds()))
+	params.Stats.Scope(backupstats.Operation("Restore")).TimedIncrement(time.Since(startTs))
+	params.Logger.Infof("Restore: complete")
 	return manifest, nil
+}
+
+// scanLinesToLogger scans full lines from the given Reader and sends them to
+// the given Logger until EOF.
+func scanLinesToLogger(prefix string, reader io.Reader, logger logutil.Logger, doneFunc func()) {
+	defer doneFunc()
+
+	scanner := bufio.NewScanner(reader)
+	for scanner.Scan() {
+		line := scanner.Text()
+		logger.Infof("%s: %s", prefix, line)
+	}
+	if err := scanner.Err(); err != nil {
+		// This is usually run in a background goroutine, so there's no point
+		// returning an error. Just log it.
+		logger.Warningf("error scanning lines from %s: %v", prefix, err)
+	}
 }

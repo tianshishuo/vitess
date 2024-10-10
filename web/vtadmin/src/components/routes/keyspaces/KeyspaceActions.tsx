@@ -24,7 +24,7 @@ const KeyspaceActions: React.FC<KeyspaceActionsProps> = ({ keyspace, clusterID }
 
     return (
         <div className="w-min inline-block">
-            <Dropdown dropdownButton={Icons.info} position="bottom-right">
+            <Dropdown dropdownButton={Icons.info}>
                 <MenuItem onClick={() => setCurrentDialog('Validate Keyspace')}>Validate Keyspace</MenuItem>
                 <MenuItem onClick={() => setCurrentDialog('Validate Schema')}>Validate Schema</MenuItem>
                 <MenuItem onClick={() => setCurrentDialog('Validate Version')}>Validate Version</MenuItem>
@@ -89,16 +89,17 @@ const KeyspaceActions: React.FC<KeyspaceActionsProps> = ({ keyspace, clusterID }
                             validateSchemaKeyspaceMutation.data.results.length === 0 && (
                                 <div className="text-sm">No schema validation errors found.</div>
                             )}
-                        {validateSchemaKeyspaceMutation.data && validateSchemaKeyspaceMutation.data.results.length > 0 && (
-                            <ul>
-                                {validateSchemaKeyspaceMutation.data &&
-                                    validateSchemaKeyspaceMutation.data.results.map((res, i) => (
-                                        <li className="text-sm" key={`schema_keyspace_validation_result_${i}`}>
-                                            • {res}
-                                        </li>
-                                    ))}
-                            </ul>
-                        )}
+                        {validateSchemaKeyspaceMutation.data &&
+                            validateSchemaKeyspaceMutation.data.results.length > 0 && (
+                                <ul>
+                                    {validateSchemaKeyspaceMutation.data &&
+                                        validateSchemaKeyspaceMutation.data.results.map((res, i) => (
+                                            <li className="text-sm" key={`schema_keyspace_validation_result_${i}`}>
+                                                • {res}
+                                            </li>
+                                        ))}
+                                </ul>
+                            )}
                     </div>
                 }
             />

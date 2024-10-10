@@ -17,7 +17,9 @@ limitations under the License.
 package mysql
 
 import (
+	"vitess.io/vitess/go/mysql/sqlerror"
 	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/sqlparser"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
 )
@@ -30,15 +32,15 @@ import (
 func (c *Conn) ExecuteStreamFetch(query string) (err error) {
 	defer func() {
 		if err != nil {
-			if sqlerr, ok := err.(*SQLError); ok {
-				sqlerr.Query = query
+			if sqlerr, ok := err.(*sqlerror.SQLError); ok {
+				sqlerr.Query = sqlparser.TruncateQuery(query, c.truncateErrLen)
 			}
 		}
 	}()
 
 	// Sanity check.
 	if c.fields != nil {
-		return NewSQLError(CRCommandsOutOfSync, SSUnknownSQLState, "streaming query already in progress")
+		return sqlerror.NewSQLError(sqlerror.CRCommandsOutOfSync, sqlerror.SSUnknownSQLState, "streaming query already in progress")
 	}
 
 	// Send the query as a COM_QUERY packet.
@@ -47,7 +49,8 @@ func (c *Conn) ExecuteStreamFetch(query string) (err error) {
 	}
 
 	// Get the result.
-	colNumber, _, err := c.readComQueryResponse()
+	var packetOk PacketOK
+	colNumber, err := c.readComQueryResponse(&packetOk)
 	if err != nil {
 		return err
 	}
@@ -75,17 +78,17 @@ func (c *Conn) ExecuteStreamFetch(query string) (err error) {
 		// EOF is only present here if it's not deprecated.
 		data, err := c.readEphemeralPacket()
 		if err != nil {
-			return NewSQLError(CRServerLost, SSUnknownSQLState, "%v", err)
+			return sqlerror.NewSQLErrorf(sqlerror.CRServerLost, sqlerror.SSUnknownSQLState, "%v", err)
 		}
 		defer c.recycleReadPacket()
-		if isEOFPacket(data) {
+		if c.isEOFPacket(data) {
 			// This is what we expect.
 			// Warnings and status flags are ignored.
 			// goto: end
 		} else if isErrorPacket(data) {
 			return ParseErrorPacket(data)
 		} else {
-			return NewSQLError(CRCommandsOutOfSync, SSUnknownSQLState, "unexpected packet after fields: %v", data)
+			return sqlerror.NewSQLErrorf(sqlerror.CRCommandsOutOfSync, sqlerror.SSUnknownSQLState, "unexpected packet after fields: %v", data)
 		}
 	}
 
@@ -96,7 +99,7 @@ func (c *Conn) ExecuteStreamFetch(query string) (err error) {
 // Fields returns the fields for an ongoing streaming query.
 func (c *Conn) Fields() ([]*querypb.Field, error) {
 	if c.fields == nil {
-		return nil, NewSQLError(CRCommandsOutOfSync, SSUnknownSQLState, "no streaming query in progress")
+		return nil, sqlerror.NewSQLError(sqlerror.CRCommandsOutOfSync, sqlerror.SSUnknownSQLState, "no streaming query in progress")
 	}
 	if len(c.fields) == 0 {
 		// The query returned an empty field list.
@@ -110,7 +113,7 @@ func (c *Conn) Fields() ([]*querypb.Field, error) {
 func (c *Conn) FetchNext(in []sqltypes.Value) ([]sqltypes.Value, error) {
 	if c.fields == nil {
 		// We are already done, and the result was closed.
-		return nil, NewSQLError(CRCommandsOutOfSync, SSUnknownSQLState, "no streaming query in progress")
+		return nil, sqlerror.NewSQLError(sqlerror.CRCommandsOutOfSync, sqlerror.SSUnknownSQLState, "no streaming query in progress")
 	}
 
 	if len(c.fields) == 0 {
@@ -123,7 +126,7 @@ func (c *Conn) FetchNext(in []sqltypes.Value) ([]sqltypes.Value, error) {
 		return nil, err
 	}
 
-	if isEOFPacket(data) {
+	if c.isEOFPacket(data) {
 		// Warnings and status flags are ignored.
 		c.fields = nil
 		return nil, nil

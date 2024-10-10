@@ -18,21 +18,30 @@ package vindexes
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
-	"fmt"
-
-	"vitess.io/vitess/go/vt/vtgate/evalengine"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
+	"vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vterrors"
+)
+
+const (
+	regionExperimentalParamRegionBytes = "region_bytes"
 )
 
 var (
-	_ MultiColumn = (*RegionExperimental)(nil)
+	_ MultiColumn     = (*RegionExperimental)(nil)
+	_ ParamValidating = (*RegionExperimental)(nil)
+
+	regionExperimentalParams = []string{
+		regionExperimentalParamRegionBytes,
+	}
 )
 
 func init() {
-	Register("region_experimental", NewRegionExperimental)
+	Register("region_experimental", newRegionExperimental)
 }
 
 // RegionExperimental is a multi-column unique vindex. The first column is prefixed
@@ -40,17 +49,18 @@ func init() {
 // RegionExperimental can be used for geo-partitioning because the first column can denote a region,
 // and its value will dictate the shard for that region.
 type RegionExperimental struct {
-	name        string
-	regionBytes int
+	name          string
+	regionBytes   int
+	unknownParams []string
 }
 
-// NewRegionExperimental creates a RegionExperimental vindex.
+// newRegionExperimental creates a RegionExperimental vindex.
 // The supplied map requires all the fields of "consistent_lookup_unique".
 // Additionally, it requires a region_bytes argument whose value can be "1", or "2".
-func NewRegionExperimental(name string, m map[string]string) (Vindex, error) {
-	rbs, ok := m["region_bytes"]
+func newRegionExperimental(name string, m map[string]string) (Vindex, error) {
+	rbs, ok := m[regionExperimentalParamRegionBytes]
 	if !ok {
-		return nil, fmt.Errorf("region_experimental missing region_bytes param")
+		return nil, vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "region_experimental missing %s param", regionExperimentalParamRegionBytes)
 	}
 	var rb int
 	switch rbs {
@@ -59,11 +69,12 @@ func NewRegionExperimental(name string, m map[string]string) (Vindex, error) {
 	case "2":
 		rb = 2
 	default:
-		return nil, fmt.Errorf("region_bits must be 1 or 2: %v", rbs)
+		return nil, vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "region_bytes must be 1 or 2: %v", rbs)
 	}
 	return &RegionExperimental{
-		name:        name,
-		regionBytes: rb,
+		name:          name,
+		regionBytes:   rb,
+		unknownParams: FindUnknownParams(m, regionExperimentalParams),
 	}, nil
 }
 
@@ -88,7 +99,7 @@ func (ge *RegionExperimental) NeedsVCursor() bool {
 }
 
 // Map satisfies MultiColumn.
-func (ge *RegionExperimental) Map(vcursor VCursor, rowsColValues [][]sqltypes.Value) ([]key.Destination, error) {
+func (ge *RegionExperimental) Map(ctx context.Context, vcursor VCursor, rowsColValues [][]sqltypes.Value) ([]key.Destination, error) {
 	destinations := make([]key.Destination, 0, len(rowsColValues))
 	for _, row := range rowsColValues {
 		if len(row) > 2 {
@@ -96,7 +107,7 @@ func (ge *RegionExperimental) Map(vcursor VCursor, rowsColValues [][]sqltypes.Va
 			continue
 		}
 		// Compute region prefix.
-		rn, err := evalengine.ToUint64(row[0])
+		rn, err := row[0].ToCastUint64()
 		if err != nil {
 			destinations = append(destinations, key.DestinationNone{})
 			continue
@@ -112,7 +123,7 @@ func (ge *RegionExperimental) Map(vcursor VCursor, rowsColValues [][]sqltypes.Va
 		dest := r
 		if len(row) == 2 {
 			// Compute hash.
-			hn, err := evalengine.ToUint64(row[1])
+			hn, err := row[1].ToCastUint64()
 			if err != nil {
 				destinations = append(destinations, key.DestinationNone{})
 				continue
@@ -128,9 +139,9 @@ func (ge *RegionExperimental) Map(vcursor VCursor, rowsColValues [][]sqltypes.Va
 }
 
 // Verify satisfies MultiColumn.
-func (ge *RegionExperimental) Verify(vcursor VCursor, rowsColValues [][]sqltypes.Value, ksids [][]byte) ([]bool, error) {
+func (ge *RegionExperimental) Verify(ctx context.Context, vcursor VCursor, rowsColValues [][]sqltypes.Value, ksids [][]byte) ([]bool, error) {
 	result := make([]bool, len(rowsColValues))
-	destinations, _ := ge.Map(vcursor, rowsColValues)
+	destinations, _ := ge.Map(ctx, vcursor, rowsColValues)
 	for i, dest := range destinations {
 		destksid, ok := dest.(key.DestinationKeyspaceID)
 		if !ok {
@@ -143,4 +154,9 @@ func (ge *RegionExperimental) Verify(vcursor VCursor, rowsColValues [][]sqltypes
 
 func (ge *RegionExperimental) PartialVindex() bool {
 	return true
+}
+
+// UnknownParams implements the ParamValidating interface.
+func (ge *RegionExperimental) UnknownParams() []string {
+	return ge.unknownParams
 }

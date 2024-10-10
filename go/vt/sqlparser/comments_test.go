@@ -18,10 +18,14 @@ package sqlparser
 
 import (
 	"fmt"
-	"reflect"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"vitess.io/vitess/go/vt/sysvars"
+
+	querypb "vitess.io/vitess/go/vt/proto/query"
 )
 
 func TestSplitComments(t *testing.T) {
@@ -138,15 +142,9 @@ func TestSplitComments(t *testing.T) {
 			gotSQL, gotComments := SplitMarginComments(testCase.input)
 			gotLeadingComments, gotTrailingComments := gotComments.Leading, gotComments.Trailing
 
-			if gotSQL != testCase.outSQL {
-				t.Errorf("test input: '%s', got SQL\n%+v, want\n%+v", testCase.input, gotSQL, testCase.outSQL)
-			}
-			if gotLeadingComments != testCase.outLeadingComments {
-				t.Errorf("test input: '%s', got LeadingComments\n%+v, want\n%+v", testCase.input, gotLeadingComments, testCase.outLeadingComments)
-			}
-			if gotTrailingComments != testCase.outTrailingComments {
-				t.Errorf("test input: '%s', got TrailingComments\n%+v, want\n%+v", testCase.input, gotTrailingComments, testCase.outTrailingComments)
-			}
+			assert.Equal(t, testCase.outSQL, gotSQL, "SQL mismatch")
+			assert.Equal(t, testCase.outLeadingComments, gotLeadingComments, "LeadingComments mismatch")
+			assert.Equal(t, testCase.outTrailingComments, gotTrailingComments, "TrailingCommints mismatch")
 		})
 	}
 }
@@ -220,10 +218,7 @@ a`,
 	}}
 	for _, testCase := range testCases {
 		gotSQL := StripLeadingComments(testCase.input)
-
-		if gotSQL != testCase.outSQL {
-			t.Errorf("test input: '%s', got SQL\n%+v, want\n%+v", testCase.input, gotSQL, testCase.outSQL)
-		}
+		assert.Equal(t, testCase.outSQL, gotSQL)
 	}
 }
 
@@ -249,10 +244,8 @@ func TestExtractMysqlComment(t *testing.T) {
 	}}
 	for _, testCase := range testCases {
 		gotVersion, gotSQL := ExtractMysqlComment(testCase.input)
+		assert.Equal(t, testCase.outVersion, gotVersion, "version mismatch")
 
-		if gotVersion != testCase.outVersion {
-			t.Errorf("test input: '%s', got version\n%+v, want\n%+v", testCase.input, gotVersion, testCase.outVersion)
-		}
 		if gotSQL != testCase.outSQL {
 			t.Errorf("test input: '%s', got SQL\n%+v, want\n%+v", testCase.input, gotSQL, testCase.outSQL)
 		}
@@ -262,61 +255,62 @@ func TestExtractMysqlComment(t *testing.T) {
 func TestExtractCommentDirectives(t *testing.T) {
 	var testCases = []struct {
 		input string
-		vals  CommentDirectives
+		vals  map[string]string
 	}{{
 		input: "",
 		vals:  nil,
 	}, {
 		input: "/* not a vt comment */",
-		vals:  nil,
+		vals:  map[string]string{},
 	}, {
 		input: "/*vt+ */",
-		vals:  CommentDirectives{},
+		vals:  map[string]string{},
 	}, {
 		input: "/*vt+ SINGLE_OPTION */",
-		vals: CommentDirectives{
-			"SINGLE_OPTION": true,
+		vals: map[string]string{
+			"single_option": "true",
 		},
 	}, {
 		input: "/*vt+ ONE_OPT TWO_OPT */",
-		vals: CommentDirectives{
-			"ONE_OPT": true,
-			"TWO_OPT": true,
+		vals: map[string]string{
+			"one_opt": "true",
+			"two_opt": "true",
 		},
 	}, {
 		input: "/*vt+ ONE_OPT */ /* other comment */ /*vt+ TWO_OPT */",
-		vals: CommentDirectives{
-			"ONE_OPT": true,
-			"TWO_OPT": true,
+		vals: map[string]string{
+			"one_opt": "true",
+			"two_opt": "true",
 		},
 	}, {
 		input: "/*vt+ ONE_OPT=abc TWO_OPT=def */",
-		vals: CommentDirectives{
-			"ONE_OPT": "abc",
-			"TWO_OPT": "def",
+		vals: map[string]string{
+			"one_opt": "abc",
+			"two_opt": "def",
 		},
 	}, {
 		input: "/*vt+ ONE_OPT=true TWO_OPT=false */",
-		vals: CommentDirectives{
-			"ONE_OPT": true,
-			"TWO_OPT": false,
+		vals: map[string]string{
+			"one_opt": "true",
+			"two_opt": "false",
 		},
 	}, {
 		input: "/*vt+ ONE_OPT=true TWO_OPT=\"false\" */",
-		vals: CommentDirectives{
-			"ONE_OPT": true,
-			"TWO_OPT": "\"false\"",
+		vals: map[string]string{
+			"one_opt": "true",
+			"two_opt": "\"false\"",
 		},
 	}, {
 		input: "/*vt+ RANGE_OPT=[a:b] ANOTHER ANOTHER_WITH_VALEQ=val= AND_ONE_WITH_EQ== */",
-		vals: CommentDirectives{
-			"RANGE_OPT":          "[a:b]",
-			"ANOTHER":            true,
-			"ANOTHER_WITH_VALEQ": "val=",
-			"AND_ONE_WITH_EQ":    "=",
+		vals: map[string]string{
+			"range_opt":          "[a:b]",
+			"another":            "true",
+			"another_with_valeq": "val=",
+			"and_one_with_eq":    "=",
 		},
 	}}
 
+	parser := NewTestParser()
 	for _, testCase := range testCases {
 		t.Run(testCase.input, func(t *testing.T) {
 			sqls := []string{
@@ -333,8 +327,8 @@ func TestExtractCommentDirectives(t *testing.T) {
 			}
 			for _, sql := range sqls {
 				t.Run(sql, func(t *testing.T) {
-					var comments Comments
-					stmt, _ := Parse(sql)
+					var comments *ParsedComments
+					stmt, _ := parser.Parse(sql)
 					switch s := stmt.(type) {
 					case *Select:
 						comments = s.Comments
@@ -357,75 +351,52 @@ func TestExtractCommentDirectives(t *testing.T) {
 					default:
 						t.Errorf("Unexpected statement type %+v", s)
 					}
-					vals := ExtractCommentDirectives(comments)
 
-					if !reflect.DeepEqual(vals, testCase.vals) {
-						t.Errorf("test input: '%v', got vals:\n%+v, want\n%+v", testCase.input, vals, testCase.vals)
+					vals := comments.Directives()
+					if vals == nil {
+						require.Nil(t, vals)
+						return
 					}
+
+					assert.Equal(t, testCase.vals, vals.m)
 				})
 			}
 		})
 	}
 
-	d := CommentDirectives{
-		"ONE_OPT": true,
-		"TWO_OPT": false,
-		"three":   1,
-		"four":    2,
-		"five":    0,
+	d := &CommentDirectives{m: map[string]string{
+		"one_opt": "true",
+		"two_opt": "false",
+		"three":   "1",
+		"four":    "2",
+		"five":    "0",
 		"six":     "true",
-	}
+	}}
 
-	if !d.IsSet("ONE_OPT") {
-		t.Errorf("d.IsSet(ONE_OPT) should be true")
-	}
-
-	if d.IsSet("TWO_OPT") {
-		t.Errorf("d.IsSet(TWO_OPT) should be false")
-	}
-
-	if !d.IsSet("three") {
-		t.Errorf("d.IsSet(three) should be true")
-	}
-
-	if d.IsSet("four") {
-		t.Errorf("d.IsSet(four) should be false")
-	}
-
-	if d.IsSet("five") {
-		t.Errorf("d.IsSet(five) should be false")
-	}
-
-	if d.IsSet("six") {
-		t.Errorf("d.IsSet(six) should be false")
-	}
+	assert.True(t, d.IsSet("ONE_OPT"), "d.IsSet(ONE_OPT)")
+	assert.False(t, d.IsSet("TWO_OPT"), "d.IsSet(TWO_OPT)")
+	assert.True(t, d.IsSet("three"), "d.IsSet(three)")
+	assert.False(t, d.IsSet("four"), "d.IsSet(four)")
+	assert.False(t, d.IsSet("five"), "d.IsSet(five)")
+	assert.True(t, d.IsSet("six"), "d.IsSet(six)")
 }
 
 func TestSkipQueryPlanCacheDirective(t *testing.T) {
-	stmt, _ := Parse("insert /*vt+ SKIP_QUERY_PLAN_CACHE=1 */ into user(id) values (1), (2)")
-	if !SkipQueryPlanCacheDirective(stmt) {
-		t.Errorf("d.SkipQueryPlanCacheDirective(stmt) should be true")
-	}
+	parser := NewTestParser()
+	stmt, _ := parser.Parse("insert /*vt+ SKIP_QUERY_PLAN_CACHE=1 */ into user(id) values (1), (2)")
+	assert.False(t, CachePlan(stmt))
 
-	stmt, _ = Parse("insert into user(id) values (1), (2)")
-	if SkipQueryPlanCacheDirective(stmt) {
-		t.Errorf("d.SkipQueryPlanCacheDirective(stmt) should be false")
-	}
+	stmt, _ = parser.Parse("insert into user(id) values (1), (2)")
+	assert.True(t, CachePlan(stmt))
 
-	stmt, _ = Parse("update /*vt+ SKIP_QUERY_PLAN_CACHE=1 */ users set name=1")
-	if !SkipQueryPlanCacheDirective(stmt) {
-		t.Errorf("d.SkipQueryPlanCacheDirective(stmt) should be true")
-	}
+	stmt, _ = parser.Parse("update /*vt+ SKIP_QUERY_PLAN_CACHE=1 */ users set name=1")
+	assert.False(t, CachePlan(stmt))
 
-	stmt, _ = Parse("select /*vt+ SKIP_QUERY_PLAN_CACHE=1 */ * from users")
-	if !SkipQueryPlanCacheDirective(stmt) {
-		t.Errorf("d.SkipQueryPlanCacheDirective(stmt) should be true")
-	}
+	stmt, _ = parser.Parse("select /*vt+ SKIP_QUERY_PLAN_CACHE=1 */ * from users")
+	assert.False(t, CachePlan(stmt))
 
-	stmt, _ = Parse("delete /*vt+ SKIP_QUERY_PLAN_CACHE=1 */ from users")
-	if !SkipQueryPlanCacheDirective(stmt) {
-		t.Errorf("d.SkipQueryPlanCacheDirective(stmt) should be true")
-	}
+	stmt, _ = parser.Parse("delete /*vt+ SKIP_QUERY_PLAN_CACHE=1 */ from users")
+	assert.False(t, CachePlan(stmt))
 }
 
 func TestIgnoreMaxPayloadSizeDirective(t *testing.T) {
@@ -445,9 +416,10 @@ func TestIgnoreMaxPayloadSizeDirective(t *testing.T) {
 		{"show create table users", false},
 	}
 
+	parser := NewTestParser()
 	for _, test := range testCases {
 		t.Run(test.query, func(t *testing.T) {
-			stmt, _ := Parse(test.query)
+			stmt, _ := parser.Parse(test.query)
 			got := IgnoreMaxPayloadSizeDirective(stmt)
 			assert.Equalf(t, test.expected, got, fmt.Sprintf("IgnoreMaxPayloadSizeDirective(stmt) returned %v but expected %v", got, test.expected))
 		})
@@ -471,11 +443,258 @@ func TestIgnoreMaxMaxMemoryRowsDirective(t *testing.T) {
 		{"show create table users", false},
 	}
 
+	parser := NewTestParser()
 	for _, test := range testCases {
 		t.Run(test.query, func(t *testing.T) {
-			stmt, _ := Parse(test.query)
+			stmt, _ := parser.Parse(test.query)
 			got := IgnoreMaxMaxMemoryRowsDirective(stmt)
 			assert.Equalf(t, test.expected, got, fmt.Sprintf("IgnoreMaxPayloadSizeDirective(stmt) returned %v but expected %v", got, test.expected))
+		})
+	}
+}
+
+func TestConsolidator(t *testing.T) {
+	testCases := []struct {
+		query    string
+		expected querypb.ExecuteOptions_Consolidator
+	}{
+		{"insert /*vt+ CONSOLIDATOR=enabled */ into user(id) values (1), (2)", querypb.ExecuteOptions_CONSOLIDATOR_UNSPECIFIED},
+		{"update /*vt+ CONSOLIDATOR=enabled */ users set name=1", querypb.ExecuteOptions_CONSOLIDATOR_UNSPECIFIED},
+		{"delete /*vt+ CONSOLIDATOR=enabled */ from users", querypb.ExecuteOptions_CONSOLIDATOR_UNSPECIFIED},
+		{"show /*vt+ CONSOLIDATOR=enabled */ create table users", querypb.ExecuteOptions_CONSOLIDATOR_UNSPECIFIED},
+		{"select * from users", querypb.ExecuteOptions_CONSOLIDATOR_UNSPECIFIED},
+		{"select /*vt+ CONSOLIDATOR=invalid_value */ * from users", querypb.ExecuteOptions_CONSOLIDATOR_UNSPECIFIED},
+		{"select /*vt+ IGNORE_MAX_MEMORY_ROWS=1 */ * from users", querypb.ExecuteOptions_CONSOLIDATOR_UNSPECIFIED},
+		{"select /*vt+ CONSOLIDATOR=disabled */ * from users", querypb.ExecuteOptions_CONSOLIDATOR_DISABLED},
+		{"select /*vt+ CONSOLIDATOR=enabled */ * from users", querypb.ExecuteOptions_CONSOLIDATOR_ENABLED},
+		{"select /*vt+ CONSOLIDATOR=enabled_replicas */ * from users", querypb.ExecuteOptions_CONSOLIDATOR_ENABLED_REPLICAS},
+	}
+
+	parser := NewTestParser()
+	for _, test := range testCases {
+		t.Run(test.query, func(t *testing.T) {
+			stmt, _ := parser.Parse(test.query)
+			qh, err := BuildQueryHints(stmt)
+			require.NoError(t, err)
+			assert.Equalf(t, test.expected, qh.Consolidator,
+				"Consolidator(stmt) returned %v but expected %v", qh.Consolidator, test.expected)
+		})
+	}
+}
+
+func TestGetPriorityFromStatement(t *testing.T) {
+	testCases := []struct {
+		query            string
+		expectedPriority string
+		expectedError    error
+	}{
+		{
+			query:            "select * from a_table",
+			expectedPriority: "",
+			expectedError:    nil,
+		},
+		{
+			query:            "select /*vt+ ANOTHER_DIRECTIVE=324 */ * from another_table",
+			expectedPriority: "",
+			expectedError:    nil,
+		},
+		{
+			query:            "select /*vt+ PRIORITY=33 */ * from another_table",
+			expectedPriority: "33",
+			expectedError:    nil,
+		},
+		{
+			query:            "select /*vt+ PRIORITY=200 */ * from another_table",
+			expectedPriority: "",
+			expectedError:    ErrInvalidPriority,
+		},
+		{
+			query:            "select /*vt+ PRIORITY=-1 */ * from another_table",
+			expectedPriority: "",
+			expectedError:    ErrInvalidPriority,
+		},
+		{
+			query:            "select /*vt+ PRIORITY=some_text */ * from another_table",
+			expectedPriority: "",
+			expectedError:    ErrInvalidPriority,
+		},
+		{
+			query:            "select /*vt+ PRIORITY=0 */ * from another_table",
+			expectedPriority: "0",
+			expectedError:    nil,
+		},
+		{
+			query:            "select /*vt+ PRIORITY=100 */ * from another_table",
+			expectedPriority: "100",
+			expectedError:    nil,
+		},
+	}
+
+	parser := NewTestParser()
+	for _, testCase := range testCases {
+		t.Run(testCase.query, func(t *testing.T) {
+			t.Parallel()
+			stmt, err := parser.Parse(testCase.query)
+			assert.NoError(t, err)
+			qh, err := BuildQueryHints(stmt)
+			if testCase.expectedError != nil {
+				assert.ErrorIs(t, err, testCase.expectedError)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, testCase.expectedPriority, qh.Priority)
+			}
+		})
+	}
+}
+
+// TestGetMySQLSetVarValue tests the functionality of GetMySQLSetVarValue
+func TestGetMySQLSetVarValue(t *testing.T) {
+	tests := []struct {
+		name      string
+		comments  []string
+		valToFind string
+		want      string
+	}{
+		{
+			name:      "SET_VAR clause in the middle",
+			comments:  []string{"/*+ NO_RANGE_OPTIMIZATION(t3 PRIMARY, f2_idx) SET_VAR(foreign_key_checks=OFF) NO_ICP(t1, t2) */"},
+			valToFind: sysvars.ForeignKeyChecks,
+			want:      "OFF",
+		},
+		{
+			name:      "Single SET_VAR clause",
+			comments:  []string{"/*+ SET_VAR(sort_buffer_size = 16M) */"},
+			valToFind: "sort_buffer_size",
+			want:      "16M",
+		},
+		{
+			name:      "No comments",
+			comments:  nil,
+			valToFind: "sort_buffer_size",
+			want:      "",
+		},
+		{
+			name:      "Multiple SET_VAR clauses",
+			comments:  []string{"/*+ SET_VAR(sort_buffer_size = 16M) */", "/*+ SET_VAR(optimizer_switch = 'mrr_cost_b(ased=of\"f') */", "/*+ SET_VAR( foReiGn_key_checks = On) */"},
+			valToFind: sysvars.ForeignKeyChecks,
+			want:      "",
+		},
+		{
+			name:      "Verify casing",
+			comments:  []string{"/*+ SET_VAR(optimizer_switch = 'mrr_cost_b(ased=of\"f') SET_VAR( foReiGn_key_checks = On) */"},
+			valToFind: sysvars.ForeignKeyChecks,
+			want:      "On",
+		},
+		{
+			name:      "Leading comment is a normal comment",
+			comments:  []string{"/* This is a normal comment */", "/*+ MAX_EXECUTION_TIME(1000) SET_VAR( foreign_key_checks = 1) */"},
+			valToFind: sysvars.ForeignKeyChecks,
+			want:      "1",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &ParsedComments{
+				comments: tt.comments,
+			}
+			assert.Equal(t, tt.want, c.GetMySQLSetVarValue(tt.valToFind))
+		})
+	}
+}
+
+func TestSetMySQLSetVarValue(t *testing.T) {
+	tests := []struct {
+		name           string
+		comments       []string
+		key            string
+		value          string
+		commentsWanted Comments
+	}{
+		{
+			name:           "SET_VAR clause in the middle",
+			comments:       []string{"/*+ NO_RANGE_OPTIMIZATION(t3 PRIMARY, f2_idx) SET_VAR(foreign_key_checks=OFF) NO_ICP(t1, t2) */"},
+			key:            sysvars.ForeignKeyChecks,
+			value:          "On",
+			commentsWanted: []string{"/*+ NO_RANGE_OPTIMIZATION(t3 PRIMARY, f2_idx) SET_VAR(foreign_key_checks=On) NO_ICP(t1, t2) */"},
+		},
+		{
+			name:           "Single SET_VAR clause",
+			comments:       []string{"/*+ SET_VAR(sort_buffer_size = 16M) */"},
+			key:            "sort_buffer_size",
+			value:          "1Mb",
+			commentsWanted: []string{"/*+ SET_VAR(sort_buffer_size=1Mb) */"},
+		},
+		{
+			name:           "No comments",
+			comments:       nil,
+			key:            "sort_buffer_size",
+			value:          "13M",
+			commentsWanted: []string{"/*+ SET_VAR(sort_buffer_size=13M) */"},
+		},
+		{
+			name:           "Multiple SET_VAR clauses",
+			comments:       []string{"/*+ SET_VAR(sort_buffer_size = 16M) */", "/*+ SET_VAR(optimizer_switch = 'mrr_cost_b(ased=of\"f') */", "/*+ SET_VAR( foReiGn_key_checks = On) */"},
+			key:            sysvars.ForeignKeyChecks,
+			value:          "1",
+			commentsWanted: []string{"/*+ SET_VAR(sort_buffer_size = 16M) SET_VAR(foreign_key_checks=1) */", "/*+ SET_VAR(optimizer_switch = 'mrr_cost_b(ased=of\"f') */", "/*+ SET_VAR( foReiGn_key_checks = On) */"},
+		},
+		{
+			name:           "Verify casing",
+			comments:       []string{"/*+ SET_VAR(optimizer_switch = 'mrr_cost_b(ased=of\"f') SET_VAR( foReiGn_key_checks = On) */"},
+			key:            sysvars.ForeignKeyChecks,
+			value:          "off",
+			commentsWanted: []string{"/*+ SET_VAR(optimizer_switch = 'mrr_cost_b(ased=of\"f') SET_VAR(foReiGn_key_checks=off) */"},
+		},
+		{
+			name:           "Leading comment is a normal comment",
+			comments:       []string{"/* This is a normal comment */", "/*+ MAX_EXECUTION_TIME(1000) SET_VAR( foreign_key_checks = 1) */"},
+			key:            sysvars.ForeignKeyChecks,
+			value:          "Off",
+			commentsWanted: []string{"/* This is a normal comment */", "/*+ MAX_EXECUTION_TIME(1000) SET_VAR(foreign_key_checks=Off) */"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &ParsedComments{
+				comments: tt.comments,
+			}
+			newComments := c.SetMySQLSetVarValue(tt.key, tt.value)
+			require.EqualValues(t, tt.commentsWanted, newComments)
+		})
+	}
+}
+
+// TestQueryTimeout tests the extraction of Query_Timeout_MS from the comments.
+func TestQueryTimeout(t *testing.T) {
+	testCases := []struct {
+		query      string
+		expTimeout int
+		noTimeout  bool
+	}{{
+		query:     "select * from a_table",
+		noTimeout: true,
+	}, {
+		query:      "select /*vt+ QUERY_TIMEOUT_MS=21 */ * from another_table",
+		expTimeout: 21,
+	}, {
+		query:      "select /*vt+ QUERY_TIMEOUT_MS=0 */ * from another_table",
+		expTimeout: 0,
+	}, {
+		query:     "select /*vt+ PRIORITY=-42 */ * from another_table",
+		noTimeout: true,
+	}}
+
+	parser := NewTestParser()
+	for _, tc := range testCases {
+		t.Run(tc.query, func(t *testing.T) {
+			stmt, err := parser.Parse(tc.query)
+			assert.NoError(t, err)
+			qh, _ := BuildQueryHints(stmt)
+			if tc.noTimeout {
+				assert.Nil(t, qh.Timeout)
+			} else {
+				assert.Equal(t, tc.expTimeout, *qh.Timeout)
+			}
 		})
 	}
 }

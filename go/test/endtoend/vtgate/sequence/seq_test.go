@@ -24,6 +24,7 @@ import (
 	"strings"
 	"testing"
 
+	"vitess.io/vitess/go/mysql/sqlerror"
 	"vitess.io/vitess/go/test/endtoend/utils"
 
 	"github.com/stretchr/testify/assert"
@@ -47,9 +48,9 @@ var (
 	)Engine=InnoDB;
 
 	create table sequence_test_seq (
-		id int default 0, 
-		next_id bigint default null, 
-		cache bigint default null, 
+		id int default 0,
+		next_id bigint default null,
+		cache bigint default null,
 		primary key(id)
 	) comment 'vitess_sequence' Engine=InnoDB;
 
@@ -60,13 +61,13 @@ INSERT INTO id_seq (id, next_id, cache) values (0, 1, 1000);
 	`
 
 	unshardedVSchema = `
-		{	
+		{
 			"sharded":false,
 			"vindexes": {
 				"hash_index": {
 					"type": "hash"
 				}
-			},	
+			},
 			"tables": {
 				"sequence_test":{
 					"auto_increment":{
@@ -147,7 +148,7 @@ CREATE TABLE allDefaults (
 				"column": "id",
 				"sequence": "id_seq"
 			  }
-			},			
+			},
 			"allDefaults": {
 			  "columnVindexes": [
 				{
@@ -191,7 +192,7 @@ func TestMain(m *testing.M) {
 			SchemaSQL: unshardedSQLSchema,
 			VSchema:   unshardedVSchema,
 		}
-		if err := clusterInstance.StartUnshardedKeyspace(*uKeyspace, 1, false); err != nil {
+		if err := clusterInstance.StartUnshardedKeyspace(*uKeyspace, 0, false); err != nil {
 			return 1
 		}
 
@@ -200,7 +201,7 @@ func TestMain(m *testing.M) {
 			SchemaSQL: shardedSQLSchema,
 			VSchema:   shardedVSchema,
 		}
-		if err := clusterInstance.StartKeyspace(*sKeyspace, []string{"-80", "80-"}, 1, false); err != nil {
+		if err := clusterInstance.StartKeyspace(*sKeyspace, []string{"-80", "80-"}, 0, false); err != nil {
 			return 1
 		}
 
@@ -264,6 +265,12 @@ func TestSeq(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), want) {
 		t.Errorf("wrong insert: %v, must contain %s", err, want)
 	}
+
+	utils.Exec(t, conn, "DELETE FROM sequence_test_seq")
+	qr = utils.Exec(t, conn, "select * from sequence_test_seq")
+	if got, want := fmt.Sprintf("%v", qr.Rows), `[]`; got != want {
+		t.Errorf("select:\n%v want\n%v", got, want)
+	}
 }
 
 func TestDotTableSeq(t *testing.T) {
@@ -283,10 +290,10 @@ func TestDotTableSeq(t *testing.T) {
 
 	_, err = conn.ExecuteFetch("insert into `dotted.tablename` (c1,c2) values (10,10)", 1000, true)
 	require.Error(t, err)
-	mysqlErr := err.(*mysql.SQLError)
-	assert.Equal(t, 1062, mysqlErr.Num)
+	mysqlErr := err.(*sqlerror.SQLError)
+	assert.Equal(t, sqlerror.ERDupEntry, mysqlErr.Num)
 	assert.Equal(t, "23000", mysqlErr.State)
-	assert.Contains(t, mysqlErr.Message, "Duplicate entry")
+	assert.ErrorContains(t, mysqlErr, "Duplicate entry")
 }
 
 func TestInsertAllDefaults(t *testing.T) {

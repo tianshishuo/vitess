@@ -18,6 +18,7 @@ package vindexes
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 
 	"vitess.io/vitess/go/sqltypes"
@@ -25,6 +26,20 @@ import (
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	"vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/vterrors"
+)
+
+const (
+	cfcParamHash    = "hash"
+	cfcParamOffsets = "offsets"
+)
+
+var (
+	_ ParamValidating = (*CFC)(nil)
+
+	cfcParams = []string{
+		cfcParamHash,
+		cfcParamOffsets,
+	}
 )
 
 // CFC is Concatenated Fixed-width Composite Vindex.
@@ -68,17 +83,17 @@ import (
 // the behavior is exactly same as other vindex's but just more efficient in
 // controlling the fanout.
 //
-// The expected format of the vindex definition is
+// # The expected format of the vindex definition is
 //
-// "vindexes": {
-//   "cfc_md5": {
-//     "type": "cfc",
-//     "params": {
-//       "hash": "md5",
-//       "offsets": "[2,4]"
-//     }
-//   }
-// }
+//	"vindexes": {
+//	  "cfc_md5": {
+//	    "type": "cfc",
+//	    "params": {
+//	      "hash": "md5",
+//	      "offsets": "[2,4]"
+//	    }
+//	  }
+//	}
 //
 // 'offsets' only makes sense when hash is used. Offsets should be a sorted
 // list of positive ints, each of which denotes the byte offset (from the
@@ -86,28 +101,37 @@ import (
 // Specifically, offsets[0] is the byte offset of the first component,
 // offsets[1] is the byte offset of the second component, etc.
 type CFC struct {
-	name         string
-	hash         func([]byte) []byte
-	offsets      []int
-	prefixVindex SingleColumn
+	// CFC is used in all compare expressions other than 'LIKE'.
+	*cfcCommon
+	// prefixCFC is only used in 'LIKE' compare expressions.
+	prefixCFC *prefixCFC
 }
 
-// NewCFC creates a new CFC vindex
-func NewCFC(name string, params map[string]string) (Vindex, error) {
-	// CFC is used in all compare expressions other than 'LIKE'.
-	ss := &CFC{
-		name: name,
+type cfcCommon struct {
+	name          string
+	hash          func([]byte) []byte
+	offsets       []int
+	unknownParams []string
+}
+
+// newCFC creates a new CFC vindex
+func newCFC(name string, params map[string]string) (Vindex, error) {
+	ss := &cfcCommon{
+		name:          name,
+		unknownParams: FindUnknownParams(params, cfcParams),
 	}
-	// prefixCFC is only used in 'LIKE' compare expressions.
-	ss.prefixVindex = &prefixCFC{CFC: ss}
+	cfc := &CFC{
+		cfcCommon: ss,
+		prefixCFC: &prefixCFC{cfcCommon: ss},
+	}
 
 	if params == nil {
-		return ss, nil
+		return cfc, nil
 	}
 
-	switch h := params["hash"]; h {
+	switch h := params[cfcParamHash]; h {
 	case "":
-		return ss, nil
+		return cfc, nil
 	case "md5":
 		ss.hash = md5hash
 	case "xxhash64":
@@ -117,7 +141,7 @@ func NewCFC(name string, params map[string]string) (Vindex, error) {
 	}
 
 	var offsets []int
-	if p := params["offsets"]; p == "" {
+	if p := params[cfcParamOffsets]; p == "" {
 		return nil, vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "CFC vindex requires offsets when hash is defined")
 	} else if err := json.Unmarshal([]byte(p), &offsets); err != nil || !validOffsets(offsets) {
 		return nil, vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "invalid offsets %s to CFC vindex %s. expected sorted positive ints in brackets", p, name)
@@ -131,7 +155,7 @@ func NewCFC(name string, params map[string]string) (Vindex, error) {
 		prev = off
 	}
 
-	return ss, nil
+	return cfc, nil
 }
 
 func validOffsets(offsets []int) bool {
@@ -172,7 +196,7 @@ func (vind *CFC) NeedsVCursor() bool {
 }
 
 // computeKsid returns the corresponding keyspace id of a key.
-func (vind *CFC) computeKsid(v []byte, prefix bool) ([]byte, error) {
+func (vind *cfcCommon) computeKsid(v []byte, prefix bool) ([]byte, error) {
 
 	if vind.hash == nil {
 		return v, nil
@@ -207,8 +231,7 @@ func (vind *CFC) computeKsid(v []byte, prefix bool) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// Verify returns true if ids maps to ksids.
-func (vind *CFC) Verify(_ VCursor, ids []sqltypes.Value, ksids [][]byte) ([]bool, error) {
+func (vind *cfcCommon) verify(ids []sqltypes.Value, ksids [][]byte) ([]bool, error) {
 	out := make([]bool, len(ids))
 	for i := range ids {
 		idBytes, err := ids[i].ToBytes()
@@ -224,8 +247,18 @@ func (vind *CFC) Verify(_ VCursor, ids []sqltypes.Value, ksids [][]byte) ([]bool
 	return out, nil
 }
 
+// UnknownParams implements the ParamValidating interface.
+func (vind *cfcCommon) UnknownParams() []string {
+	return vind.unknownParams
+}
+
+// Verify returns true if ids maps to ksids.
+func (vind *CFC) Verify(_ context.Context, _ VCursor, ids []sqltypes.Value, ksids [][]byte) ([]bool, error) {
+	return vind.verify(ids, ksids)
+}
+
 // Map can map ids to key.Destination objects.
-func (vind *CFC) Map(cursor VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
+func (vind *CFC) Map(_ context.Context, _ VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
 	out := make([]key.Destination, len(ids))
 	for i, id := range ids {
 		idBytes, err := id.ToBytes()
@@ -243,7 +276,7 @@ func (vind *CFC) Map(cursor VCursor, ids []sqltypes.Value) ([]key.Destination, e
 
 // PrefixVindex switches the vindex to prefix mode
 func (vind *CFC) PrefixVindex() SingleColumn {
-	return vind.prefixVindex
+	return vind.prefixCFC
 }
 
 // NewKeyRangeFromPrefix creates a keyspace range from a prefix of keyspace id.
@@ -283,7 +316,19 @@ func addOne(value []byte) []byte {
 }
 
 type prefixCFC struct {
-	*CFC
+	*cfcCommon
+}
+
+func (vind *prefixCFC) String() string {
+	return vind.name
+}
+
+func (vind *prefixCFC) NeedsVCursor() bool {
+	return false
+}
+
+func (vind *prefixCFC) Verify(_ context.Context, _ VCursor, ids []sqltypes.Value, ksids [][]byte) ([]bool, error) {
+	return vind.verify(ids, ksids)
 }
 
 // In prefix mode, i.e. within a LIKE op, the cost is higher than regular mode.
@@ -301,7 +346,7 @@ func (vind *prefixCFC) IsUnique() bool {
 }
 
 // Map can map ids to key.Destination objects.
-func (vind *prefixCFC) Map(cursor VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
+func (vind *prefixCFC) Map(_ context.Context, _ VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
 	out := make([]key.Destination, len(ids))
 	for i, id := range ids {
 		value, err := id.ToBytes()
@@ -382,5 +427,5 @@ func xxhash64(in []byte) []byte {
 }
 
 func init() {
-	Register("cfc", NewCFC)
+	Register("cfc", newCFC)
 }

@@ -18,6 +18,7 @@ package discovery
 
 import (
 	"bytes"
+	"encoding/json"
 	"strings"
 
 	"vitess.io/vitess/go/vt/vttablet/queryservice"
@@ -39,6 +40,24 @@ type TabletHealth struct {
 	PrimaryTermStartTime int64
 	LastError            error
 	Serving              bool
+}
+
+func (th *TabletHealth) MarshalJSON() ([]byte, error) {
+	return json.Marshal(&struct {
+		Tablet               *topodata.Tablet
+		Target               *query.Target
+		Serving              bool
+		PrimaryTermStartTime int64
+		Stats                *query.RealtimeStats
+		LastError            error
+	}{
+		Tablet:               th.Tablet,
+		Target:               th.Target,
+		Serving:              th.Serving,
+		PrimaryTermStartTime: th.PrimaryTermStartTime,
+		Stats:                th.Stats,
+		LastError:            th.LastError,
+	})
 }
 
 // DeepEqual compares two TabletHealth. Since we include protos, we

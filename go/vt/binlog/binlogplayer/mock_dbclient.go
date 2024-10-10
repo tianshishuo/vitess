@@ -17,12 +17,16 @@ limitations under the License.
 package binlogplayer
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"vitess.io/vitess/go/mysql/capabilities"
 	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/sqlparser"
 )
 
 const mockClientUNameFiltered = "Filtered"
@@ -31,13 +35,15 @@ const mockClientUNameDba = "Dba"
 // MockDBClient mocks a DBClient.
 // It must be configured to expect requests in a specific order.
 type MockDBClient struct {
-	t               *testing.T
-	UName           string
-	expect          []*mockExpect
-	currentResult   int
-	done            chan struct{}
-	queriesToIgnore []*mockExpect // these queries will return a standard nil result, you SHOULD NOT expect them in the tests
-	invariants      map[string]*sqltypes.Result
+	t             *testing.T
+	UName         string
+	expect        []*mockExpect
+	expectMu      sync.Mutex
+	currentResult int
+	done          chan struct{}
+	invariants    map[string]*sqltypes.Result
+	Tag           string
+	parser        *sqlparser.Parser
 }
 
 type mockExpect struct {
@@ -47,49 +53,66 @@ type mockExpect struct {
 	err    error
 }
 
-func getQueriesToIgnore() []*mockExpect {
-	var queriesToIgnore []*mockExpect
-	for _, query := range WithDDLInitialQueries {
-		exp := &mockExpect{
-			query:  query,
-			re:     nil,
-			result: &sqltypes.Result{},
-			err:    nil,
-		}
-		queriesToIgnore = append(queriesToIgnore, exp)
-
-	}
-	return queriesToIgnore
-}
-
 // NewMockDBClient returns a new DBClientMock with the default "Filtered" UName.
 func NewMockDBClient(t *testing.T) *MockDBClient {
 	return &MockDBClient{
-		t:               t,
-		UName:           mockClientUNameFiltered,
-		done:            make(chan struct{}),
-		queriesToIgnore: getQueriesToIgnore(),
+		t:     t,
+		UName: mockClientUNameFiltered,
+		done:  make(chan struct{}),
 		invariants: map[string]*sqltypes.Result{
 			"CREATE TABLE IF NOT EXISTS _vt.vreplication_log":           {},
 			"select id, type, state, message from _vt.vreplication_log": {},
 			"insert into _vt.vreplication_log":                          {},
+			// The following statements don't have a deterministic order as they are
+			// executed in the normal program flow, but ALSO done in a defer as a protective
+			// measure as they are resetting the values back to the original one. This also
+			// means that the values they set are based on the session defaults, which can
+			// change. So we make these invariants for unit test stability.
+			"select @@foreign_key_checks": sqltypes.MakeTestResult(
+				sqltypes.MakeTestFields(
+					"@@foreign_key_checks",
+					"int64",
+				),
+				"1",
+			),
+			"set @@session.foreign_key_checks": {},
+			"set foreign_key_checks":           {},
+			"select @@session.sql_mode": sqltypes.MakeTestResult(
+				sqltypes.MakeTestFields(
+					"sql_mode", "varchar",
+				),
+				"ONLY_FULL_GROUP_BY,NO_AUTO_VALUE_ON_ZERO,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
+			),
+			"set @@session.sql_mode": {},
+			"set sql_mode":           {},
 		},
+		parser: sqlparser.NewTestParser(),
 	}
 }
 
 // NewMockDbaClient returns a new DBClientMock with the default "Dba" UName.
 func NewMockDbaClient(t *testing.T) *MockDBClient {
 	return &MockDBClient{
-		t:               t,
-		UName:           mockClientUNameDba,
-		done:            make(chan struct{}),
-		queriesToIgnore: getQueriesToIgnore(),
+		t:      t,
+		UName:  mockClientUNameDba,
+		done:   make(chan struct{}),
+		parser: sqlparser.NewTestParser(),
 	}
+}
+
+func (dc *MockDBClient) Reset() {
+	dc.expectMu.Lock()
+	defer dc.expectMu.Unlock()
+	dc.currentResult = 0
+	dc.expect = nil
+	dc.done = make(chan struct{})
 }
 
 // ExpectRequest adds an expected result to the mock.
 // This function should not be called conncurrently with other commands.
 func (dc *MockDBClient) ExpectRequest(query string, result *sqltypes.Result, err error) {
+	dc.expectMu.Lock()
+	defer dc.expectMu.Unlock()
 	select {
 	case <-dc.done:
 		dc.done = make(chan struct{})
@@ -106,6 +129,8 @@ func (dc *MockDBClient) ExpectRequest(query string, result *sqltypes.Result, err
 // queryRE is a regular expression.
 // This function should not be called conncurrently with other commands.
 func (dc *MockDBClient) ExpectRequestRE(queryRE string, result *sqltypes.Result, err error) {
+	dc.expectMu.Lock()
+	defer dc.expectMu.Unlock()
 	select {
 	case <-dc.done:
 		dc.done = make(chan struct{})
@@ -166,31 +191,46 @@ func (dc *MockDBClient) Close() {
 
 // ExecuteFetch is part of the DBClient interface
 func (dc *MockDBClient) ExecuteFetch(query string, maxrows int) (qr *sqltypes.Result, err error) {
-	dc.t.Helper()
-	dc.t.Logf("DBClient query: %v", query)
+	// Serialize ExecuteFetch to enforce a strict order on shared dbClients.
+	dc.expectMu.Lock()
+	defer dc.expectMu.Unlock()
 
-	for _, q := range dc.queriesToIgnore {
-		if strings.EqualFold(q.query, query) || strings.Contains(strings.ToLower(query), strings.ToLower(q.query)) {
-			return q.result, q.err
-		}
+	dc.t.Helper()
+	msg := "DBClient query: %v"
+	if dc.Tag != "" {
+		msg = fmt.Sprintf("[%s] %s", dc.Tag, msg)
 	}
+	dc.t.Logf(msg, query)
+
 	for q, result := range dc.invariants {
-		if strings.Contains(query, q) {
+		if strings.Contains(strings.ToLower(query), strings.ToLower(q)) {
 			return result, nil
 		}
 	}
 
 	if dc.currentResult >= len(dc.expect) {
-		dc.t.Fatalf("DBClientMock: query: %s, no more requests are expected", query)
+		msg := "DBClientMock: query: %s, no more requests are expected"
+		if dc.Tag != "" {
+			msg = fmt.Sprintf("[%s] %s", dc.Tag, msg)
+		}
+		dc.t.Fatalf(msg, query)
 	}
 	result := dc.expect[dc.currentResult]
 	if result.re == nil {
 		if query != result.query {
-			dc.t.Fatalf("DBClientMock: query: %s, want %s", query, result.query)
+			msg := "DBClientMock: query: \n%s, want \n%s"
+			if dc.Tag != "" {
+				msg = fmt.Sprintf("[%s] %s", dc.Tag, msg)
+			}
+			dc.t.Fatalf(msg, query, result.query)
 		}
 	} else {
 		if !result.re.MatchString(query) {
-			dc.t.Fatalf("DBClientMock: query: %s, must match %s", query, result.query)
+			msg := "DBClientMock: query: %s, must match %s"
+			if dc.Tag != "" {
+				msg = fmt.Sprintf("[%s] %s", dc.Tag, msg)
+			}
+			dc.t.Fatalf(msg, query, result.query)
 		}
 	}
 	dc.currentResult++
@@ -198,4 +238,47 @@ func (dc *MockDBClient) ExecuteFetch(query string, maxrows int) (qr *sqltypes.Re
 		close(dc.done)
 	}
 	return result.result, result.err
+}
+
+func (dc *MockDBClient) ExecuteFetchMulti(query string, maxrows int) ([]*sqltypes.Result, error) {
+	queries, err := dc.parser.SplitStatementToPieces(query)
+	if err != nil {
+		return nil, err
+	}
+	results := make([]*sqltypes.Result, 0, len(queries))
+	for _, query := range queries {
+		qr, err := dc.ExecuteFetch(query, maxrows)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, qr)
+	}
+	return results, nil
+}
+
+// AddInvariant can be used to customize the behavior of the mock client.
+func (dc *MockDBClient) AddInvariant(query string, result *sqltypes.Result) {
+	dc.expectMu.Lock()
+	defer dc.expectMu.Unlock()
+	dc.invariants[query] = result
+}
+
+// RemoveInvariant can be used to customize the behavior of the mock client.
+func (dc *MockDBClient) RemoveInvariant(query string) {
+	dc.expectMu.Lock()
+	defer dc.expectMu.Unlock()
+	delete(dc.invariants, query)
+}
+
+// RemoveInvariant can be used to customize the behavior of the mock client.
+func (dc *MockDBClient) RemoveInvariants(queries ...string) {
+	dc.expectMu.Lock()
+	defer dc.expectMu.Unlock()
+	for _, query := range queries {
+		delete(dc.invariants, query)
+	}
+}
+
+func (dc *MockDBClient) SupportsCapability(capability capabilities.FlavorCapability) (bool, error) {
+	return false, nil
 }

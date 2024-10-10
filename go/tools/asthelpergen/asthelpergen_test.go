@@ -25,7 +25,13 @@ import (
 )
 
 func TestFullGeneration(t *testing.T) {
-	result, err := GenerateASTHelpers([]string{"./integration/..."}, "vitess.io/vitess/go/tools/asthelpergen/integration.AST", "*NoCloneType")
+	result, err := GenerateASTHelpers(&Options{
+		Packages:      []string{"./integration/..."},
+		RootInterface: "vitess.io/vitess/go/tools/asthelpergen/integration.AST",
+		Clone: CloneOptions{
+			Exclude: []string{"*NoCloneType"},
+		},
+	})
 	require.NoError(t, err)
 
 	verifyErrors := VerifyFilesOnDisk(result)
@@ -36,8 +42,6 @@ func TestFullGeneration(t *testing.T) {
 		require.Contains(t, contents, "http://www.apache.org/licenses/LICENSE-2.0")
 		applyIdx := strings.Index(contents, "func (a *application) apply(parent, node AST, replacer replacerFunc)")
 		cloneIdx := strings.Index(contents, "CloneAST(in AST) AST")
-		if applyIdx == 0 && cloneIdx == 0 {
-			t.Fatalf("file doesn't contain expected contents")
-		}
+		require.False(t, applyIdx == 0 && cloneIdx == 0, "file doesn't contain expected contents")
 	}
 }

@@ -42,7 +42,6 @@ var (
 	hostname        = "localhost"
 	keyspaceName    = "ks"
 	cell            = "zone1"
-	signalInterval  = 1
 	sqlSchema       = `
 		create table vt_user (
 			id bigint,
@@ -78,8 +77,7 @@ func TestMain(m *testing.M) {
 		}
 
 		// List of users authorized to execute vschema ddl operations
-		clusterInstance.VtGateExtraArgs = []string{"-schema_change_signal"}
-
+		clusterInstance.VtGateExtraArgs = append(clusterInstance.VtGateExtraArgs, "--schema_change_signal")
 		// Start keyspace
 		keyspace := &cluster.Keyspace{
 			Name:      keyspaceName,
@@ -91,10 +89,7 @@ func TestMain(m *testing.M) {
 
 		// restart the tablet so that the schema.Engine gets a chance to start with existing schema
 		tablet := clusterInstance.Keyspaces[0].Shards[0].PrimaryTablet()
-		tablet.VttabletProcess.ExtraArgs = []string{
-			"-queryserver-config-schema-change-signal",
-			fmt.Sprintf("-queryserver-config-schema-change-signal-interval=%d", signalInterval),
-		}
+		tablet.VttabletProcess.ExtraArgs = append(tablet.VttabletProcess.ExtraArgs, "--queryserver-config-schema-change-signal")
 		if err := tablet.RestartOnlyTablet(); err != nil {
 			return 1
 		}
@@ -104,6 +99,13 @@ func TestMain(m *testing.M) {
 			clusterInstance.VtgateProcess = cluster.VtgateProcess{}
 			return 1
 		}
+
+		err := clusterInstance.WaitForVTGateAndVTTablets(5 * time.Minute)
+		if err != nil {
+			fmt.Println(err)
+			return 1
+		}
+
 		vtParams = mysql.ConnParams{
 			Host: clusterInstance.Hostname,
 			Port: clusterInstance.VtgateMySQLPort,
@@ -120,10 +122,15 @@ func TestVSchemaTrackerInit(t *testing.T) {
 	require.NoError(t, err)
 	defer conn.Close()
 
-	qr := utils.Exec(t, conn, "SHOW VSCHEMA TABLES")
-	got := fmt.Sprintf("%v", qr.Rows)
-	want := `[[VARCHAR("dual")] [VARCHAR("main")] [VARCHAR("test_table")] [VARCHAR("vt_user")]]`
-	assert.Equal(t, want, got)
+	want := `[[VARCHAR("main")] [VARCHAR("test_table")] [VARCHAR("vt_user")]]`
+	utils.AssertMatchesWithTimeout(t, conn,
+		"SHOW VSCHEMA TABLES",
+		want,
+		100*time.Millisecond,
+		60*time.Second,
+		"initial table list not complete")
+
+	utils.AssertMatches(t, conn, "SHOW VSCHEMA KEYSPACES", `[[VARCHAR("ks") VARCHAR("false") VARCHAR("unmanaged") VARCHAR("")]]`)
 }
 
 // TestVSchemaTrackerKeyspaceReInit tests that the vschema tracker
@@ -135,7 +142,7 @@ func TestVSchemaTrackerKeyspaceReInit(t *testing.T) {
 	primaryTablet := clusterInstance.Keyspaces[0].Shards[0].PrimaryTablet()
 
 	// get the vschema prior to the restarts
-	var originalResults interface{}
+	var originalResults any
 	readVSchema(t, &clusterInstance.VtgateProcess, &originalResults)
 	assert.NotNil(t, originalResults)
 
@@ -147,18 +154,20 @@ func TestVSchemaTrackerKeyspaceReInit(t *testing.T) {
 		require.NoError(t, err)
 		err = clusterInstance.WaitForTabletsToHealthyInVtgate()
 		require.NoError(t, err)
-		time.Sleep(time.Duration(signalInterval*2) * time.Second)
-		var newResults interface{}
-		readVSchema(t, &clusterInstance.VtgateProcess, &newResults)
-		assert.Equal(t, originalResults, newResults)
-		newResults = nil
+
+		utils.TimeoutAction(t, 1*time.Minute, "timeout - could not find the updated vschema in VTGate", func() bool {
+			var newResults any
+			readVSchema(t, &clusterInstance.VtgateProcess, &newResults)
+			return assert.ObjectsAreEqual(originalResults, newResults)
+		})
 	}
 }
 
-func readVSchema(t *testing.T, vtgate *cluster.VtgateProcess, results *interface{}) {
+func readVSchema(t *testing.T, vtgate *cluster.VtgateProcess, results *any) {
 	httpClient := &http.Client{Timeout: 5 * time.Second}
 	resp, err := httpClient.Get(vtgate.VSchemaURL)
-	require.Nil(t, err)
+	require.NoError(t, err)
+	defer resp.Body.Close()
 	assert.Equal(t, 200, resp.StatusCode)
 	json.NewDecoder(resp.Body).Decode(results)
 }

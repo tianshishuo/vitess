@@ -21,6 +21,10 @@ import (
 	"fmt"
 	"testing"
 
+	"vitess.io/vitess/go/test/utils"
+	"vitess.io/vitess/go/vt/mysqlctl"
+	"vitess.io/vitess/go/vt/vtenv"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -29,7 +33,6 @@ import (
 	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
 	"vitess.io/vitess/go/vt/vtctl/grpcvtctldserver"
-	"vitess.io/vitess/go/vt/vtctl/reparentutil"
 	"vitess.io/vitess/go/vt/vttablet/tabletservermock"
 	"vitess.io/vitess/go/vt/vttablet/tmclient"
 	"vitess.io/vitess/go/vt/wrangler"
@@ -40,12 +43,14 @@ import (
 )
 
 func TestInitShardPrimary(t *testing.T) {
-	ts := memorytopo.NewServer("cell1")
+	ctx := utils.LeakCheckContext(t)
+	ts := memorytopo.NewServer(ctx, "cell1")
 	tmc := tmclient.NewTabletManagerClient()
-	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmc)
-	_ = reparentutil.SetDurabilityPolicy("none")
+	defer tmc.Close()
+	wr := wrangler.New(vtenv.NewTestEnv(), logutil.NewConsoleLogger(), ts, tmc)
 
 	primaryDb := fakesqldb.New(t)
+	defer primaryDb.Close()
 	primaryDb.AddQuery("create database if not exists `vt_test_keyspace`", &sqltypes.Result{InsertID: 0, RowsAffected: 0})
 
 	tablet1 := testlib.NewFakeTablet(t, wr, "cell1", 0, topodatapb.TabletType_PRIMARY, primaryDb)
@@ -54,30 +59,33 @@ func TestInitShardPrimary(t *testing.T) {
 
 	tablet1.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
 		"FAKE RESET ALL REPLICATION",
-		"CREATE DATABASE IF NOT EXISTS _vt",
-		"SUBCREATE TABLE IF NOT EXISTS _vt.reparent_journal",
-		"ALTER TABLE _vt.reparent_journal CHANGE COLUMN primary_alias master_alias VARBINARY(32) NOT NULL",
-		"CREATE DATABASE IF NOT EXISTS _vt",
-		"SUBCREATE TABLE IF NOT EXISTS _vt.reparent_journal",
-		"ALTER TABLE _vt.reparent_journal CHANGE COLUMN primary_alias master_alias VARBINARY(32) NOT NULL",
-		"SUBINSERT INTO _vt.reparent_journal (time_created_ns, action_name, master_alias, replication_position) VALUES",
+		mysqlctl.GenerateInitialBinlogEntry(),
+		"SUBINSERT INTO _vt.reparent_journal (time_created_ns, action_name, primary_alias, replication_position) VALUES",
 	}
 
 	tablet2.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
+		// These come from tablet startup
+		"STOP REPLICA",
+		"FAKE SET SOURCE",
+		"START REPLICA",
+		// These come from InitShardPrimary
 		"FAKE RESET ALL REPLICATION",
-		"FAKE RESET ALL REPLICATION",
-		"FAKE SET SLAVE POSITION",
-		"FAKE SET MASTER",
-		"START SLAVE",
+		"FAKE RESET BINARY LOGS AND GTIDS",
+		"FAKE SET GLOBAL gtid_purged",
+		"FAKE SET SOURCE",
+		"START REPLICA",
 	}
 	tablet2.FakeMysqlDaemon.SetReplicationSourceInputs = append(tablet2.FakeMysqlDaemon.SetReplicationSourceInputs, fmt.Sprintf("%v:%v", tablet1.Tablet.Hostname, tablet1.Tablet.MysqlPort))
 
 	tablet3.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
+		"STOP REPLICA",
+		"FAKE SET SOURCE",
+		"START REPLICA",
 		"FAKE RESET ALL REPLICATION",
-		"FAKE RESET ALL REPLICATION",
-		"FAKE SET SLAVE POSITION",
-		"FAKE SET MASTER",
-		"START SLAVE",
+		"FAKE RESET BINARY LOGS AND GTIDS",
+		"FAKE SET GLOBAL gtid_purged",
+		"FAKE SET SOURCE",
+		"START REPLICA",
 	}
 	tablet3.FakeMysqlDaemon.SetReplicationSourceInputs = append(tablet3.FakeMysqlDaemon.SetReplicationSourceInputs, fmt.Sprintf("%v:%v", tablet1.Tablet.Hostname, tablet1.Tablet.MysqlPort))
 
@@ -88,7 +96,7 @@ func TestInitShardPrimary(t *testing.T) {
 		tablet.TM.QueryServiceControl.(*tabletservermock.Controller).SetQueryServiceEnabledForTests(true)
 	}
 
-	vtctld := grpcvtctldserver.NewVtctldServer(ts)
+	vtctld := grpcvtctldserver.NewVtctldServer(vtenv.NewTestEnv(), ts)
 	resp, err := vtctld.InitShardPrimary(context.Background(), &vtctldatapb.InitShardPrimaryRequest{
 		Keyspace:                tablet1.Tablet.Keyspace,
 		Shard:                   tablet1.Tablet.Shard,
@@ -100,12 +108,14 @@ func TestInitShardPrimary(t *testing.T) {
 }
 
 func TestInitShardPrimaryNoFormerPrimary(t *testing.T) {
-	ts := memorytopo.NewServer("cell1")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ts := memorytopo.NewServer(ctx, "cell1")
 	tmc := tmclient.NewTabletManagerClient()
-	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmc)
-	_ = reparentutil.SetDurabilityPolicy("none")
+	wr := wrangler.New(vtenv.NewTestEnv(), logutil.NewConsoleLogger(), ts, tmc)
 
 	primaryDb := fakesqldb.New(t)
+	defer primaryDb.Close()
 	primaryDb.AddQuery("create database if not exists `vt_test_keyspace`", &sqltypes.Result{InsertID: 0, RowsAffected: 0})
 
 	tablet1 := testlib.NewFakeTablet(t, wr, "cell1", 0, topodatapb.TabletType_REPLICA, primaryDb)
@@ -114,28 +124,25 @@ func TestInitShardPrimaryNoFormerPrimary(t *testing.T) {
 
 	tablet1.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
 		"FAKE RESET ALL REPLICATION",
-		"CREATE DATABASE IF NOT EXISTS _vt",
-		"SUBCREATE TABLE IF NOT EXISTS _vt.reparent_journal",
-		"ALTER TABLE _vt.reparent_journal CHANGE COLUMN primary_alias master_alias VARBINARY(32) NOT NULL",
-		"CREATE DATABASE IF NOT EXISTS _vt",
-		"SUBCREATE TABLE IF NOT EXISTS _vt.reparent_journal",
-		"ALTER TABLE _vt.reparent_journal CHANGE COLUMN primary_alias master_alias VARBINARY(32) NOT NULL",
-		"SUBINSERT INTO _vt.reparent_journal (time_created_ns, action_name, master_alias, replication_position) VALUES",
+		mysqlctl.GenerateInitialBinlogEntry(),
+		"SUBINSERT INTO _vt.reparent_journal (time_created_ns, action_name, primary_alias, replication_position) VALUES",
 	}
 
 	tablet2.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
 		"FAKE RESET ALL REPLICATION",
-		"FAKE SET SLAVE POSITION",
-		"FAKE SET MASTER",
-		"START SLAVE",
+		"FAKE RESET BINARY LOGS AND GTIDS",
+		"FAKE SET GLOBAL gtid_purged",
+		"FAKE SET SOURCE",
+		"START REPLICA",
 	}
 	tablet2.FakeMysqlDaemon.SetReplicationSourceInputs = append(tablet2.FakeMysqlDaemon.SetReplicationSourceInputs, fmt.Sprintf("%v:%v", tablet1.Tablet.Hostname, tablet1.Tablet.MysqlPort))
 
 	tablet3.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
 		"FAKE RESET ALL REPLICATION",
-		"FAKE SET SLAVE POSITION",
-		"FAKE SET MASTER",
-		"START SLAVE",
+		"FAKE RESET BINARY LOGS AND GTIDS",
+		"FAKE SET GLOBAL gtid_purged",
+		"FAKE SET SOURCE",
+		"START REPLICA",
 	}
 	tablet3.FakeMysqlDaemon.SetReplicationSourceInputs = append(tablet3.FakeMysqlDaemon.SetReplicationSourceInputs, fmt.Sprintf("%v:%v", tablet1.Tablet.Hostname, tablet1.Tablet.MysqlPort))
 
@@ -146,7 +153,7 @@ func TestInitShardPrimaryNoFormerPrimary(t *testing.T) {
 		tablet.TM.QueryServiceControl.(*tabletservermock.Controller).SetQueryServiceEnabledForTests(true)
 	}
 
-	vtctld := grpcvtctldserver.NewVtctldServer(ts)
+	vtctld := grpcvtctldserver.NewVtctldServer(vtenv.NewTestEnv(), ts)
 	_, err := vtctld.InitShardPrimary(context.Background(), &vtctldatapb.InitShardPrimaryRequest{
 		Keyspace:                tablet1.Tablet.Keyspace,
 		Shard:                   tablet1.Tablet.Shard,

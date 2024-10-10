@@ -23,12 +23,12 @@ import (
 	"testing"
 	"time"
 
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tx"
 
 	"vitess.io/vitess/go/vt/callerid"
 
 	"vitess.io/vitess/go/streamlog"
-	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
 )
 
 func testNotRedacted(t *testing.T, r *httptest.ResponseRecorder) {
@@ -45,7 +45,7 @@ func testRedacted(t *testing.T, r *httptest.ResponseRecorder) {
 
 func testHandler(req *http.Request, t *testing.T) {
 	// Test with redactions off to start
-	*streamlog.RedactDebugUIQueries = false
+	streamlog.SetRedactDebugUIQueries(false)
 
 	response := httptest.NewRecorder()
 	tabletenv.TxLogger.Send("test msg")
@@ -60,7 +60,7 @@ func testHandler(req *http.Request, t *testing.T) {
 			ImmediateCaller: callerid.NewImmediateCallerID("immediate-caller"),
 			StartTime:       time.Now(),
 			Conclusion:      "unknown",
-			Queries:         []string{"select * from test"},
+			Queries:         []tx.Query{{Sql: "select * from test"}},
 		},
 	}
 	txConn.txProps.EndTime = txConn.txProps.StartTime
@@ -80,12 +80,12 @@ func testHandler(req *http.Request, t *testing.T) {
 	testNotRedacted(t, response)
 
 	// Test with redactions on
-	*streamlog.RedactDebugUIQueries = true
+	streamlog.SetRedactDebugUIQueries(true)
 	txlogzHandler(response, req)
 	testRedacted(t, response)
 
 	// Reset to default redaction state
-	*streamlog.RedactDebugUIQueries = false
+	streamlog.SetRedactDebugUIQueries(false)
 }
 
 func TestTxlogzHandler(t *testing.T) {

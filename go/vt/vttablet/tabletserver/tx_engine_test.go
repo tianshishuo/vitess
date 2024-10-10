@@ -17,6 +17,7 @@ limitations under the License.
 package tabletserver
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -24,6 +25,10 @@ import (
 	"testing"
 	"time"
 
+	"vitess.io/vitess/go/mysql/sqlerror"
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vtenv"
+	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tx"
 
 	"github.com/stretchr/testify/assert"
@@ -35,8 +40,6 @@ import (
 
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
 
-	"context"
-
 	querypb "vitess.io/vitess/go/vt/proto/query"
 )
 
@@ -44,12 +47,12 @@ func TestTxEngineClose(t *testing.T) {
 	db := setUpQueryExecutorTest(t)
 	defer db.Close()
 	ctx := context.Background()
-	config := tabletenv.NewDefaultConfig()
-	config.DB = newDBConfigs(db)
-	config.TxPool.Size = 10
-	config.Oltp.TxTimeoutSeconds = 0.1
-	config.GracePeriods.ShutdownSeconds = 0
-	te := NewTxEngine(tabletenv.NewEnv(config, "TabletServerTest"))
+	cfg := tabletenv.NewDefaultConfig()
+	cfg.DB = newDBConfigs(db)
+	cfg.TxPool.Size = 10
+	cfg.Oltp.TxTimeout = 100 * time.Millisecond
+	cfg.GracePeriods.Shutdown = 0
+	te := NewTxEngine(tabletenv.NewEnv(vtenv.NewTestEnv(), cfg, "TabletServerTest"), nil)
 
 	// Normal close.
 	te.AcceptReadWrite()
@@ -59,11 +62,11 @@ func TestTxEngineClose(t *testing.T) {
 
 	// Normal close with timeout wait.
 	te.AcceptReadWrite()
-	c, beginSQL, err := te.txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
+	c, beginSQL, _, err := te.txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
 	require.NoError(t, err)
 	require.Equal(t, "begin", beginSQL)
 	c.Unlock()
-	c, beginSQL, err = te.txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
+	c, beginSQL, _, err = te.txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
 	require.NoError(t, err)
 	require.Equal(t, "begin", beginSQL)
 	c.Unlock()
@@ -75,7 +78,7 @@ func TestTxEngineClose(t *testing.T) {
 
 	// Immediate close.
 	te.AcceptReadOnly()
-	c, _, err = te.txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
+	c, _, _, err = te.txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +90,7 @@ func TestTxEngineClose(t *testing.T) {
 	// Normal close with short grace period.
 	te.shutdownGracePeriod = 25 * time.Millisecond
 	te.AcceptReadWrite()
-	c, _, err = te.txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
+	c, _, _, err = te.txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
 	require.NoError(t, err)
 	c.Unlock()
 	start = time.Now()
@@ -98,7 +101,7 @@ func TestTxEngineClose(t *testing.T) {
 	// Normal close with short grace period, but pool gets empty early.
 	te.shutdownGracePeriod = 25 * time.Millisecond
 	te.AcceptReadWrite()
-	c, _, err = te.txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
+	c, _, _, err = te.txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
 	require.NoError(t, err)
 	c.Unlock()
 	go func() {
@@ -114,7 +117,7 @@ func TestTxEngineClose(t *testing.T) {
 
 	// Immediate close, but connection is in use.
 	te.AcceptReadOnly()
-	c, _, err = te.txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
+	c, _, _, err = te.txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
 	require.NoError(t, err)
 	go func() {
 		time.Sleep(100 * time.Millisecond)
@@ -135,7 +138,7 @@ func TestTxEngineClose(t *testing.T) {
 	te.AcceptReadWrite()
 	_, err = te.Reserve(ctx, &querypb.ExecuteOptions{}, 0, nil)
 	require.NoError(t, err)
-	_, err = te.ReserveBegin(ctx, &querypb.ExecuteOptions{}, nil, nil)
+	_, _, err = te.ReserveBegin(ctx, &querypb.ExecuteOptions{}, nil)
 	require.NoError(t, err)
 	start = time.Now()
 	te.Close()
@@ -145,24 +148,26 @@ func TestTxEngineClose(t *testing.T) {
 }
 
 func TestTxEngineBegin(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	db := setUpQueryExecutorTest(t)
 	defer db.Close()
 	db.AddQueryPattern(".*", &sqltypes.Result{})
-	config := tabletenv.NewDefaultConfig()
-	config.DB = newDBConfigs(db)
-	te := NewTxEngine(tabletenv.NewEnv(config, "TabletServerTest"))
+	cfg := tabletenv.NewDefaultConfig()
+	cfg.DB = newDBConfigs(db)
+	te := NewTxEngine(tabletenv.NewEnv(vtenv.NewTestEnv(), cfg, "TabletServerTest"), nil)
 
-	for _, exec := range []func() (int64, error){
-		func() (int64, error) {
-			tx, _, err := te.Begin(ctx, nil, 0, &querypb.ExecuteOptions{})
-			return tx, err
+	for _, exec := range []func() (int64, string, error){
+		func() (int64, string, error) {
+			tx, _, schemaStateChanges, err := te.Begin(ctx, 0, nil, &querypb.ExecuteOptions{})
+			return tx, schemaStateChanges, err
 		},
-		func() (int64, error) {
-			return te.ReserveBegin(ctx, &querypb.ExecuteOptions{}, nil, nil)
+		func() (int64, string, error) {
+			return te.ReserveBegin(ctx, &querypb.ExecuteOptions{}, nil)
 		},
 	} {
 		te.AcceptReadOnly()
-		tx1, err := exec()
+		tx1, _, err := exec()
 		require.NoError(t, err)
 		_, _, err = te.Commit(ctx, tx1)
 		require.NoError(t, err)
@@ -170,7 +175,7 @@ func TestTxEngineBegin(t *testing.T) {
 		db.ResetQueryLog()
 
 		te.AcceptReadWrite()
-		tx2, err := exec()
+		tx2, _, err := exec()
 		require.NoError(t, err)
 		_, _, err = te.Commit(ctx, tx2)
 		require.NoError(t, err)
@@ -178,26 +183,28 @@ func TestTxEngineBegin(t *testing.T) {
 		db.ResetQueryLog()
 
 		te.transition(Transitioning)
-		_, err = exec()
+		_, _, err = exec()
 		assert.EqualError(t, err, "tx engine can't accept new connections in state Transitioning")
 
 		te.transition(NotServing)
-		_, err = exec()
+		_, _, err = exec()
 		assert.EqualError(t, err, "tx engine can't accept new connections in state NotServing")
 	}
 
 }
 
 func TestTxEngineRenewFails(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	db := setUpQueryExecutorTest(t)
 	defer db.Close()
 	db.AddQueryPattern(".*", &sqltypes.Result{})
-	config := tabletenv.NewDefaultConfig()
-	config.DB = newDBConfigs(db)
-	te := NewTxEngine(tabletenv.NewEnv(config, "TabletServerTest"))
+	cfg := tabletenv.NewDefaultConfig()
+	cfg.DB = newDBConfigs(db)
+	te := NewTxEngine(tabletenv.NewEnv(vtenv.NewTestEnv(), cfg, "TabletServerTest"), nil)
 	te.AcceptReadOnly()
 	options := &querypb.ExecuteOptions{}
-	connID, err := te.ReserveBegin(ctx, options, nil, nil)
+	connID, _, err := te.ReserveBegin(ctx, options, nil)
 	require.NoError(t, err)
 
 	conn, err := te.txPool.GetAndLock(connID, "for test")
@@ -205,17 +212,17 @@ func TestTxEngineRenewFails(t *testing.T) {
 	conn.Unlock() // but we keep holding on to it... sneaky....
 
 	// this next bit sets up the scp so our renew will fail
-	conn2, err := te.txPool.scp.NewConn(ctx, options)
+	conn2, err := te.txPool.scp.NewConn(ctx, options, nil)
 	require.NoError(t, err)
 	defer conn2.Release(tx.TxCommit)
-	te.txPool.scp.lastID.Set(conn2.ConnID - 1)
+	te.txPool.scp.lastID.Store(conn2.ConnID - 1)
 
 	// commit will do a renew
 	dbConn := conn.dbConn
 	_, _, err = te.Commit(ctx, connID)
 	require.Error(t, err)
 	assert.True(t, conn.IsClosed(), "connection was not closed")
-	assert.True(t, dbConn.IsClosed(), "underlying connection was not closed")
+	assert.True(t, dbConn.Conn.IsClosed(), "underlying connection was not closed")
 }
 
 type TxType int
@@ -490,15 +497,15 @@ func TestWithInnerTests(outerT *testing.T) {
 				// nothing to do
 			case WriteAccepted:
 				require.NoError(t,
-					startTransaction(te, true))
+					startTx(te, true))
 			case ReadOnlyAccepted:
 				require.NoError(t,
-					startTransaction(te, false))
+					startTx(te, false))
 			case WriteRejected:
-				err := startTransaction(te, true)
+				err := startTx(te, true)
 				require.Error(t, err)
 			case ReadOnlyRejected:
-				err := startTransaction(te, false)
+				err := startTx(te, false)
 				require.Error(t, err)
 			default:
 				t.Fatalf("don't know how to [%v]", test.tx)
@@ -527,12 +534,12 @@ func TestWithInnerTests(outerT *testing.T) {
 }
 
 func setupTxEngine(db *fakesqldb.DB) *TxEngine {
-	config := tabletenv.NewDefaultConfig()
-	config.DB = newDBConfigs(db)
-	config.TxPool.Size = 10
-	config.Oltp.TxTimeoutSeconds = 0.1
-	config.GracePeriods.ShutdownSeconds = 0
-	te := NewTxEngine(tabletenv.NewEnv(config, "TabletServerTest"))
+	cfg := tabletenv.NewDefaultConfig()
+	cfg.DB = newDBConfigs(db)
+	cfg.TxPool.Size = 10
+	cfg.Oltp.TxTimeout = 100 * time.Millisecond
+	cfg.GracePeriods.Shutdown = 0
+	te := NewTxEngine(tabletenv.NewEnv(vtenv.NewTestEnv(), cfg, "TabletServerTest"), nil)
 	return te
 }
 
@@ -545,30 +552,32 @@ func assertEndStateIs(expected txEngineState) func(actual txEngineState) error {
 	}
 }
 
-func startTransaction(te *TxEngine, writeTransaction bool) error {
+func startTx(te *TxEngine, writeTransaction bool) error {
 	options := &querypb.ExecuteOptions{}
 	if writeTransaction {
 		options.TransactionIsolation = querypb.ExecuteOptions_DEFAULT
 	} else {
 		options.TransactionIsolation = querypb.ExecuteOptions_CONSISTENT_SNAPSHOT_READ_ONLY
 	}
-	_, _, err := te.Begin(context.Background(), nil, 0, options)
+	_, _, _, err := te.Begin(context.Background(), 0, nil, options)
 	return err
 }
 
 func TestTxEngineFailReserve(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	db := setUpQueryExecutorTest(t)
 	defer db.Close()
 	db.AddQueryPattern(".*", &sqltypes.Result{})
-	config := tabletenv.NewDefaultConfig()
-	config.DB = newDBConfigs(db)
-	te := NewTxEngine(tabletenv.NewEnv(config, "TabletServerTest"))
+	cfg := tabletenv.NewDefaultConfig()
+	cfg.DB = newDBConfigs(db)
+	te := NewTxEngine(tabletenv.NewEnv(vtenv.NewTestEnv(), cfg, "TabletServerTest"), nil)
 
 	options := &querypb.ExecuteOptions{}
 	_, err := te.Reserve(ctx, options, 0, nil)
 	assert.EqualError(t, err, "tx engine can't accept new connections in state NotServing")
 
-	_, err = te.ReserveBegin(ctx, options, nil, nil)
+	_, _, err = te.ReserveBegin(ctx, options, nil)
 	assert.EqualError(t, err, "tx engine can't accept new connections in state NotServing")
 
 	te.AcceptReadOnly()
@@ -577,14 +586,14 @@ func TestTxEngineFailReserve(t *testing.T) {
 	_, err = te.Reserve(ctx, options, 0, []string{"dummy_query"})
 	assert.EqualError(t, err, "unknown error: failed executing dummy_query (errno 1105) (sqlstate HY000) during query: dummy_query")
 
-	_, err = te.ReserveBegin(ctx, options, []string{"dummy_query"}, nil)
+	_, _, err = te.ReserveBegin(ctx, options, []string{"dummy_query"})
 	assert.EqualError(t, err, "unknown error: failed executing dummy_query (errno 1105) (sqlstate HY000) during query: dummy_query")
 
 	nonExistingID := int64(42)
 	_, err = te.Reserve(ctx, options, nonExistingID, nil)
-	assert.EqualError(t, err, "transaction 42: not found")
+	assert.EqualError(t, err, "transaction 42: not found (potential transaction timeout)")
 
-	txID, _, err := te.Begin(ctx, nil, 0, options)
+	txID, _, _, err := te.Begin(ctx, 0, nil, options)
 	require.NoError(t, err)
 	conn, err := te.txPool.GetAndLock(txID, "for test")
 	require.NoError(t, err)
@@ -596,4 +605,119 @@ func TestTxEngineFailReserve(t *testing.T) {
 	connID, _, err := te.Commit(ctx, txID)
 	require.Error(t, err)
 	assert.Zero(t, connID)
+}
+
+func TestCheckReceivedError(t *testing.T) {
+	db := setUpQueryExecutorTest(t)
+	defer db.Close()
+	cfg := tabletenv.NewDefaultConfig()
+	cfg.DB = newDBConfigs(db)
+	env := tabletenv.NewEnv(vtenv.NewTestEnv(), cfg, "TabletServerTest")
+	env.Config().TwoPCEnable = true
+	env.Config().TwoPCAbandonAge = 5
+	te := NewTxEngine(env, nil)
+	te.AcceptReadWrite()
+
+	tcases := []struct {
+		receivedErr error
+		retryable   bool
+		expQuery    string
+	}{{
+		receivedErr: vterrors.New(vtrpcpb.Code_DEADLINE_EXCEEDED, "deadline exceeded"),
+		retryable:   true,
+		expQuery:    `update _vt.redo_state set state = 1, message = 'deadline exceeded' where dtid = 'aa'`,
+	}, {
+		receivedErr: vterrors.New(vtrpcpb.Code_INVALID_ARGUMENT, "invalid argument"),
+		retryable:   false,
+		expQuery:    `update _vt.redo_state set state = 0, message = 'invalid argument' where dtid = 'aa'`,
+	}, {
+		receivedErr: sqlerror.NewSQLError(sqlerror.ERLockDeadlock, sqlerror.SSLockDeadlock, "Deadlock found when trying to get lock; try restarting transaction"),
+		retryable:   false,
+		expQuery:    `update _vt.redo_state set state = 0, message = 'Deadlock found when trying to get lock; try restarting transaction (errno 1213) (sqlstate 40001)' where dtid = 'aa'`,
+	}, {
+		receivedErr: context.DeadlineExceeded,
+		retryable:   true,
+		expQuery:    `update _vt.redo_state set state = 1, message = 'context deadline exceeded' where dtid = 'aa'`,
+	}, {
+		receivedErr: context.Canceled,
+		retryable:   true,
+		expQuery:    `update _vt.redo_state set state = 1, message = 'context canceled' where dtid = 'aa'`,
+	}, {
+		receivedErr: sqlerror.NewSQLError(sqlerror.CRServerLost, sqlerror.SSUnknownSQLState, "Lost connection to MySQL server during query"),
+		retryable:   true,
+		expQuery:    `update _vt.redo_state set state = 1, message = 'Lost connection to MySQL server during query (errno 2013) (sqlstate HY000)' where dtid = 'aa'`,
+	}, {
+		receivedErr: sqlerror.NewSQLError(sqlerror.CRMalformedPacket, sqlerror.SSUnknownSQLState, "Malformed packet"),
+		retryable:   false,
+		expQuery:    `update _vt.redo_state set state = 0, message = 'Malformed packet (errno 2027) (sqlstate HY000)' where dtid = 'aa'`,
+	}, {
+		receivedErr: sqlerror.NewSQLError(sqlerror.CRServerGone, sqlerror.SSUnknownSQLState, "Server has gone away"),
+		retryable:   true,
+		expQuery:    `update _vt.redo_state set state = 1, message = 'Server has gone away (errno 2006) (sqlstate HY000)' where dtid = 'aa'`,
+	}, {
+		receivedErr: vterrors.New(vtrpcpb.Code_ABORTED, "Row count exceeded"),
+		retryable:   false,
+		expQuery:    `update _vt.redo_state set state = 0, message = 'Row count exceeded' where dtid = 'aa'`,
+	}, {
+		receivedErr: errors.New("(errno 2013) (sqlstate HY000) lost connection"),
+		retryable:   true,
+		expQuery:    `update _vt.redo_state set state = 1, message = '(errno 2013) (sqlstate HY000) lost connection' where dtid = 'aa'`,
+	}}
+
+	for _, tc := range tcases {
+		t.Run(tc.receivedErr.Error(), func(t *testing.T) {
+			if tc.expQuery != "" {
+				db.AddQuery(tc.expQuery, &sqltypes.Result{})
+			}
+			nonRetryable := te.checkErrorAndMarkFailed(context.Background(), "aa", tc.receivedErr, "")
+			require.NotEqual(t, tc.retryable, nonRetryable)
+			if !tc.retryable {
+				require.Equal(t, errPrepFailed, te.preparedPool.reserved["aa"])
+			}
+			delete(te.preparedPool.reserved, "aa")
+		})
+	}
+}
+
+func TestIsTwoPCAllowed(t *testing.T) {
+	testcases := []struct {
+		semiSyncAllowed        bool
+		tabletControllsAllowed bool
+		wantAllowed            bool
+	}{
+		{
+			semiSyncAllowed:        true,
+			tabletControllsAllowed: true,
+			wantAllowed:            true,
+		},
+		{
+			semiSyncAllowed:        false,
+			tabletControllsAllowed: true,
+			wantAllowed:            false,
+		},
+		{
+			semiSyncAllowed:        true,
+			tabletControllsAllowed: false,
+			wantAllowed:            false,
+		},
+		{
+			semiSyncAllowed:        false,
+			tabletControllsAllowed: false,
+			wantAllowed:            false,
+		},
+	}
+
+	for _, tt := range testcases {
+		t.Run(fmt.Sprintf("SemiSyncAllowed - %v, TabletControlsAllowed - %v", tt.semiSyncAllowed, tt.tabletControllsAllowed), func(t *testing.T) {
+			te := &TxEngine{
+				twopcAllowed: []bool{true, true},
+			}
+			tsv := TabletServer{
+				te: te,
+			}
+			tsv.SetTwoPCAllowed(TwoPCAllowed_SemiSync, tt.semiSyncAllowed)
+			tsv.SetTwoPCAllowed(TwoPCAllowed_TabletControls, tt.tabletControllsAllowed)
+			require.Equal(t, tt.wantAllowed, te.IsTwoPCAllowed())
+		})
+	}
 }

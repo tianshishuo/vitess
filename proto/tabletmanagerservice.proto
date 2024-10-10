@@ -45,6 +45,10 @@ service TabletManager {
   // GetPermissions asks the tablet for its permissions
   rpc GetPermissions(tabletmanagerdata.GetPermissionsRequest) returns (tabletmanagerdata.GetPermissionsResponse) {};
 
+  // GetGlobalStatusVars returns the server's global status variables asked for.
+  // An empty/nil variable name parameter slice means you want all of them.
+  rpc GetGlobalStatusVars(tabletmanagerdata.GetGlobalStatusVarsRequest) returns (tabletmanagerdata.GetGlobalStatusVarsResponse) {};
+
   //
   // Various read-write methods
   //
@@ -52,6 +56,9 @@ service TabletManager {
   rpc SetReadOnly(tabletmanagerdata.SetReadOnlyRequest) returns (tabletmanagerdata.SetReadOnlyResponse) {};
 
   rpc SetReadWrite(tabletmanagerdata.SetReadWriteRequest) returns (tabletmanagerdata.SetReadWriteResponse) {};
+
+  // ChangeTags asks the remote tablet to change its tags
+  rpc ChangeTags(tabletmanagerdata.ChangeTagsRequest) returns (tabletmanagerdata.ChangeTagsResponse) {};
 
   // ChangeType asks the remote tablet to change its type
   rpc ChangeType(tabletmanagerdata.ChangeTypeRequest) returns (tabletmanagerdata.ChangeTypeResponse) {};
@@ -66,6 +73,8 @@ service TabletManager {
 
   rpc ApplySchema(tabletmanagerdata.ApplySchemaRequest) returns (tabletmanagerdata.ApplySchemaResponse) {};
 
+  rpc ResetSequences(tabletmanagerdata.ResetSequencesRequest) returns (tabletmanagerdata.ResetSequencesResponse) {};
+
   rpc LockTables(tabletmanagerdata.LockTablesRequest) returns (tabletmanagerdata.LockTablesResponse) {};
 
   rpc UnlockTables(tabletmanagerdata.UnlockTablesRequest) returns (tabletmanagerdata.UnlockTablesResponse) {};
@@ -74,9 +83,23 @@ service TabletManager {
 
   rpc ExecuteFetchAsDba(tabletmanagerdata.ExecuteFetchAsDbaRequest) returns (tabletmanagerdata.ExecuteFetchAsDbaResponse) {};
 
+  rpc ExecuteMultiFetchAsDba(tabletmanagerdata.ExecuteMultiFetchAsDbaRequest) returns (tabletmanagerdata.ExecuteMultiFetchAsDbaResponse) {};
+
   rpc ExecuteFetchAsAllPrivs(tabletmanagerdata.ExecuteFetchAsAllPrivsRequest) returns (tabletmanagerdata.ExecuteFetchAsAllPrivsResponse) {};
 
   rpc ExecuteFetchAsApp(tabletmanagerdata.ExecuteFetchAsAppRequest) returns (tabletmanagerdata.ExecuteFetchAsAppResponse) {};
+
+  //
+  // Distributed Transaction related methods
+  //
+
+  rpc GetUnresolvedTransactions(tabletmanagerdata.GetUnresolvedTransactionsRequest) returns (tabletmanagerdata.GetUnresolvedTransactionsResponse) {};
+
+  rpc ReadTransaction(tabletmanagerdata.ReadTransactionRequest) returns (tabletmanagerdata.ReadTransactionResponse) {};
+
+  rpc ConcludeTransaction(tabletmanagerdata.ConcludeTransactionRequest) returns (tabletmanagerdata.ConcludeTransactionResponse) {};
+
+  rpc MysqlHostMetrics(tabletmanagerdata.MysqlHostMetricsRequest) returns (tabletmanagerdata.MysqlHostMetricsResponse) {};
 
   //
   // Replication related methods
@@ -85,14 +108,8 @@ service TabletManager {
   // ReplicationStatus returns the current replication status.
   rpc ReplicationStatus(tabletmanagerdata.ReplicationStatusRequest) returns (tabletmanagerdata.ReplicationStatusResponse) {};
 
-  // Deprecated, use PrimaryStatus instead
-  rpc MasterStatus(tabletmanagerdata.PrimaryStatusRequest) returns (tabletmanagerdata.PrimaryStatusResponse) {};
-
   // PrimaryStatus returns the current primary status.
   rpc PrimaryStatus(tabletmanagerdata.PrimaryStatusRequest) returns (tabletmanagerdata.PrimaryStatusResponse) {};
-
-  // Deprecated, use PrimaryPosition instead
-  rpc MasterPosition(tabletmanagerdata.PrimaryPositionRequest) returns (tabletmanagerdata.PrimaryPositionResponse) {};
 
   // PrimaryPosition returns the current primary position
   rpc PrimaryPosition(tabletmanagerdata.PrimaryPositionRequest) returns (tabletmanagerdata.PrimaryPositionResponse) {};
@@ -118,8 +135,19 @@ service TabletManager {
   rpc GetReplicas(tabletmanagerdata.GetReplicasRequest) returns (tabletmanagerdata.GetReplicasResponse) {};
 
   // VReplication API
+  rpc CreateVReplicationWorkflow(tabletmanagerdata.CreateVReplicationWorkflowRequest) returns (tabletmanagerdata.CreateVReplicationWorkflowResponse) {};
+  rpc DeleteVReplicationWorkflow(tabletmanagerdata.DeleteVReplicationWorkflowRequest) returns(tabletmanagerdata.DeleteVReplicationWorkflowResponse) {};
+  rpc HasVReplicationWorkflows(tabletmanagerdata.HasVReplicationWorkflowsRequest) returns(tabletmanagerdata.HasVReplicationWorkflowsResponse) {};
+  rpc ReadVReplicationWorkflow(tabletmanagerdata.ReadVReplicationWorkflowRequest) returns(tabletmanagerdata.ReadVReplicationWorkflowResponse) {};
+  rpc ReadVReplicationWorkflows(tabletmanagerdata.ReadVReplicationWorkflowsRequest) returns(tabletmanagerdata.ReadVReplicationWorkflowsResponse) {};
+  rpc UpdateVReplicationWorkflow(tabletmanagerdata.UpdateVReplicationWorkflowRequest) returns(tabletmanagerdata.UpdateVReplicationWorkflowResponse) {};
+  rpc UpdateVReplicationWorkflows(tabletmanagerdata.UpdateVReplicationWorkflowsRequest) returns(tabletmanagerdata.UpdateVReplicationWorkflowsResponse) {};
+  rpc ValidateVReplicationPermissions(tabletmanagerdata.ValidateVReplicationPermissionsRequest) returns(tabletmanagerdata.ValidateVReplicationPermissionsResponse) {};
   rpc VReplicationExec(tabletmanagerdata.VReplicationExecRequest) returns(tabletmanagerdata.VReplicationExecResponse) {};
   rpc VReplicationWaitForPos(tabletmanagerdata.VReplicationWaitForPosRequest) returns(tabletmanagerdata.VReplicationWaitForPosResponse) {};
+
+  // VDiff API
+  rpc VDiff(tabletmanagerdata.VDiffRequest) returns(tabletmanagerdata.VDiffResponse) {};
 
   //
   // Reparenting related functions
@@ -127,9 +155,6 @@ service TabletManager {
 
   // ResetReplication makes the target not replicating
   rpc ResetReplication(tabletmanagerdata.ResetReplicationRequest) returns (tabletmanagerdata.ResetReplicationResponse) {};
-
-  // Deprecated, use InitPrimary instead
-  rpc InitMaster(tabletmanagerdata.InitPrimaryRequest) returns (tabletmanagerdata.InitPrimaryResponse) {};
 
   // InitPrimary initializes the tablet as a primary
   rpc InitPrimary(tabletmanagerdata.InitPrimaryRequest) returns (tabletmanagerdata.InitPrimaryResponse) {};
@@ -141,14 +166,8 @@ service TabletManager {
   // InitReplica tells the tablet to reparent to the primary unconditionally
   rpc InitReplica(tabletmanagerdata.InitReplicaRequest) returns (tabletmanagerdata.InitReplicaResponse) {};
 
-  // Deprecated, see DemotePrimary instead
-  rpc DemoteMaster(tabletmanagerdata.DemotePrimaryRequest) returns (tabletmanagerdata.DemotePrimaryResponse) {};
-
   // DemotePrimary tells the soon-to-be-former primary it's gonna change
   rpc DemotePrimary(tabletmanagerdata.DemotePrimaryRequest) returns (tabletmanagerdata.DemotePrimaryResponse) {};
-
-  // Deprecated, use UndoDemotePrimary instead
-  rpc UndoDemoteMaster(tabletmanagerdata.UndoDemotePrimaryRequest) returns (tabletmanagerdata.UndoDemotePrimaryResponse) {};
 
   // UndoDemotePrimary reverts all changes made by DemotePrimary
   rpc UndoDemotePrimary(tabletmanagerdata.UndoDemotePrimaryRequest) returns (tabletmanagerdata.UndoDemotePrimaryResponse) {};
@@ -156,8 +175,11 @@ service TabletManager {
   // ReplicaWasPromoted tells the remote tablet it is now the primary
   rpc ReplicaWasPromoted(tabletmanagerdata.ReplicaWasPromotedRequest) returns (tabletmanagerdata.ReplicaWasPromotedResponse) {};
 
-  // Deprecated, use SetReplicationSource instead
-  rpc SetMaster(tabletmanagerdata.SetReplicationSourceRequest) returns (tabletmanagerdata.SetReplicationSourceResponse) {};
+  // ResetReplicationParameters resets the replica replication parameters
+  rpc ResetReplicationParameters(tabletmanagerdata.ResetReplicationParametersRequest) returns (tabletmanagerdata.ResetReplicationParametersResponse) {};
+
+  // FullStatus collects and returns the full status of MySQL including the replication information, semi-sync information, GTID information among others
+  rpc FullStatus(tabletmanagerdata.FullStatusRequest) returns (tabletmanagerdata.FullStatusResponse) {};
 
   // SetReplicationSource tells the replica to reparent
   rpc SetReplicationSource(tabletmanagerdata.SetReplicationSourceRequest) returns (tabletmanagerdata.SetReplicationSourceResponse) {};
@@ -181,6 +203,13 @@ service TabletManager {
   // RestoreFromBackup deletes all local data and restores it from the latest backup.
   rpc RestoreFromBackup(tabletmanagerdata.RestoreFromBackupRequest) returns (stream tabletmanagerdata.RestoreFromBackupResponse) {};
 
-  // Generic VExec request. Can be used for various purposes
-  rpc VExec(tabletmanagerdata.VExecRequest) returns(tabletmanagerdata.VExecResponse) {};
+  //
+  // Tablet throttler related methods
+  //
+
+  // CheckThrottler issues a 'check' on a tablet's throttler
+  rpc CheckThrottler(tabletmanagerdata.CheckThrottlerRequest) returns (tabletmanagerdata.CheckThrottlerResponse) {};
+
+  // GetThrottlerStatus gets the status of a tablet throttler
+  rpc GetThrottlerStatus(tabletmanagerdata.GetThrottlerStatusRequest) returns (tabletmanagerdata.GetThrottlerStatusResponse) {};
 }

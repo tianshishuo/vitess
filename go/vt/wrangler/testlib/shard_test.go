@@ -17,15 +17,15 @@ limitations under the License.
 package testlib
 
 import (
+	"context"
 	"strings"
 	"testing"
-
-	"context"
 
 	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
 	"vitess.io/vitess/go/vt/topotools"
+	"vitess.io/vitess/go/vt/vtenv"
 	"vitess.io/vitess/go/vt/vttablet/tmclient"
 	"vitess.io/vitess/go/vt/wrangler"
 
@@ -33,10 +33,11 @@ import (
 )
 
 func TestDeleteShardCleanup(t *testing.T) {
-	ctx := context.Background()
-	ts := memorytopo.NewServer("cell1", "cell2")
-	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
-	vp := NewVtctlPipe(t, ts)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ts := memorytopo.NewServer(ctx, "cell1", "cell2")
+	wr := wrangler.New(vtenv.NewTestEnv(), logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
+	vp := NewVtctlPipe(ctx, t, ts)
 	defer vp.Close()
 
 	// Create a primary, a couple good replicas
@@ -68,7 +69,7 @@ func TestDeleteShardCleanup(t *testing.T) {
 	// without recursive flag, should fail on existing tablets.
 	if err := vp.Run([]string{
 		"DeleteShard",
-		"-even_if_serving",
+		"--even_if_serving",
 		primary.Tablet.Keyspace + "/" + primary.Tablet.Shard,
 	}); err == nil || !strings.Contains(err.Error(), "use -recursive or remove them manually") {
 		t.Fatalf("DeleteShard(evenIfServing=true) returned wrong error: %v", err)
@@ -78,8 +79,8 @@ func TestDeleteShardCleanup(t *testing.T) {
 	// it should just work.
 	if err := vp.Run([]string{
 		"DeleteShard",
-		"-recursive",
-		"-even_if_serving",
+		"--recursive",
+		"--even_if_serving",
 		primary.Tablet.Keyspace + "/" + primary.Tablet.Shard,
 	}); err != nil {
 		t.Fatalf("DeleteShard(recursive=true, evenIfServing=true) should have worked but returned: %v", err)

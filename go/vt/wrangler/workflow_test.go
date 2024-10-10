@@ -19,17 +19,23 @@ package wrangler
 import (
 	"context"
 	"fmt"
+	"regexp"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/discovery"
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/proto/vschema"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/vtctl/workflow"
 
+	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
 )
 
@@ -44,6 +50,7 @@ func getMoveTablesWorkflow(t *testing.T, cells, tabletTypes string) *VReplicatio
 		Cells:                           cells,
 		TabletTypes:                     tabletTypes,
 		MaxAllowedTransactionLagSeconds: defaultMaxAllowedTransactionLagSeconds,
+		OnDDL:                           binlogdatapb.OnDDLAction_EXEC.String(),
 	}
 	mtwf := &VReplicationWorkflow{
 		workflowType: MoveTablesWorkflow,
@@ -69,8 +76,11 @@ func TestReshardingWorkflowErrorsAndMisc(t *testing.T) {
 	mtwf.ws.WritesSwitched = true
 	require.Errorf(t, mtwf.Cancel(), ErrWorkflowPartiallySwitched)
 
+	tabletTypes, _, err := discovery.ParseTabletTypesAndOrder(mtwf.params.TabletTypes)
+	require.NoError(t, err)
+
 	require.ElementsMatch(t, mtwf.getCellsAsArray(), []string{"cell1", "cell2"})
-	require.ElementsMatch(t, mtwf.getTabletTypes(), []topodata.TabletType{topodata.TabletType_REPLICA, topodata.TabletType_RDONLY})
+	require.ElementsMatch(t, tabletTypes, []topodata.TabletType{topodata.TabletType_REPLICA, topodata.TabletType_RDONLY})
 	hasReplica, hasRdonly, hasPrimary, err := mtwf.parseTabletTypes()
 	require.NoError(t, err)
 	require.True(t, hasReplica)
@@ -78,7 +88,9 @@ func TestReshardingWorkflowErrorsAndMisc(t *testing.T) {
 	require.False(t, hasPrimary)
 
 	mtwf.params.TabletTypes = "replica,rdonly,primary"
-	require.ElementsMatch(t, mtwf.getTabletTypes(),
+	tabletTypes, _, err = discovery.ParseTabletTypesAndOrder(mtwf.params.TabletTypes)
+	require.NoError(t, err)
+	require.ElementsMatch(t, tabletTypes,
 		[]topodata.TabletType{topodata.TabletType_REPLICA, topodata.TabletType_RDONLY, topodata.TabletType_PRIMARY})
 
 	hasReplica, hasRdonly, hasPrimary, err = mtwf.parseTabletTypes()
@@ -90,25 +102,25 @@ func TestReshardingWorkflowErrorsAndMisc(t *testing.T) {
 
 func expectCanSwitchQueries(t *testing.T, tme *testMigraterEnv, keyspace, state string, currentLag int64) {
 	now := time.Now().Unix()
-	rowTemplate := "1|||||%s|vt_%s|%d|%d|0||"
+	rowTemplate := "1|||||%s|vt_%s|%d|%d|0|0|||"
 	row := fmt.Sprintf(rowTemplate, state, keyspace, now, now-currentLag)
 	replicationResult := sqltypes.MakeTestResult(sqltypes.MakeTestFields(
-		"id|source|pos|stop_pos|max_replication_lag|state|db_name|time_updated|transaction_timestamp|time_heartbeat|message|tags",
-		"int64|varchar|int64|int64|int64|varchar|varchar|int64|int64|int64|varchar|varchar"),
+		"id|source|pos|stop_pos|max_replication_lag|state|db_name|time_updated|transaction_timestamp|time_heartbeat|time_throttled|component_throttled|message|tags",
+		"int64|varchar|int64|int64|int64|varchar|varchar|int64|int64|int64|int64|varchar|varchar|varchar"),
 		row)
-	copyStateResult := sqltypes.MakeTestResult(sqltypes.MakeTestFields(
-		"table|lastpk",
-		"varchar|varchar"),
-		"t1|pk1",
+	copyStateResult := sqltypes.MakeTestResult(
+		sqltypes.MakeTestFields("vrepl_id|table|lastpk", "int64|varchar|varchar"),
+		"1|t1|pk1",
+		"1|t2|pk2",
 	)
 
 	for _, db := range tme.dbTargetClients {
 		db.addInvariant(streamExtInfoKs2, replicationResult)
 
 		if state == "Copying" {
-			db.addInvariant(fmt.Sprintf(copyStateQuery, 1), copyStateResult)
+			db.addInvariant(fmt.Sprintf(copyStateQuery, "1", "1"), copyStateResult)
 		} else {
-			db.addInvariant(fmt.Sprintf(copyStateQuery, 1), noResult)
+			db.addInvariant(fmt.Sprintf(copyStateQuery, "1", "1"), noResult)
 		}
 	}
 }
@@ -137,13 +149,13 @@ func TestCanSwitch(t *testing.T) {
 		name                  string
 		state                 string
 		streamLag, allowedLag int64 /* seconds */
-		expectedReason        string
+		expectedReason        *regexp.Regexp
 	}
 
 	testCases := []testCase{
-		{"In Copy Phase", "Copying", 0, 0, cannotSwitchCopyIncomplete},
-		{"High Lag", "Running", 6, 5, cannotSwitchHighLag},
-		{"Acceptable Lag", "Running", 4, 5, ""},
+		{"In Copy Phase", binlogdatapb.VReplicationWorkflowState_Copying.String(), 0, 0, regexp.MustCompile(cannotSwitchCopyIncomplete)},
+		{"High Lag", binlogdatapb.VReplicationWorkflowState_Running.String(), 6, 5, regexp.MustCompile(strings.ReplaceAll(cannotSwitchHighLag, "%d", "(\\d+)"))},
+		{"Acceptable Lag", binlogdatapb.VReplicationWorkflowState_Running.String(), 4, 5, nil},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -151,11 +163,30 @@ func TestCanSwitch(t *testing.T) {
 			p.MaxAllowedTransactionLagSeconds = tc.allowedLag
 			reason, err := wf.canSwitch("ks2", workflowName)
 			require.NoError(t, err)
-			expected := ""
-			if reason != "" {
-				expected = fmt.Sprintf(tc.expectedReason, tc.streamLag, tc.allowedLag)
+
+			if tc.expectedReason != nil {
+				require.Regexp(t, tc.expectedReason, reason)
+
+				m := tc.expectedReason.FindStringSubmatch(reason)
+				switch tc.expectedReason.NumSubexp() {
+				case 0:
+					// cannotSwitchCopyIncomplete, nothing else to do
+				case 2:
+					// cannotSwitchHighLag, assert streamLag > allowedLag
+					curLag, err := strconv.ParseInt(m[1], 10, 64)
+					require.NoError(t, err, "could not parse current lag %s as int", m[1])
+
+					allowedLag, err := strconv.ParseInt(m[2], 10, 64)
+					require.NoError(t, err, "could not parse allowed lag %s as int", m[2])
+
+					require.Greater(t, curLag, allowedLag, "current lag %d should be strictly greater than allowed lag %d (from reason %q)", curLag, allowedLag, reason)
+				default:
+					// unexpected regexp, fail loudly
+					require.Fail(t, "unknown reason regexp %s -- did you add a new test case?", tc.expectedReason)
+				}
+			} else {
+				require.Empty(t, reason, "should be able to switch, but cannot because %s", reason)
 			}
-			require.Contains(t, expected, reason)
 		})
 	}
 }
@@ -201,14 +232,14 @@ func TestCopyProgress(t *testing.T) {
 
 func expectCopyProgressQueries(t *testing.T, tme *testMigraterEnv) {
 	db := tme.tmeDB
-	query := "select table_name from _vt.copy_state cs, _vt.vreplication vr where vr.id = cs.vrepl_id and vr.id = 1"
+	query := "select distinct table_name from _vt.copy_state cs, _vt.vreplication vr where vr.id = cs.vrepl_id and vr.id = 1"
 	rows := []string{"t1", "t2"}
 	result := sqltypes.MakeTestResult(sqltypes.MakeTestFields(
 		"table_name",
 		"varchar"),
 		rows...)
 	db.AddQuery(query, result)
-	query = "select table_name from _vt.copy_state cs, _vt.vreplication vr where vr.id = cs.vrepl_id and vr.id = 2"
+	query = "select distinct table_name from _vt.copy_state cs, _vt.vreplication vr where vr.id = cs.vrepl_id and vr.id = 2"
 	db.AddQuery(query, result)
 
 	query = "select table_name, table_rows, data_length from information_schema.tables where table_schema = 'vt_ks2' and table_name in ('t1','t2')"
@@ -228,7 +259,7 @@ func expectCopyProgressQueries(t *testing.T, tme *testMigraterEnv) {
 	db.AddQuery(query, result)
 
 	for _, id := range []int{1, 2} {
-		query = fmt.Sprintf("select 1 from _vt.copy_state cs, _vt.vreplication vr where vr.id = cs.vrepl_id and vr.id = %d", id)
+		query = fmt.Sprintf("select distinct 1 from _vt.copy_state cs, _vt.vreplication vr where vr.id = cs.vrepl_id and vr.id = %d", id)
 		result = sqltypes.MakeTestResult(sqltypes.MakeTestFields(
 			"dummy",
 			"int64"),
@@ -250,6 +281,7 @@ func TestMoveTablesV2(t *testing.T) {
 		TabletTypes:                     "REPLICA,RDONLY,PRIMARY",
 		Timeout:                         DefaultActionTimeout,
 		MaxAllowedTransactionLagSeconds: defaultMaxAllowedTransactionLagSeconds,
+		OnDDL:                           binlogdatapb.OnDDLAction_STOP.String(),
 	}
 	tme := newTestTableMigrater(ctx, t)
 	defer tme.stopTablets(t)
@@ -258,10 +290,189 @@ func TestMoveTablesV2(t *testing.T) {
 	require.NotNil(t, wf)
 	require.Equal(t, WorkflowStateNotSwitched, wf.CurrentState())
 	tme.expectNoPreviousJournals()
-	expectMoveTablesQueries(t, tme)
+	expectMoveTablesQueries(t, tme, p)
 	tme.expectNoPreviousJournals()
 	require.NoError(t, testSwitchForward(t, wf))
 	require.Equal(t, WorkflowStateAllSwitched, wf.CurrentState())
+
+	tme.expectNoPreviousJournals()
+	tme.expectNoPreviousReverseJournals()
+	require.NoError(t, testReverse(t, wf))
+	require.Equal(t, WorkflowStateNotSwitched, wf.CurrentState())
+}
+
+// TestPartialMoveTables ensures that shard by shard migrations work
+// as expected. This test moves tables from one sharded keyspace (ks1)
+// to another sharded keyspace (ks2), but only for the -80 shard.
+func TestPartialMoveTables(t *testing.T) {
+	ctx := context.Background()
+	shards := []string{"-80", "80-"}
+	shardsToMove := shards[0:1]
+	p := &VReplicationWorkflowParams{
+		Workflow:                        "test",
+		WorkflowType:                    MoveTablesWorkflow,
+		SourceKeyspace:                  "ks1",
+		SourceShards:                    shardsToMove, // shard by shard
+		TargetShards:                    shardsToMove, // shard by shard
+		TargetKeyspace:                  "ks2",
+		Tables:                          "t1,t2",
+		Cells:                           "cell1,cell2",
+		TabletTypes:                     "REPLICA,RDONLY,PRIMARY",
+		Timeout:                         DefaultActionTimeout,
+		MaxAllowedTransactionLagSeconds: defaultMaxAllowedTransactionLagSeconds,
+		OnDDL:                           binlogdatapb.OnDDLAction_STOP.String(),
+	}
+	tme := newTestTablePartialMigrater(ctx, t, shards, shards[0:1], "select * %s")
+	defer tme.stopTablets(t)
+
+	// Add the schema for the primary tablets, so that we don't fail while applying the denied table rules.
+	schm := &tabletmanagerdatapb.SchemaDefinition{
+		TableDefinitions: []*tabletmanagerdatapb.TableDefinition{{
+			Name: "t1",
+		}, {
+			Name: "t2",
+		}},
+	}
+	for _, primary := range append(tme.sourcePrimaries, tme.targetPrimaries...) {
+		primary.FakeMysqlDaemon.Schema = schm
+	}
+
+	// Save some unrelated shard routing rules to be sure that
+	// they don't interfere in any way.
+	srr, err := tme.ts.GetShardRoutingRules(ctx)
+	require.NoError(t, err)
+	srr.Rules = append(srr.Rules, []*vschema.ShardRoutingRule{
+		{
+			FromKeyspace: "wut",
+			Shard:        "40-80",
+			ToKeyspace:   "bloop",
+		},
+		{
+			FromKeyspace: "haylo",
+			Shard:        "-80",
+			ToKeyspace:   "blarg",
+		},
+	}...)
+	err = tme.ts.SaveShardRoutingRules(ctx, srr)
+	require.NoError(t, err)
+
+	wf, err := tme.wr.NewVReplicationWorkflow(ctx, MoveTablesWorkflow, p)
+	require.NoError(t, err)
+	require.NotNil(t, wf)
+	require.Equal(t, WorkflowStateNotSwitched, wf.CurrentState())
+	require.True(t, wf.ts.isPartialMigration, "expected partial shard migration")
+
+	// The default shard routing rule for the keyspace's other shard would
+	// normally be put in place, but the unit test does not execute the
+	// wrangler.MoveTables function which adds all of the default shard
+	// routing rules in the topo for the keyspace when the first workflow
+	// is run against it. So we simulate it here.
+	srr, err = tme.ts.GetShardRoutingRules(ctx)
+	require.NoError(t, err)
+	srr.Rules = append(srr.Rules, &vschema.ShardRoutingRule{
+		FromKeyspace: "ks2",
+		Shard:        "80-",
+		ToKeyspace:   "ks1",
+	})
+	err = tme.ts.SaveShardRoutingRules(ctx, srr)
+	require.NoError(t, err)
+
+	tme.expectNoPreviousJournals()
+	expectMoveTablesQueries(t, tme, p)
+	tme.expectNoPreviousJournals()
+	require.NoError(t, testSwitchForward(t, wf))
+	require.Equal(t, "Reads partially switched, for shards: -80. Writes partially switched, for shards: -80", wf.CurrentState())
+	require.NoError(t, err)
+
+	tme.expectNoPreviousJournals()
+	tme.expectNoPreviousReverseJournals()
+	require.NoError(t, testReverse(t, wf))
+	require.Equal(t, WorkflowStateNotSwitched, wf.CurrentState())
+}
+
+// TestPartialMoveTablesShardSubset is a version of TestPartialMoveTables which uses the --shards option.
+func TestPartialMoveTablesShardSubset(t *testing.T) {
+	ctx := context.Background()
+	shards := []string{"-40", "40-80", "80-c0", "c0-"}
+	shardsToMove := shards[0:2]
+	otherShards := shards[2:]
+	p := &VReplicationWorkflowParams{
+		Workflow:                        "test",
+		WorkflowType:                    MoveTablesWorkflow,
+		SourceKeyspace:                  "ks1",
+		SourceShards:                    shardsToMove, // shard by shard
+		TargetShards:                    shardsToMove, // shard by shard
+		TargetKeyspace:                  "ks2",
+		Tables:                          "t1,t2",
+		Cells:                           "cell1,cell2",
+		TabletTypes:                     "REPLICA,RDONLY,PRIMARY",
+		Timeout:                         DefaultActionTimeout,
+		MaxAllowedTransactionLagSeconds: defaultMaxAllowedTransactionLagSeconds,
+		OnDDL:                           binlogdatapb.OnDDLAction_STOP.String(),
+	}
+	tme := newTestTablePartialMigrater(ctx, t, shards, shardsToMove, "select * %s")
+	defer tme.stopTablets(t)
+	// Add the schema for the primary tablets, so that we don't fail while applying the denied table rules.
+	schm := &tabletmanagerdatapb.SchemaDefinition{
+		TableDefinitions: []*tabletmanagerdatapb.TableDefinition{{
+			Name: "t1",
+		}, {
+			Name: "t2",
+		}},
+	}
+	for _, primary := range append(tme.sourcePrimaries, tme.targetPrimaries...) {
+		primary.FakeMysqlDaemon.Schema = schm
+	}
+
+	// Save some unrelated shard routing rules to be sure that
+	// they don't interfere in any way.
+	srr, err := tme.ts.GetShardRoutingRules(ctx)
+	require.NoError(t, err)
+	srr.Rules = append(srr.Rules, []*vschema.ShardRoutingRule{
+		{
+			FromKeyspace: "wut",
+			Shard:        "40-80",
+			ToKeyspace:   "bloop",
+		},
+		{
+			FromKeyspace: "haylo",
+			Shard:        "-80",
+			ToKeyspace:   "blarg",
+		},
+	}...)
+	err = tme.ts.SaveShardRoutingRules(ctx, srr)
+	require.NoError(t, err)
+
+	// Providing an incorrect shard should result in the workflow not being found.
+	p.ShardSubset = otherShards
+	wf, err := tme.wr.NewVReplicationWorkflow(ctx, MoveTablesWorkflow, p)
+	require.NoError(t, err)
+	require.Nil(t, wf.ts)
+
+	p.ShardSubset = shardsToMove
+	wf, err = tme.wr.NewVReplicationWorkflow(ctx, MoveTablesWorkflow, p)
+	require.NoError(t, err)
+	require.NotNil(t, wf)
+	require.Equal(t, WorkflowStateNotSwitched, wf.CurrentState())
+	require.True(t, wf.ts.isPartialMigration, "expected partial shard migration")
+
+	srr, err = tme.ts.GetShardRoutingRules(ctx)
+	require.NoError(t, err)
+	srr.Rules = append(srr.Rules, &vschema.ShardRoutingRule{
+		FromKeyspace: "ks2",
+		Shard:        "80-",
+		ToKeyspace:   "ks1",
+	})
+	err = tme.ts.SaveShardRoutingRules(ctx, srr)
+	require.NoError(t, err)
+
+	tme.expectNoPreviousJournals()
+	expectMoveTablesQueries(t, tme, p)
+	tme.expectNoPreviousJournals()
+	wf.params.ShardSubset = shardsToMove
+	require.NoError(t, testSwitchForward(t, wf))
+	require.Equal(t, "Reads partially switched, for shards: -40,40-80. Writes partially switched, for shards: -40,40-80", wf.CurrentState())
+	require.NoError(t, err)
 
 	tme.expectNoPreviousJournals()
 	tme.expectNoPreviousReverseJournals()
@@ -304,7 +515,7 @@ func TestMoveTablesV2Complete(t *testing.T) {
 	require.NotNil(t, wf)
 	require.Equal(t, WorkflowStateNotSwitched, wf.CurrentState())
 	tme.expectNoPreviousJournals()
-	expectMoveTablesQueries(t, tme)
+	expectMoveTablesQueries(t, tme, p)
 	tme.expectNoPreviousJournals()
 	require.NoError(t, testSwitchForward(t, wf))
 	require.Equal(t, WorkflowStateAllSwitched, wf.CurrentState())
@@ -334,7 +545,7 @@ func testReverse(t *testing.T, wf *VReplicationWorkflow) error {
 	return err
 }
 
-func TestMoveTablesV2Partial(t *testing.T) {
+func TestMoveTablesV2SwitchTraffic(t *testing.T) {
 	ctx := context.Background()
 	p := &VReplicationWorkflowParams{
 		Workflow:                        "test",
@@ -353,7 +564,7 @@ func TestMoveTablesV2Partial(t *testing.T) {
 	require.NotNil(t, wf)
 	require.Equal(t, WorkflowStateNotSwitched, wf.CurrentState())
 	tme.expectNoPreviousJournals()
-	expectMoveTablesQueries(t, tme)
+	expectMoveTablesQueries(t, tme, p)
 
 	tme.expectNoPreviousJournals()
 	wf.params.TabletTypes = "RDONLY"
@@ -405,12 +616,12 @@ func TestMoveTablesV2Cancel(t *testing.T) {
 	}
 	tme := newTestTableMigrater(ctx, t)
 	defer tme.stopTablets(t)
-	expectMoveTablesQueries(t, tme)
+	expectMoveTablesQueries(t, tme, p)
 	wf, err := tme.wr.NewVReplicationWorkflow(ctx, MoveTablesWorkflow, p)
 	require.NoError(t, err)
 	require.NotNil(t, wf)
 	require.Equal(t, WorkflowStateNotSwitched, wf.CurrentState())
-	expectMoveTablesQueries(t, tme)
+	expectMoveTablesQueries(t, tme, p)
 	validateRoutingRuleCount(ctx, t, wf.wr.ts, 4) // rules set up by test env
 
 	require.True(t, checkIfTableExistInVSchema(ctx, t, wf.wr.ts, "ks1", "t1"))
@@ -424,8 +635,20 @@ func TestMoveTablesV2Cancel(t *testing.T) {
 
 	require.True(t, checkIfTableExistInVSchema(ctx, t, wf.wr.ts, "ks1", "t1"))
 	require.True(t, checkIfTableExistInVSchema(ctx, t, wf.wr.ts, "ks1", "t2"))
-	require.False(t, checkIfTableExistInVSchema(ctx, t, wf.wr.ts, "ks2", "t1"))
-	require.False(t, checkIfTableExistInVSchema(ctx, t, wf.wr.ts, "ks2", "t2"))
+
+	// Should target vschema table entries be deleted upon Cancel. For unsharded
+	// keyspaces they should be as they are empty table entries that we also
+	// create when the workflow is Created.
+	targetVSchemaEntriesRemain := false
+	if len(tme.targetShards) > 1 {
+		// If the target keyspace is sharded -- which it is today in the test -- the
+		// vschema must be created by the user before the workflow is started. Thus
+		// we should also not delete the vschema table entries upon Cancel as the
+		// management of the sharded vschema is up to the user.
+		targetVSchemaEntriesRemain = true
+	}
+	require.Equal(t, targetVSchemaEntriesRemain, checkIfTableExistInVSchema(ctx, t, wf.wr.ts, "ks2", "t1"))
+	require.Equal(t, targetVSchemaEntriesRemain, checkIfTableExistInVSchema(ctx, t, wf.wr.ts, "ks2", "t2"))
 }
 
 func TestReshardV2(t *testing.T) {
@@ -442,6 +665,7 @@ func TestReshardV2(t *testing.T) {
 		TabletTypes:                     "replica,rdonly,primary",
 		Timeout:                         DefaultActionTimeout,
 		MaxAllowedTransactionLagSeconds: defaultMaxAllowedTransactionLagSeconds,
+		OnDDL:                           binlogdatapb.OnDDLAction_EXEC_IGNORE.String(),
 	}
 	tme := newTestShardMigrater(ctx, t, sourceShards, targetShards)
 	defer tme.stopTablets(t)
@@ -450,7 +674,7 @@ func TestReshardV2(t *testing.T) {
 	require.NotNil(t, wf)
 	require.Equal(t, WorkflowStateNotSwitched, wf.CurrentState())
 	tme.expectNoPreviousJournals()
-	expectReshardQueries(t, tme)
+	expectReshardQueries(t, tme, p)
 	tme.expectNoPreviousJournals()
 	require.NoError(t, testSwitchForward(t, wf))
 	require.Equal(t, WorkflowStateAllSwitched, wf.CurrentState())
@@ -522,15 +746,23 @@ func TestReshardV2Cancel(t *testing.T) {
 	require.NotNil(t, wf)
 	require.Equal(t, WorkflowStateNotSwitched, wf.CurrentState())
 	tme.expectNoPreviousJournals()
-	expectReshardQueries(t, tme)
+	expectReshardQueries(t, tme, p)
 	require.NoError(t, wf.Cancel())
 }
 
-func expectReshardQueries(t *testing.T, tme *testShardMigraterEnv) {
+func expectReshardQueries(t *testing.T, tme *testShardMigraterEnv, params *VReplicationWorkflowParams) {
+	vdiffDeleteQuery := fmt.Sprintf(`delete from vd, vdt, vdl using _vt.vdiff as vd inner join _vt.vdiff_table as vdt on (vd.id = vdt.vdiff_id)
+						inner join _vt.vdiff_log as vdl on (vd.id = vdl.vdiff_id)
+						where vd.keyspace = '%s' and vd.workflow = '%s'`,
+		params.TargetKeyspace, params.Workflow)
+	vdiffDeleteReverseQuery := fmt.Sprintf(`delete from vd, vdt, vdl using _vt.vdiff as vd inner join _vt.vdiff_table as vdt on (vd.id = vdt.vdiff_id)
+						inner join _vt.vdiff_log as vdl on (vd.id = vdl.vdiff_id)
+						where vd.keyspace = '%s' and vd.workflow = '%s_reverse'`,
+		params.SourceKeyspace, params.Workflow)
 
 	sourceQueries := []string{
-		"select id, workflow, source, pos from _vt.vreplication where db_name='vt_ks' and workflow != 'test_reverse' and state = 'Stopped' and message != 'FROZEN'",
-		"select id, workflow, source, pos from _vt.vreplication where db_name='vt_ks' and workflow != 'test_reverse'",
+		"select id, workflow, source, pos, workflow_type, workflow_sub_type, defer_secondary_keys from _vt.vreplication where db_name='vt_ks' and workflow != 'test_reverse' and state = 'Stopped' and message != 'FROZEN'",
+		"select id, workflow, source, pos, workflow_type, workflow_sub_type, defer_secondary_keys from _vt.vreplication where db_name='vt_ks' and workflow != 'test_reverse'",
 	}
 	noResult := &sqltypes.Result{}
 	for _, dbclient := range tme.dbSourceClients {
@@ -540,16 +772,18 @@ func expectReshardQueries(t *testing.T, tme *testShardMigraterEnv) {
 		dbclient.addInvariant("select id from _vt.vreplication where db_name = 'vt_ks' and workflow = 'test_reverse'", resultid1)
 		dbclient.addInvariant("delete from _vt.vreplication where id in (1)", noResult)
 		dbclient.addInvariant("delete from _vt.copy_state where vrepl_id in (1)", noResult)
-		dbclient.addInvariant("insert into _vt.vreplication (workflow, source, pos, max_tps, max_replication_lag, time_updated, transaction_timestamp, state, db_name)", &sqltypes.Result{InsertID: uint64(1)})
+		dbclient.addInvariant("delete from _vt.post_copy_action where vrepl_id in (1)", noResult)
+		dbclient.addInvariant("insert into _vt.vreplication (workflow, source, pos, max_tps, max_replication_lag, time_updated, transaction_timestamp, state, db_name, workflow_type, workflow_sub_type, options)", &sqltypes.Result{InsertID: uint64(1)})
 		dbclient.addInvariant("select id from _vt.vreplication where id = 1", resultid1)
 		dbclient.addInvariant("select id from _vt.vreplication where id = 2", resultid2)
 		dbclient.addInvariant("select * from _vt.vreplication where id = 1", runningResult(1))
 		dbclient.addInvariant("select * from _vt.vreplication where id = 2", runningResult(2))
 		dbclient.addInvariant("insert into _vt.resharding_journal", noResult)
+		dbclient.addInvariant("alter table _vt.copy_state auto_increment = 1", noResult)
 	}
 
 	targetQueries := []string{
-		"select id, workflow, source, pos from _vt.vreplication where db_name='vt_ks' and workflow != 'test_reverse' and state = 'Stopped' and message != 'FROZEN'",
+		"select id, workflow, source, pos, workflow_type, workflow_sub_type, defer_secondary_keys from _vt.vreplication where db_name='vt_ks' and workflow != 'test_reverse' and state = 'Stopped' and message != 'FROZEN'",
 	}
 
 	for _, dbclient := range tme.dbTargetClients {
@@ -572,13 +806,27 @@ func expectReshardQueries(t *testing.T, tme *testShardMigraterEnv) {
 		dbclient.addInvariant("update _vt.vreplication set message = 'FROZEN'", noResult)
 		dbclient.addInvariant("delete from _vt.vreplication where id in (1)", noResult)
 		dbclient.addInvariant("delete from _vt.copy_state where vrepl_id in (1)", noResult)
+		dbclient.addInvariant("delete from _vt.post_copy_action where vrepl_id in (1)", noResult)
 	}
-	tme.tmeDB.AddQuery("select 1 from _vt.copy_state cs, _vt.vreplication vr where vr.id = cs.vrepl_id and vr.id = 1", noResult)
-	tme.tmeDB.AddQuery("select 1 from _vt.copy_state cs, _vt.vreplication vr where vr.id = cs.vrepl_id and vr.id = 2", noResult)
-
+	tme.tmeDB.AddQuery("USE `vt_ks`", noResult)
+	tme.tmeDB.AddQuery("select distinct table_name from _vt.copy_state cs, _vt.vreplication vr where vr.id = cs.vrepl_id and vr.id = 1", noResult)
+	tme.tmeDB.AddQuery("select distinct table_name from _vt.copy_state cs, _vt.vreplication vr where vr.id = cs.vrepl_id and vr.id = 2", noResult)
+	tme.tmeDB.AddQuery(vdiffDeleteQuery, noResult)
+	tme.tmeDB.AddQuery(vdiffDeleteReverseQuery, noResult)
+	tme.tmeDB.AddQuery("alter table _vt.copy_state auto_increment = 1", noResult)
+	tme.tmeDB.AddQuery("optimize table _vt.copy_state", noResult)
 }
 
-func expectMoveTablesQueries(t *testing.T, tme *testMigraterEnv) {
+func expectMoveTablesQueries(t *testing.T, tme *testMigraterEnv, params *VReplicationWorkflowParams) {
+	vdiffDeleteQuery := fmt.Sprintf(`delete from vd, vdt, vdl using _vt.vdiff as vd inner join _vt.vdiff_table as vdt on (vd.id = vdt.vdiff_id)
+	inner join _vt.vdiff_log as vdl on (vd.id = vdl.vdiff_id)
+	where vd.keyspace = '%s' and vd.workflow = '%s'`,
+		params.TargetKeyspace, params.Workflow)
+	vdiffDeleteReverseQuery := fmt.Sprintf(`delete from vd, vdt, vdl using _vt.vdiff as vd inner join _vt.vdiff_table as vdt on (vd.id = vdt.vdiff_id)
+	inner join _vt.vdiff_log as vdl on (vd.id = vdl.vdiff_id)
+	where vd.keyspace = '%s' and vd.workflow = '%s_reverse'`,
+		params.SourceKeyspace, params.Workflow)
+
 	var query string
 	noResult := &sqltypes.Result{}
 	for _, dbclient := range tme.dbTargetClients {
@@ -593,11 +841,12 @@ func expectMoveTablesQueries(t *testing.T, tme *testMigraterEnv) {
 		dbclient.addInvariant("select id from _vt.vreplication where id = 2", resultid2)
 		dbclient.addInvariant("update _vt.vreplication set state = 'Stopped', message = 'stopped for cutover' where id in (1)", noResult)
 		dbclient.addInvariant("update _vt.vreplication set state = 'Stopped', message = 'stopped for cutover' where id in (2)", noResult)
-		dbclient.addInvariant("insert into _vt.vreplication (workflow, source, pos, max_tps, max_replication_lag, time_updated, transaction_timestamp, state, db_name)", &sqltypes.Result{InsertID: uint64(1)})
+		dbclient.addInvariant("insert into _vt.vreplication (workflow, source, pos, max_tps, max_replication_lag, time_updated, transaction_timestamp, state, db_name, workflow_type, workflow_sub_type, options)", &sqltypes.Result{InsertID: uint64(1)})
 		dbclient.addInvariant("update _vt.vreplication set message = 'FROZEN'", noResult)
 		dbclient.addInvariant("select 1 from _vt.vreplication where db_name='vt_ks2' and workflow='test' and message!='FROZEN'", noResult)
 		dbclient.addInvariant("delete from _vt.vreplication where id in (1)", noResult)
 		dbclient.addInvariant("delete from _vt.copy_state where vrepl_id in (1)", noResult)
+		dbclient.addInvariant("delete from _vt.post_copy_action where vrepl_id in (1)", noResult)
 		dbclient.addInvariant("insert into _vt.resharding_journal", noResult)
 		dbclient.addInvariant("select val from _vt.resharding_journal", noResult)
 		dbclient.addInvariant("select id, source, message, cell, tablet_types from _vt.vreplication where workflow='test_reverse' and db_name='vt_ks1'",
@@ -611,7 +860,7 @@ func expectMoveTablesQueries(t *testing.T, tme *testMigraterEnv) {
 	for _, dbclient := range tme.dbSourceClients {
 		dbclient.addInvariant("select val from _vt.resharding_journal", noResult)
 		dbclient.addInvariant("update _vt.vreplication set message = 'FROZEN'", noResult)
-		dbclient.addInvariant("insert into _vt.vreplication (workflow, source, pos, max_tps, max_replication_lag, time_updated, transaction_timestamp, state, db_name)", &sqltypes.Result{InsertID: uint64(1)})
+		dbclient.addInvariant("insert into _vt.vreplication (workflow, source, pos, max_tps, max_replication_lag, time_updated, transaction_timestamp, state, db_name, workflow_type, workflow_sub_type, options)", &sqltypes.Result{InsertID: uint64(1)})
 		dbclient.addInvariant("update _vt.vreplication set state = 'Stopped', message = 'stopped for cutover' where id in (1)", noResult)
 		dbclient.addInvariant("update _vt.vreplication set state = 'Stopped', message = 'stopped for cutover' where id in (2)", noResult)
 		dbclient.addInvariant("select id from _vt.vreplication where id = 1", resultid1)
@@ -619,7 +868,8 @@ func expectMoveTablesQueries(t *testing.T, tme *testMigraterEnv) {
 		dbclient.addInvariant("select id from _vt.vreplication where db_name = 'vt_ks1' and workflow = 'test_reverse'", resultid1)
 		dbclient.addInvariant("delete from _vt.vreplication where id in (1)", noResult)
 		dbclient.addInvariant("delete from _vt.copy_state where vrepl_id in (1)", noResult)
-		dbclient.addInvariant("insert into _vt.vreplication (workflow, source, pos, max_tps, max_replication_lag, time_updated, transaction_timestamp, state, db_name)", &sqltypes.Result{InsertID: uint64(1)})
+		dbclient.addInvariant("delete from _vt.post_copy_action where vrepl_id in (1)", noResult)
+		dbclient.addInvariant("insert into _vt.vreplication (workflow, source, pos, max_tps, max_replication_lag, time_updated, transaction_timestamp, state, db_name, workflow_type, workflow_sub_type, options)", &sqltypes.Result{InsertID: uint64(1)})
 		dbclient.addInvariant("select * from _vt.vreplication where id = 1", runningResult(1))
 		dbclient.addInvariant("select * from _vt.vreplication where id = 2", runningResult(2))
 		dbclient.addInvariant("insert into _vt.resharding_journal", noResult)
@@ -644,13 +894,20 @@ func expectMoveTablesQueries(t *testing.T, tme *testMigraterEnv) {
 	tme.dbSourceClients[0].addInvariant("select pos, state, message from _vt.vreplication where id=2", state)
 	tme.dbSourceClients[1].addInvariant("select pos, state, message from _vt.vreplication where id=1", state)
 	tme.dbSourceClients[1].addInvariant("select pos, state, message from _vt.vreplication where id=2", state)
+	tme.tmeDB.AddQuery("SET SESSION foreign_key_checks = OFF", &sqltypes.Result{})
+	tme.tmeDB.AddQuery("USE `vt_ks1`", noResult)
+	tme.tmeDB.AddQuery("USE `vt_ks2`", noResult)
 	tme.tmeDB.AddQuery("drop table `vt_ks1`.`t1`", noResult)
 	tme.tmeDB.AddQuery("drop table `vt_ks1`.`t2`", noResult)
 	tme.tmeDB.AddQuery("drop table `vt_ks2`.`t1`", noResult)
 	tme.tmeDB.AddQuery("drop table `vt_ks2`.`t2`", noResult)
+	tme.tmeDB.AddQuery("SET SESSION foreign_key_checks = ON", &sqltypes.Result{})
 	tme.tmeDB.AddQuery("update _vt.vreplication set message='Picked source tablet: cell:\"cell1\" uid:10 ' where id=1", noResult)
 	tme.tmeDB.AddQuery("lock tables `t1` read,`t2` read", &sqltypes.Result{})
-	tme.tmeDB.AddQuery("select 1 from _vt.copy_state cs, _vt.vreplication vr where vr.id = cs.vrepl_id and vr.id = 1", noResult)
-	tme.tmeDB.AddQuery("select 1 from _vt.copy_state cs, _vt.vreplication vr where vr.id = cs.vrepl_id and vr.id = 2", noResult)
-
+	tme.tmeDB.AddQuery("select distinct table_name from _vt.copy_state cs, _vt.vreplication vr where vr.id = cs.vrepl_id and vr.id = 1", noResult)
+	tme.tmeDB.AddQuery("select distinct table_name from _vt.copy_state cs, _vt.vreplication vr where vr.id = cs.vrepl_id and vr.id = 2", noResult)
+	tme.tmeDB.AddQuery(vdiffDeleteQuery, noResult)
+	tme.tmeDB.AddQuery(vdiffDeleteReverseQuery, noResult)
+	tme.tmeDB.AddQuery("alter table _vt.copy_state auto_increment = 1", noResult)
+	tme.tmeDB.AddQuery("optimize table _vt.copy_state", noResult)
 }

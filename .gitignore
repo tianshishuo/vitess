@@ -4,6 +4,9 @@
 # For mac users
 .DS_Store
 
+# For direnv users
+.envrc
+
 # Produced by yacc
 *.output
 
@@ -26,6 +29,7 @@ tags
 
 # vscode
 .vscode/
+__debug_bin
 
 # C build dirs
 **/build
@@ -52,6 +56,8 @@ tags
 /php/composer.phar
 /php/vendor
 
+report*.xml
+
 # vitess.io preview site
 /preview-vitess.io/
 
@@ -66,12 +72,7 @@ _test/
 /vendor/*/
 
 # release folder
-releases
-
-# Angular2 Bower Libs
-/web/vtctld2/.bowerrc~
-/web/vtctld2/bower.json~
-/web/vtctld2/public/bower_components/
+/releases/
 
 # Local examples
 /examples/local/vtdataroot
@@ -84,3 +85,11 @@ venv
 
 .scannerwork
 report
+
+# plan test output
+/go/vt/vtgate/planbuilder/testdata/plan_test*
+/go/vt/vtgate/planbuilder/testdata/expected
+
+# mise files
+.mise.toml
+/errors/

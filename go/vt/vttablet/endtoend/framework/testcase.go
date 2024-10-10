@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"time"
 
 	"vitess.io/vitess/go/vt/vterrors"
 
@@ -85,10 +86,10 @@ type TestCase struct {
 	Result [][]string
 
 	// RowsAffected affected can be nil or an int.
-	RowsAffected interface{}
+	RowsAffected any
 
 	// 	RowsReturned affected can be nil or an int.
-	RowsReturned interface{}
+	RowsReturned any
 
 	// Rewritten specifies how the query should have be rewritten.
 	Rewritten []string
@@ -101,10 +102,10 @@ type TestCase struct {
 	// cache stats for that table. If the stat values are nil, then
 	// the check is skipped.
 	Table         string
-	Hits          interface{}
-	Misses        interface{}
-	Absent        interface{}
-	Invalidations interface{}
+	Hits          any
+	Misses        any
+	Absent        any
+	Invalidations any
 }
 
 // Benchmark executes the test case and discards the results without verifying them
@@ -122,7 +123,7 @@ func (tc *TestCase) Test(name string, client *QueryClient) error {
 	}
 
 	// wait for all previous test cases to have been settled in cache
-	client.server.QueryPlanCacheWait()
+	time.Sleep(100 * time.Millisecond)
 
 	catcher := NewQueryCatcher()
 	defer catcher.Close()

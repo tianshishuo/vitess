@@ -17,8 +17,12 @@ limitations under the License.
 package engine
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"vitess.io/vitess/go/sqltypes"
 	querypb "vitess.io/vitess/go/vt/proto/query"
@@ -31,7 +35,7 @@ type Join struct {
 	Opcode JoinOpcode
 	// Left and Right are the LHS and RHS primitives
 	// of the Join. They can be any primitive.
-	Left, Right Primitive `json:",omitempty"`
+	Left, Right Primitive
 
 	// Cols defines which columns from the left
 	// or right results should be used to build the
@@ -40,27 +44,27 @@ type Join struct {
 	// For the right query, they're 1, 2, etc.
 	// If Cols is {-1, -2, 1, 2}, it means that
 	// the returned result will be {Left0, Left1, Right0, Right1}.
-	Cols []int `json:",omitempty"`
+	Cols []int
 
 	// Vars defines the list of joinVars that need to
 	// be built from the LHS result before invoking
 	// the RHS subqquery.
-	Vars map[string]int `json:",omitempty"`
+	Vars map[string]int
 }
 
 // TryExecute performs a non-streaming exec.
-func (jn *Join) TryExecute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
+func (jn *Join) TryExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
 	joinVars := make(map[string]*querypb.BindVariable)
-	lresult, err := vcursor.ExecutePrimitive(jn.Left, bindVars, wantfields)
+	lresult, err := vcursor.ExecutePrimitive(ctx, jn.Left, bindVars, wantfields)
 	if err != nil {
 		return nil, err
 	}
 	result := &sqltypes.Result{}
 	if len(lresult.Rows) == 0 && wantfields {
-		for k := range jn.Vars {
-			joinVars[k] = sqltypes.NullBindVariable
+		for k, col := range jn.Vars {
+			joinVars[k] = bindvarForType(lresult.Fields[col])
 		}
-		rresult, err := jn.Right.GetFields(vcursor, combineVars(bindVars, joinVars))
+		rresult, err := jn.Right.GetFields(ctx, vcursor, combineVars(bindVars, joinVars))
 		if err != nil {
 			return nil, err
 		}
@@ -71,7 +75,7 @@ func (jn *Join) TryExecute(vcursor VCursor, bindVars map[string]*querypb.BindVar
 		for k, col := range jn.Vars {
 			joinVars[k] = sqltypes.ValueBindVariable(lrow[col])
 		}
-		rresult, err := vcursor.ExecutePrimitive(jn.Right, combineVars(bindVars, joinVars), wantfields)
+		rresult, err := vcursor.ExecutePrimitive(ctx, jn.Right, combineVars(bindVars, joinVars), wantfields)
 		if err != nil {
 			return nil, err
 		}
@@ -92,36 +96,68 @@ func (jn *Join) TryExecute(vcursor VCursor, bindVars map[string]*querypb.BindVar
 	return result, nil
 }
 
+func bindvarForType(field *querypb.Field) *querypb.BindVariable {
+	bv := &querypb.BindVariable{
+		Type:  field.Type,
+		Value: nil,
+	}
+	switch field.Type {
+	case querypb.Type_INT8, querypb.Type_UINT8, querypb.Type_INT16, querypb.Type_UINT16,
+		querypb.Type_INT32, querypb.Type_UINT32, querypb.Type_INT64, querypb.Type_UINT64:
+		bv.Value = []byte("0")
+	case querypb.Type_FLOAT32, querypb.Type_FLOAT64:
+		bv.Value = []byte("0e0")
+	case querypb.Type_DECIMAL:
+		size := max(1, int(field.ColumnLength-field.Decimals))
+		scale := max(1, int(field.Decimals))
+		bv.Value = append(append(bytes.Repeat([]byte{'0'}, size), byte('.')), bytes.Repeat([]byte{'0'}, scale)...)
+	default:
+		return sqltypes.NullBindVariable
+	}
+	return bv
+}
+
 // TryStreamExecute performs a streaming exec.
-func (jn *Join) TryStreamExecute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
-	joinVars := make(map[string]*querypb.BindVariable)
-	err := vcursor.StreamExecutePrimitive(jn.Left, bindVars, wantfields, func(lresult *sqltypes.Result) error {
+func (jn *Join) TryStreamExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
+	var mu sync.Mutex
+	// We need to use this atomic since we're also reading this
+	// value outside of it being locked with the mu lock.
+	// This is still racy, but worst case it means that we may
+	// retrieve the right hand side fields twice instead of once.
+	var fieldsSent atomic.Bool
+	fieldsSent.Store(!wantfields)
+	err := vcursor.StreamExecutePrimitive(ctx, jn.Left, bindVars, wantfields, func(lresult *sqltypes.Result) error {
+		joinVars := make(map[string]*querypb.BindVariable)
 		for _, lrow := range lresult.Rows {
 			for k, col := range jn.Vars {
 				joinVars[k] = sqltypes.ValueBindVariable(lrow[col])
 			}
-			rowSent := false
-			err := vcursor.StreamExecutePrimitive(jn.Right, combineVars(bindVars, joinVars), wantfields, func(rresult *sqltypes.Result) error {
+			var rowSent atomic.Bool
+			err := vcursor.StreamExecutePrimitive(ctx, jn.Right, combineVars(bindVars, joinVars), !fieldsSent.Load(), func(rresult *sqltypes.Result) error {
+				// This needs to be locking since it's not safe to just use
+				// fieldsSent. This is because we can't have a race between
+				// checking fieldsSent and then actually calling the callback
+				// and in parallel another goroutine doing the same. That
+				// can lead to out of order execution of the callback. So the callback
+				// itself and the check need to be covered by the same lock.
+				mu.Lock()
+				defer mu.Unlock()
 				result := &sqltypes.Result{}
-				if wantfields {
-					// This code is currently unreachable because the first result
-					// will always be just the field info, which will cause the outer
-					// wantfields code path to be executed. But this may change in the future.
-					wantfields = false
+				if fieldsSent.CompareAndSwap(false, true) {
 					result.Fields = joinFields(lresult.Fields, rresult.Fields, jn.Cols)
 				}
 				for _, rrow := range rresult.Rows {
 					result.Rows = append(result.Rows, joinRows(lrow, rrow, jn.Cols))
 				}
 				if len(rresult.Rows) != 0 {
-					rowSent = true
+					rowSent.Store(true)
 				}
 				return callback(result)
 			})
 			if err != nil {
 				return err
 			}
-			if jn.Opcode == LeftJoin && !rowSent {
+			if jn.Opcode == LeftJoin && !rowSent.Load() {
 				result := &sqltypes.Result{}
 				result.Rows = [][]sqltypes.Value{joinRows(
 					lrow,
@@ -131,13 +167,20 @@ func (jn *Join) TryStreamExecute(vcursor VCursor, bindVars map[string]*querypb.B
 				return callback(result)
 			}
 		}
-		if wantfields {
-			wantfields = false
+		// This needs to be locking since it's not safe to just use
+		// fieldsSent. This is because we can't have a race between
+		// checking fieldsSent and then actually calling the callback
+		// and in parallel another goroutine doing the same. That
+		// can lead to out of order execution of the callback. So the callback
+		// itself and the check need to be covered by the same lock.
+		mu.Lock()
+		defer mu.Unlock()
+		if fieldsSent.CompareAndSwap(false, true) {
 			for k := range jn.Vars {
 				joinVars[k] = sqltypes.NullBindVariable
 			}
 			result := &sqltypes.Result{}
-			rresult, err := jn.Right.GetFields(vcursor, combineVars(bindVars, joinVars))
+			rresult, err := jn.Right.GetFields(ctx, vcursor, combineVars(bindVars, joinVars))
 			if err != nil {
 				return err
 			}
@@ -150,9 +193,9 @@ func (jn *Join) TryStreamExecute(vcursor VCursor, bindVars map[string]*querypb.B
 }
 
 // GetFields fetches the field info.
-func (jn *Join) GetFields(vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
+func (jn *Join) GetFields(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
 	joinVars := make(map[string]*querypb.BindVariable)
-	lresult, err := jn.Left.GetFields(vcursor, bindVars)
+	lresult, err := jn.Left.GetFields(ctx, vcursor, bindVars)
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +203,7 @@ func (jn *Join) GetFields(vcursor VCursor, bindVars map[string]*querypb.BindVari
 	for k := range jn.Vars {
 		joinVars[k] = sqltypes.NullBindVariable
 	}
-	rresult, err := jn.Right.GetFields(vcursor, combineVars(bindVars, joinVars))
+	rresult, err := jn.Right.GetFields(ctx, vcursor, combineVars(bindVars, joinVars))
 	if err != nil {
 		return nil, err
 	}
@@ -169,8 +212,8 @@ func (jn *Join) GetFields(vcursor VCursor, bindVars map[string]*querypb.BindVari
 }
 
 // Inputs returns the input primitives for this join
-func (jn *Join) Inputs() []Primitive {
-	return []Primitive{jn.Left, jn.Right}
+func (jn *Join) Inputs() ([]Primitive, []map[string]any) {
+	return []Primitive{jn.Left, jn.Right}, nil
 }
 
 func joinFields(lfields, rfields []*querypb.Field, cols []int) []*querypb.Field {
@@ -185,7 +228,7 @@ func joinFields(lfields, rfields []*querypb.Field, cols []int) []*querypb.Field 
 	return fields
 }
 
-func joinRows(lrow, rrow []sqltypes.Value, cols []int) []sqltypes.Value {
+func joinRows(lrow, rrow sqltypes.Row, cols []int) sqltypes.Row {
 	row := make([]sqltypes.Value, len(cols))
 	for i, index := range cols {
 		if index < 0 {
@@ -258,9 +301,9 @@ func combineVars(bv1, bv2 map[string]*querypb.BindVariable) map[string]*querypb.
 }
 
 func (jn *Join) description() PrimitiveDescription {
-	other := map[string]interface{}{
+	other := map[string]any{
 		"TableName":         jn.GetTableName(),
-		"JoinColumnIndexes": strings.Trim(strings.Join(strings.Fields(fmt.Sprint(jn.Cols)), ","), "[]"),
+		"JoinColumnIndexes": jn.joinColsDescription(),
 	}
 	if len(jn.Vars) > 0 {
 		other["JoinVars"] = orderedStringIntMap(jn.Vars)
@@ -270,4 +313,17 @@ func (jn *Join) description() PrimitiveDescription {
 		Variant:      jn.Opcode.String(),
 		Other:        other,
 	}
+}
+
+func (jn *Join) joinColsDescription() string {
+	var joinCols []string
+	for _, col := range jn.Cols {
+		if col < 0 {
+			joinCols = append(joinCols, fmt.Sprintf("L:%d", -col-1))
+		} else {
+			joinCols = append(joinCols, fmt.Sprintf("R:%d", col-1))
+		}
+	}
+	joinColTxt := strings.Join(joinCols, ",")
+	return joinColTxt
 }

@@ -17,11 +17,24 @@ limitations under the License.
 package throttler
 
 import (
+	"context"
 	"runtime"
-	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
+
+	"vitess.io/vitess/go/vt/discovery"
+	"vitess.io/vitess/go/vt/proto/query"
+	"vitess.io/vitess/go/vt/proto/topodata"
 )
+
+// testTabletTypes is the list of tablet types to test.
+var testTabletTypes = []topodata.TabletType{
+	topodata.TabletType_REPLICA,
+	topodata.TabletType_RDONLY,
+}
 
 // The main purpose of the benchmarks below is to demonstrate the functionality
 // of the throttler in the real-world (using a non-faked time.Now).
@@ -162,7 +175,7 @@ func sinceZero(sinceZero time.Duration) time.Time {
 // threadThrottler.newThreadThrottler() for more details.
 
 // newThrottlerWithClock should only be used for testing.
-func newThrottlerWithClock(name, unit string, threadCount int, maxRate int64, maxReplicationLag int64, nowFunc func() time.Time) (*Throttler, error) {
+func newThrottlerWithClock(name, unit string, threadCount int, maxRate int64, maxReplicationLag int64, nowFunc func() time.Time) (Throttler, error) {
 	return newThrottler(GlobalManager, name, unit, threadCount, maxRate, maxReplicationLag, nowFunc)
 }
 
@@ -176,35 +189,30 @@ func TestThrottle(t *testing.T) {
 	// 2 QPS should divide the current second into two chunks of 500 ms:
 	// a) [1s, 1.5s), b) [1.5s, 2s)
 	// First call goes through since the chunk is not "used" yet.
-	if gotBackoff := throttler.Throttle(0); gotBackoff != NotThrottled {
-		t.Fatalf("throttler should not have throttled us: backoff = %v", gotBackoff)
-	}
+	gotBackoff := throttler.Throttle(0)
+	require.Equal(t, NotThrottled, gotBackoff, "throttler should not have throttled us")
 
 	// Next call should tell us to backoff until we reach the second chunk.
 	fc.setNow(1000 * time.Millisecond)
 	wantBackoff := 500 * time.Millisecond
-	if gotBackoff := throttler.Throttle(0); gotBackoff != wantBackoff {
-		t.Fatalf("throttler should have throttled us. got = %v, want = %v", gotBackoff, wantBackoff)
-	}
+	gotBackoff = throttler.Throttle(0)
+	require.Equal(t, wantBackoff, gotBackoff, "throttler should have throttled us")
 
 	// Some time elpased, but we are still in the first chunk and must backoff.
 	fc.setNow(1111 * time.Millisecond)
 	wantBackoff2 := 389 * time.Millisecond
-	if gotBackoff := throttler.Throttle(0); gotBackoff != wantBackoff2 {
-		t.Fatalf("throttler should have still throttled us. got = %v, want = %v", gotBackoff, wantBackoff2)
-	}
+	gotBackoff = throttler.Throttle(0)
+	require.Equal(t, wantBackoff2, gotBackoff, "throttler should have still throttled us")
 
 	// Enough time elapsed that we are in the second chunk now.
 	fc.setNow(1500 * time.Millisecond)
-	if gotBackoff := throttler.Throttle(0); gotBackoff != NotThrottled {
-		t.Fatalf("throttler should not have throttled us: backoff = %v", gotBackoff)
-	}
+	gotBackoff = throttler.Throttle(0)
+	require.Equal(t, NotThrottled, gotBackoff, "throttler should not have throttled us")
 
 	// We're in the third chunk and are allowed to issue the third request.
 	fc.setNow(2001 * time.Millisecond)
-	if gotBackoff := throttler.Throttle(0); gotBackoff != NotThrottled {
-		t.Fatalf("throttler should not have throttled us: backoff = %v", gotBackoff)
-	}
+	gotBackoff = throttler.Throttle(0)
+	require.Equal(t, NotThrottled, gotBackoff, "throttler should not have throttled us")
 }
 
 func TestThrottle_RateRemainderIsDistributedAcrossThreads(t *testing.T) {
@@ -216,9 +224,8 @@ func TestThrottle_RateRemainderIsDistributedAcrossThreads(t *testing.T) {
 	fc.setNow(1000 * time.Millisecond)
 	// Out of 5 QPS, each thread gets 1 and two threads get 1 query extra.
 	for threadID := 0; threadID < 2; threadID++ {
-		if gotBackoff := throttler.Throttle(threadID); gotBackoff != NotThrottled {
-			t.Fatalf("throttler should not have throttled thread %d: backoff = %v", threadID, gotBackoff)
-		}
+		gotBackoff := throttler.Throttle(threadID)
+		require.Equalf(t, NotThrottled, gotBackoff, "throttler should not have throttled thread %d", threadID)
 	}
 
 	fc.setNow(1500 * time.Millisecond)
@@ -229,21 +236,18 @@ func TestThrottle_RateRemainderIsDistributedAcrossThreads(t *testing.T) {
 			threadsWithMoreThanOneQPS++
 		} else {
 			wantBackoff := 500 * time.Millisecond
-			if gotBackoff != wantBackoff {
-				t.Fatalf("throttler did throttle us with the wrong backoff time. got = %v, want = %v", gotBackoff, wantBackoff)
-			}
+			require.Equal(t, wantBackoff, gotBackoff, "throttler did throttle us with the wrong backoff time")
 		}
 	}
 	if want := 2; threadsWithMoreThanOneQPS != want {
-		t.Fatalf("wrong number of threads were throttled: %v != %v", threadsWithMoreThanOneQPS, want)
+		require.Equal(t, want, threadsWithMoreThanOneQPS, "wrong number of threads were throttled")
 	}
 
 	// Now, all threads are throttled.
 	for threadID := 0; threadID < 2; threadID++ {
 		wantBackoff := 500 * time.Millisecond
-		if gotBackoff := throttler.Throttle(threadID); gotBackoff != wantBackoff {
-			t.Fatalf("throttler should have throttled thread %d. got = %v, want = %v", threadID, gotBackoff, wantBackoff)
-		}
+		gotBackoff := throttler.Throttle(threadID)
+		require.Equalf(t, wantBackoff, gotBackoff, "throttler should have throttled thread %d", threadID)
 	}
 }
 
@@ -256,16 +260,14 @@ func TestThreadFinished(t *testing.T) {
 	// [1000ms, 2000ms):  Each thread consumes their 1 QPS.
 	fc.setNow(1000 * time.Millisecond)
 	for threadID := 0; threadID < 2; threadID++ {
-		if gotBackoff := throttler.Throttle(threadID); gotBackoff != NotThrottled {
-			t.Fatalf("throttler should not have throttled thread %d: backoff = %v", threadID, gotBackoff)
-		}
+		gotBackoff := throttler.Throttle(threadID)
+		require.Equalf(t, NotThrottled, gotBackoff, "throttler should not have throttled thread %d", threadID)
 	}
 	// Now they would be throttled.
 	wantBackoff := 1000 * time.Millisecond
 	for threadID := 0; threadID < 2; threadID++ {
-		if gotBackoff := throttler.Throttle(threadID); gotBackoff != wantBackoff {
-			t.Fatalf("throttler should have throttled thread %d. got = %v, want = %v", threadID, gotBackoff, wantBackoff)
-		}
+		gotBackoff := throttler.Throttle(threadID)
+		require.Equalf(t, wantBackoff, gotBackoff, "throttler should have throttled thread %d", threadID)
 	}
 
 	// [2000ms, 3000ms): One thread finishes, other one gets remaining 1 QPS extra.
@@ -274,43 +276,39 @@ func TestThreadFinished(t *testing.T) {
 
 	// Max rate update to threadThrottlers happens asynchronously. Wait for it.
 	timer := time.NewTimer(2 * time.Second)
+	throttlerImpl, ok := throttler.(*ThrottlerImpl)
+	require.True(t, ok)
 	for {
-		if throttler.threadThrottlers[0].getMaxRate() == 2 {
+		if throttlerImpl.threadThrottlers[0].getMaxRate() == 2 {
 			timer.Stop()
 			break
 		}
 		select {
 		case <-timer.C:
-			t.Fatalf("max rate was not propapgated to threadThrottler[0] in time: %v", throttler.threadThrottlers[0].getMaxRate())
+			t.Fatalf("max rate was not propapgated to threadThrottler[0] in time: %v", throttlerImpl.threadThrottlers[0].getMaxRate())
 		default:
 			// Timer not up yet. Try again.
 		}
 	}
 
 	// Consume 2 QPS.
-	if gotBackoff := throttler.Throttle(0); gotBackoff != NotThrottled {
-		t.Fatalf("throttler should not have throttled us: backoff = %v", gotBackoff)
-	}
+	gotBackoff := throttler.Throttle(0)
+	require.Equal(t, NotThrottled, gotBackoff, "throttler should not have throttled us")
+
 	fc.setNow(2500 * time.Millisecond)
-	if gotBackoff := throttler.Throttle(0); gotBackoff != NotThrottled {
-		t.Fatalf("throttler should not have throttled us: backoff = %v", gotBackoff)
-	}
+	gotBackoff = throttler.Throttle(0)
+	require.Equal(t, NotThrottled, gotBackoff, "throttler should not have throttled us")
 
 	// 2 QPS are consumed. Thread 0 should be throttled now.
 	wantBackoff2 := 500 * time.Millisecond
-	if gotBackoff := throttler.Throttle(0); gotBackoff != wantBackoff2 {
-		t.Fatalf("throttler should have throttled us. got = %v, want = %v", gotBackoff, wantBackoff2)
-	}
+	gotBackoff = throttler.Throttle(0)
+	require.Equal(t, wantBackoff2, gotBackoff, "throttler should have throttled us")
 
 	// Throttle() from a finished thread will panic.
 	defer func() {
 		msg := recover()
-		if msg == nil {
-			t.Fatal("Throttle() from a thread which called ThreadFinished() should panic")
-		}
-		if !strings.Contains(msg.(string), "already finished") {
-			t.Fatalf("Throttle() after ThreadFinished() panic'd for wrong reason: %v", msg)
-		}
+		require.NotNil(t, msg)
+		require.Contains(t, msg, "already finished", "Throttle() after ThreadFinished() panic'd for wrong reason")
 	}()
 	throttler.Throttle(1)
 }
@@ -326,19 +324,18 @@ func TestThrottle_MaxRateIsZero(t *testing.T) {
 
 	fc.setNow(1000 * time.Millisecond)
 	wantBackoff := 1000 * time.Millisecond
-	if gotBackoff := throttler.Throttle(0); gotBackoff != wantBackoff {
-		t.Fatalf("throttler should have throttled us. got = %v, want = %v", gotBackoff, wantBackoff)
-	}
+	gotBackoff := throttler.Throttle(0)
+	require.Equal(t, wantBackoff, gotBackoff, "throttler should have throttled us")
+
 	fc.setNow(1111 * time.Millisecond)
 	wantBackoff2 := 1000 * time.Millisecond
-	if gotBackoff := throttler.Throttle(0); gotBackoff != wantBackoff2 {
-		t.Fatalf("throttler should have throttled us. got = %v, want = %v", gotBackoff, wantBackoff2)
-	}
+	gotBackoff = throttler.Throttle(0)
+	require.Equal(t, wantBackoff2, gotBackoff, "throttler should have throttled us")
+
 	fc.setNow(2000 * time.Millisecond)
 	wantBackoff3 := 1000 * time.Millisecond
-	if gotBackoff := throttler.Throttle(0); gotBackoff != wantBackoff3 {
-		t.Fatalf("throttler should have throttled us. got = %v, want = %v", gotBackoff, wantBackoff3)
-	}
+	gotBackoff = throttler.Throttle(0)
+	require.Equal(t, wantBackoff3, gotBackoff, "throttler should have throttled us")
 }
 
 func TestThrottle_MaxRateDisabled(t *testing.T) {
@@ -349,9 +346,8 @@ func TestThrottle_MaxRateDisabled(t *testing.T) {
 	fc.setNow(1000 * time.Millisecond)
 	// No QPS set. 10 requests in a row are fine.
 	for i := 0; i < 10; i++ {
-		if gotBackoff := throttler.Throttle(0); gotBackoff != NotThrottled {
-			t.Fatalf("throttler should not have throttled us: request = %v, backoff = %v", i, gotBackoff)
-		}
+		gotBackoff := throttler.Throttle(0)
+		require.Equal(t, NotThrottled, gotBackoff, "throttler should not have throttled us")
 	}
 }
 
@@ -368,15 +364,13 @@ func TestThrottle_MaxRateLowerThanThreadCount(t *testing.T) {
 	// must not starve.
 	fc.setNow(1000 * time.Millisecond)
 	for threadID := 0; threadID < 1; threadID++ {
-		if gotBackoff := throttler.Throttle(threadID); gotBackoff != NotThrottled {
-			t.Fatalf("throttler should not have throttled thread %d: backoff = %v", threadID, gotBackoff)
-		}
+		gotBackoff := throttler.Throttle(threadID)
+		require.Equalf(t, NotThrottled, gotBackoff, "throttler should not have throttled thread %d", threadID)
 	}
 	wantBackoff := 1000 * time.Millisecond
 	for threadID := 0; threadID < 1; threadID++ {
-		if gotBackoff := throttler.Throttle(threadID); gotBackoff != wantBackoff {
-			t.Fatalf("throttler should have throttled thread %d: got = %v, want = %v", threadID, gotBackoff, wantBackoff)
-		}
+		gotBackoff := throttler.Throttle(threadID)
+		require.Equalf(t, wantBackoff, gotBackoff, "throttler should have throttled thread %d", threadID)
 	}
 }
 
@@ -389,7 +383,9 @@ func TestUpdateMaxRate_AllThreadsFinished(t *testing.T) {
 	throttler.ThreadFinished(1)
 
 	// Make sure that there's no division by zero error (threadsRunning == 0).
-	throttler.updateMaxRate()
+	throttlerImpl, ok := throttler.(*ThrottlerImpl)
+	require.True(t, ok)
+	throttlerImpl.updateMaxRate()
 	// We don't care about the Throttler state at this point.
 }
 
@@ -400,12 +396,8 @@ func TestClose(t *testing.T) {
 
 	defer func() {
 		msg := recover()
-		if msg == nil {
-			t.Fatal("Throttle() after Close() should panic")
-		}
-		if !strings.Contains(msg.(string), "must not access closed Throttler") {
-			t.Fatalf("Throttle() after ThreadFinished() panic'd for wrong reason: %v", msg)
-		}
+		require.NotNil(t, msg)
+		require.Contains(t, msg, "must not access closed Throttler", "Throttle() after ThreadFinished() panic'd for wrong reason")
 	}()
 	throttler.Throttle(0)
 }
@@ -417,12 +409,78 @@ func TestThreadFinished_SecondCallPanics(t *testing.T) {
 
 	defer func() {
 		msg := recover()
-		if msg == nil {
-			t.Fatal("Second ThreadFinished() after ThreadFinished() should panic")
-		}
-		if !strings.Contains(msg.(string), "already finished") {
-			t.Fatalf("ThreadFinished() after ThreadFinished() panic'd for wrong reason: %v", msg)
-		}
+		require.NotNil(t, msg)
+		require.Contains(t, msg, "already finished", "Throttle() after ThreadFinished() panic'd for wrong reason")
 	}()
 	throttler.ThreadFinished(0)
+}
+
+func TestThrottlerMaxLag(t *testing.T) {
+	fc := &fakeClock{}
+	th, err := newThrottlerWithClock(t.Name(), "queries", 1, 1, 10, fc.now)
+	require.NoError(t, err)
+	throttler := th.(*ThrottlerImpl)
+	defer throttler.Close()
+
+	require.NotNil(t, throttler)
+	require.NotNil(t, throttler.maxReplicationLagModule)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+
+	// run .add() and .MaxLag() concurrently to detect races
+	for _, tabletType := range testTabletTypes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					throttler.MaxLag(tabletType)
+				}
+			}
+		}()
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					cache := throttler.maxReplicationLagModule.lagCacheByType(tabletType)
+					require.NotNil(t, cache)
+					cache.add(replicationLagRecord{
+						time: time.Now(),
+						TabletHealth: discovery.TabletHealth{
+							Serving: true,
+							Stats: &query.RealtimeStats{
+								ReplicationLagSeconds: 5,
+							},
+							Tablet: &topodata.Tablet{
+								Hostname: t.Name(),
+								Type:     tabletType,
+								PortMap: map[string]int32{
+									"test": 15999,
+								},
+							},
+						},
+					})
+				}
+			}
+		}()
+	}
+	time.Sleep(time.Second)
+	cancel()
+	wg.Wait()
+
+	// check .MaxLag()
+	for _, tabletType := range testTabletTypes {
+		require.Equal(t, uint32(5), throttler.MaxLag(tabletType))
+	}
 }

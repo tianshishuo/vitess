@@ -31,9 +31,9 @@ var carriageReturn = []byte("\n")
 // Unmarshal wraps json.Unmarshal, but returns errors that
 // also mention the line number. This function is not very
 // efficient and should not be used for high QPS operations.
-func Unmarshal(data []byte, v interface{}) error {
+func Unmarshal(data []byte, v any) error {
 	if pb, ok := v.(proto.Message); ok {
-		return annotate(data, protojson.Unmarshal(data, pb))
+		return UnmarshalPB(data, pb)
 	}
 	return annotate(data, json.Unmarshal(data, v))
 }
@@ -51,4 +51,10 @@ func annotate(data []byte, err error) error {
 	line, pos := bytes.Count(data[:start], carriageReturn)+1, int(syntax.Offset)-start
 
 	return fmt.Errorf("line: %d, position %d: %v", line, pos, err)
+}
+
+// UnmarshalPB is similar to Unmarshal but specifically for proto.Message to add type safety.
+func UnmarshalPB(data []byte, pb proto.Message) error {
+	opts := protojson.UnmarshalOptions{DiscardUnknown: true}
+	return annotate(data, opts.Unmarshal(data, pb))
 }

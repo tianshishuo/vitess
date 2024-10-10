@@ -20,13 +20,15 @@ limitations under the License.
 package memorytopo
 
 import (
-	"math/rand"
+	"context"
+	"errors"
+	"math/rand/v2"
+	"regexp"
 	"strings"
 	"sync"
-	"time"
+	"sync/atomic"
 
-	"context"
-
+	"vitess.io/vitess/go/stats"
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/topo"
 
@@ -38,6 +40,8 @@ const (
 	electionsPath = "elections"
 )
 
+var ErrConnectionClosed = errors.New("connection closed")
+
 const (
 	// UnreachableServerAddr is a sentinel value for CellInfo.ServerAddr.
 	// If a memorytopo topo.Conn is created with this serverAddr then every
@@ -47,8 +51,23 @@ const (
 	UnreachableServerAddr = "unreachable"
 )
 
-var (
-	nextWatchIndex = 0
+// Operation is one of the operations defined by topo.Conn
+type Operation int
+
+// The following is the list of topo.Conn operations
+const (
+	ListDir = Operation(iota)
+	Create
+	Update
+	Get
+	List
+	Delete
+	Lock
+	TryLock
+	Watch
+	WatchRecursive
+	NewLeaderParticipation
+	Close
 )
 
 // Factory is a memory-based implementation of topo.Factory.  It
@@ -73,6 +92,18 @@ type Factory struct {
 	// err is used for testing purposes to force queries / watches
 	// to return the given error
 	err error
+	// operationErrors is used for testing purposes to fake errors from
+	// operations and paths matching the spec
+	operationErrors map[Operation][]errorSpec
+	// callstats allows us to keep track of how many topo.Conn calls
+	// we make (Create, Get, Update, Delete, List, ListDir, etc).
+	callstats *stats.CountersWithMultiLabels
+}
+
+type errorSpec struct {
+	op          Operation
+	pathPattern *regexp.Regexp
+	err         error
 }
 
 // HasGlobalReadOnlyCell is part of the topo.Factory interface.
@@ -108,6 +139,10 @@ func (f *Factory) SetError(err error) {
 	}
 }
 
+func (f *Factory) GetCallStats() *stats.CountersWithMultiLabels {
+	return f.callstats
+}
+
 // Lock blocks all requests to the topo and is exposed to allow tests to
 // simulate an unresponsive topo server
 func (f *Factory) Lock() {
@@ -126,24 +161,32 @@ type Conn struct {
 	factory    *Factory
 	cell       string
 	serverAddr string
+	closed     atomic.Bool
 }
 
 // dial returns immediately, unless the Conn points to the sentinel
-// UnreachableServerAddr, in which case it will block until the context expires
-// and return the context's error.
+// UnreachableServerAddr, in which case it will block until the context expires.
 func (c *Conn) dial(ctx context.Context) error {
+	if c.closed.Load() {
+		return ErrConnectionClosed
+	}
 	if c.serverAddr == UnreachableServerAddr {
 		<-ctx.Done()
-		return ctx.Err()
 	}
 
-	return nil
+	return ctx.Err()
 }
 
 // Close is part of the topo.Conn interface.
-// It nils out factory, so any subsequent call will panic.
 func (c *Conn) Close() {
-	c.factory = nil
+	c.factory.callstats.Add([]string{"Close"}, 1)
+	c.closed.Store(true)
+}
+
+type watch struct {
+	contents  chan *topo.WatchData
+	recursive chan *topo.WatchDataRecursive
+	lock      chan string
 }
 
 // node contains a directory or a file entry.
@@ -159,7 +202,7 @@ type node struct {
 	parent *node
 
 	// watches is a map of all watches for this node.
-	watches map[int]chan *topo.WatchData
+	watches map[int]watch
 
 	// lock is nil when the node is not locked.
 	// otherwise it has a channel that is closed by unlock.
@@ -175,11 +218,48 @@ func (n *node) isDirectory() bool {
 	return n.children != nil
 }
 
+func (n *node) recurseContents(callback func(n *node)) {
+	if n.isDirectory() {
+		for _, child := range n.children {
+			child.recurseContents(callback)
+		}
+	} else {
+		callback(n)
+	}
+}
+
+func (n *node) propagateRecursiveWatch(ev *topo.WatchDataRecursive) {
+	for parent := n.parent; parent != nil; parent = parent.parent {
+		for _, w := range parent.watches {
+			if w.recursive != nil {
+				w.recursive <- ev
+			}
+		}
+	}
+}
+
+var (
+	nextWatchIndex   = 0
+	nextWatchIndexMu sync.Mutex
+)
+
+func (n *node) addWatch(w watch) int {
+	nextWatchIndexMu.Lock()
+	defer nextWatchIndexMu.Unlock()
+	watchIndex := nextWatchIndex
+	nextWatchIndex++
+	n.watches[watchIndex] = w
+	return watchIndex
+}
+
 // PropagateWatchError propagates the given error to all watches on this node
 // and recursively applies to all children
 func (n *node) PropagateWatchError(err error) {
 	for _, ch := range n.watches {
-		ch <- &topo.WatchData{
+		if ch.contents == nil {
+			continue
+		}
+		ch.contents <- &topo.WatchData{
 			Err: err,
 		}
 	}
@@ -192,14 +272,15 @@ func (n *node) PropagateWatchError(err error) {
 // NewServerAndFactory returns a new MemoryTopo and the backing factory for all
 // the cells. It will create one cell for each parameter passed in.  It will log.Exit out
 // in case of a problem.
-func NewServerAndFactory(cells ...string) (*topo.Server, *Factory) {
+func NewServerAndFactory(ctx context.Context, cells ...string) (*topo.Server, *Factory) {
 	f := &Factory{
-		cells:      make(map[string]*node),
-		generation: uint64(rand.Int63n(1 << 60)),
+		cells:           make(map[string]*node),
+		generation:      uint64(rand.Int64N(1 << 60)),
+		callstats:       stats.NewCountersWithMultiLabels("", "", []string{"Call"}),
+		operationErrors: make(map[Operation][]errorSpec),
 	}
 	f.cells[topo.GlobalCell] = f.newDirectory(topo.GlobalCell, nil)
 
-	ctx := context.Background()
 	ts, err := topo.NewWithFactory(f, "" /*serverAddress*/, "" /*root*/)
 	if err != nil {
 		log.Exitf("topo.NewWithFactory() failed: %v", err)
@@ -214,8 +295,8 @@ func NewServerAndFactory(cells ...string) (*topo.Server, *Factory) {
 }
 
 // NewServer returns the new server
-func NewServer(cells ...string) *topo.Server {
-	server, _ := NewServerAndFactory(cells...)
+func NewServer(ctx context.Context, cells ...string) *topo.Server {
+	server, _ := NewServerAndFactory(ctx, cells...)
 	return server
 }
 
@@ -230,7 +311,7 @@ func (f *Factory) newFile(name string, contents []byte, parent *node) *node {
 		version:  f.getNextVersion(),
 		contents: contents,
 		parent:   parent,
-		watches:  make(map[int]chan *topo.WatchData),
+		watches:  make(map[int]watch),
 	}
 }
 
@@ -240,6 +321,7 @@ func (f *Factory) newDirectory(name string, parent *node) *node {
 		version:  f.getNextVersion(),
 		children: make(map[string]*node),
 		parent:   parent,
+		watches:  make(map[int]watch),
 	}
 }
 
@@ -308,6 +390,23 @@ func (f *Factory) recursiveDelete(n *node) {
 	}
 }
 
-func init() {
-	rand.Seed(time.Now().UnixNano())
+func (f *Factory) AddOperationError(op Operation, pathPattern string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.operationErrors[op] = append(f.operationErrors[op], errorSpec{
+		op:          op,
+		pathPattern: regexp.MustCompile(pathPattern),
+		err:         err,
+	})
+}
+
+func (f *Factory) getOperationError(op Operation, path string) error {
+	specs := f.operationErrors[op]
+	for _, spec := range specs {
+		if spec.pathPattern.MatchString(path) {
+			return spec.err
+		}
+	}
+	return nil
 }

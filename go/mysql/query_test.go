@@ -24,6 +24,10 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"vitess.io/vitess/go/mysql/sqlerror"
+
+	"vitess.io/vitess/go/mysql/collations"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -48,8 +52,10 @@ func MockPrepareData(t *testing.T) (*PrepareData, *sqltypes.Result) {
 	result := &sqltypes.Result{
 		Fields: []*querypb.Field{
 			{
-				Name: "id",
-				Type: querypb.Type_INT32,
+				Name:    "id",
+				Type:    querypb.Type_INT32,
+				Charset: collations.CollationBinaryID,
+				Flags:   uint32(querypb.MySqlFlag_NUM_FLAG),
 			},
 		},
 		Rows: [][]sqltypes.Value{
@@ -91,9 +97,8 @@ func TestComInitDB(t *testing.T) {
 		t.Fatalf("sConn.ReadPacket - ComInitDB failed: %v %v", data, err)
 	}
 	db := sConn.parseComInitDB(data)
-	if db != "my_db" {
-		t.Errorf("parseComInitDB returned unexpected data: %v", db)
-	}
+	assert.Equal(t, "my_db", db, "parseComInitDB returned unexpected data: %v", db)
+
 }
 
 func TestComSetOption(t *testing.T) {
@@ -113,12 +118,9 @@ func TestComSetOption(t *testing.T) {
 		t.Fatalf("sConn.ReadPacket - ComSetOption failed: %v %v", data, err)
 	}
 	operation, ok := sConn.parseComSetOption(data)
-	if !ok {
-		t.Fatalf("parseComSetOption failed unexpectedly")
-	}
-	if operation != 1 {
-		t.Errorf("parseComSetOption returned unexpected data: %v", operation)
-	}
+	require.True(t, ok, "parseComSetOption failed unexpectedly")
+	assert.Equal(t, uint16(1), operation, "parseComSetOption returned unexpected data: %v", operation)
+
 }
 
 func TestComStmtPrepare(t *testing.T) {
@@ -137,14 +139,10 @@ func TestComStmtPrepare(t *testing.T) {
 	}
 
 	data, err := sConn.ReadPacket()
-	if err != nil {
-		t.Fatalf("sConn.ReadPacket - ComPrepare failed: %v", err)
-	}
+	require.NoError(t, err, "sConn.ReadPacket - ComPrepare failed: %v", err)
 
 	parsedQuery := sConn.parseComPrepare(data)
-	if parsedQuery != sql {
-		t.Fatalf("Received incorrect query, want: %v, got: %v", sql, parsedQuery)
-	}
+	require.Equal(t, sql, parsedQuery, "Received incorrect query, want: %v, got: %v", sql, parsedQuery)
 
 	prepare, result := MockPrepareData(t)
 	sConn.PrepareData = make(map[uint32]*PrepareData)
@@ -156,12 +154,9 @@ func TestComStmtPrepare(t *testing.T) {
 	}
 
 	resp, err := cConn.ReadPacket()
-	if err != nil {
-		t.Fatalf("cConn.ReadPacket failed: %v", err)
-	}
-	if uint32(resp[1]) != prepare.StatementID {
-		t.Fatalf("Received incorrect Statement ID, want: %v, got: %v", prepare.StatementID, resp[1])
-	}
+	require.NoError(t, err, "cConn.ReadPacket failed: %v", err)
+	require.Equal(t, prepare.StatementID, uint32(resp[1]), "Received incorrect Statement ID, want: %v, got: %v", prepare.StatementID, resp[1])
+
 }
 
 func TestComStmtPrepareUpdStmt(t *testing.T) {
@@ -229,20 +224,13 @@ func TestComStmtSendLongData(t *testing.T) {
 		t.Fatalf("sConn.ReadPacket - ComStmtClose failed: %v %v", data, err)
 	}
 	stmtID, paramID, chunkData, ok := sConn.parseComStmtSendLongData(data)
-	if !ok {
-		t.Fatalf("parseComStmtSendLongData failed")
-	}
-	if paramID != 1 {
-		t.Fatalf("Received incorrect ParamID, want %v, got %v:", paramID, 1)
-	}
-	if stmtID != prepare.StatementID {
-		t.Fatalf("Received incorrect value, want: %v, got: %v", uint32(data[1]), prepare.StatementID)
-	}
+	require.True(t, ok, "parseComStmtSendLongData failed")
+	require.Equal(t, uint16(1), paramID, "Received incorrect ParamID, want %v, got %v:", paramID, 1)
+	require.Equal(t, prepare.StatementID, stmtID, "Received incorrect value, want: %v, got: %v", uint32(data[1]), prepare.StatementID)
 	// Check length of chunkData, Since its a subset of `data` and compare with it after we subtract the number of bytes that was read from it.
 	// sizeof(uint32) + sizeof(uint16) + 1 = 7
-	if len(chunkData) != len(data)-7 {
-		t.Fatalf("Received bad chunkData")
-	}
+	require.Equal(t, len(data)-7, len(chunkData), "Received bad chunkData")
+
 }
 
 func TestComStmtExecute(t *testing.T) {
@@ -261,12 +249,9 @@ func TestComStmtExecute(t *testing.T) {
 	data := []byte{23, 18, 0, 0, 0, 128, 1, 0, 0, 0, 0, 1, 1, 128, 1}
 
 	stmtID, _, err := sConn.parseComStmtExecute(cConn.PrepareData, data)
-	if err != nil {
-		t.Fatalf("parseComStmtExeute failed: %v", err)
-	}
-	if stmtID != 18 {
-		t.Fatalf("Parsed incorrect values")
-	}
+	require.NoError(t, err, "parseComStmtExeute failed: %v", err)
+	require.Equal(t, uint32(18), stmtID, "Parsed incorrect values")
+
 }
 
 func TestComStmtExecuteUpdStmt(t *testing.T) {
@@ -330,10 +315,7 @@ func TestComStmtExecuteUpdStmt(t *testing.T) {
 	assert.EqualValues(t, querypb.Type_DATETIME, prepData.ParamsType[15], "got: %s", querypb.Type(prepData.ParamsType[15]))
 	assert.EqualValues(t, querypb.Type_TIMESTAMP, prepData.ParamsType[16], "got: %s", querypb.Type(prepData.ParamsType[16]))
 	assert.EqualValues(t, querypb.Type_TIME, prepData.ParamsType[17], "got: %s", querypb.Type(prepData.ParamsType[17]))
-
-	// this is year but in binary it is changed to varbinary
-	assert.EqualValues(t, querypb.Type_VARBINARY, prepData.ParamsType[18], "got: %s", querypb.Type(prepData.ParamsType[18]))
-
+	assert.EqualValues(t, querypb.Type_YEAR, prepData.ParamsType[18], "got: %s", querypb.Type(prepData.ParamsType[18]))
 	assert.EqualValues(t, querypb.Type_CHAR, prepData.ParamsType[19], "got: %s", querypb.Type(prepData.ParamsType[19]))
 	assert.EqualValues(t, querypb.Type_CHAR, prepData.ParamsType[20], "got: %s", querypb.Type(prepData.ParamsType[20]))
 	assert.EqualValues(t, querypb.Type_TEXT, prepData.ParamsType[21], "got: %s", querypb.Type(prepData.ParamsType[21]))
@@ -367,12 +349,35 @@ func TestComStmtClose(t *testing.T) {
 		t.Fatalf("sConn.ReadPacket - ComStmtClose failed: %v %v", data, err)
 	}
 	stmtID, ok := sConn.parseComStmtClose(data)
-	if !ok {
-		t.Fatalf("parseComStmtClose failed")
-	}
-	if stmtID != prepare.StatementID {
-		t.Fatalf("Received incorrect value, want: %v, got: %v", uint32(data[1]), prepare.StatementID)
-	}
+	require.True(t, ok, "parseComStmtClose failed")
+	require.Equal(t, prepare.StatementID, stmtID, "Received incorrect value, want: %v, got: %v", uint32(data[1]), prepare.StatementID)
+
+}
+
+// This test has been added to verify that IO errors in a connection lead to SQL Server lost errors
+// So that we end up closing the connection higher up the stack and not reusing it.
+// This test was added in response to a panic that was run into.
+func TestSQLErrorOnServerClose(t *testing.T) {
+	// Create socket pair for the server and client
+	listener, sConn, cConn := createSocketPair(t)
+	defer func() {
+		listener.Close()
+		sConn.Close()
+		cConn.Close()
+	}()
+
+	err := cConn.WriteComQuery("close before rows read")
+	require.NoError(t, err)
+
+	handler := &testRun{t: t}
+	_ = sConn.handleNextCommand(handler)
+
+	// From the server we will receive a field packet which the client will read
+	// At that point, if the server crashes and closes the connection.
+	// We should be getting a Connection lost error.
+	_, _, _, err = cConn.ReadQueryResult(100, true)
+	require.Error(t, err)
+	require.True(t, sqlerror.IsConnLostDuringQuery(err), err.Error())
 }
 
 func TestQueries(t *testing.T) {
@@ -397,12 +402,15 @@ func TestQueries(t *testing.T) {
 	checkQuery(t, "type and name", sConn, cConn, &sqltypes.Result{
 		Fields: []*querypb.Field{
 			{
-				Name: "id",
-				Type: querypb.Type_INT32,
+				Name:    "id",
+				Type:    querypb.Type_INT32,
+				Charset: collations.CollationBinaryID,
+				Flags:   uint32(querypb.MySqlFlag_NUM_FLAG),
 			},
 			{
-				Name: "name",
-				Type: querypb.Type_VARCHAR,
+				Name:    "name",
+				Type:    querypb.Type_VARCHAR,
+				Charset: uint32(collations.MySQL8().DefaultConnectionCharset()),
 			},
 		},
 		Rows: [][]sqltypes.Value{
@@ -422,36 +430,37 @@ func TestQueries(t *testing.T) {
 	// One row has all NULL values.
 	checkQuery(t, "all types", sConn, cConn, &sqltypes.Result{
 		Fields: []*querypb.Field{
-			{Name: "Type_INT8     ", Type: querypb.Type_INT8},
-			{Name: "Type_UINT8    ", Type: querypb.Type_UINT8},
-			{Name: "Type_INT16    ", Type: querypb.Type_INT16},
-			{Name: "Type_UINT16   ", Type: querypb.Type_UINT16},
-			{Name: "Type_INT24    ", Type: querypb.Type_INT24},
-			{Name: "Type_UINT24   ", Type: querypb.Type_UINT24},
-			{Name: "Type_INT32    ", Type: querypb.Type_INT32},
-			{Name: "Type_UINT32   ", Type: querypb.Type_UINT32},
-			{Name: "Type_INT64    ", Type: querypb.Type_INT64},
-			{Name: "Type_UINT64   ", Type: querypb.Type_UINT64},
-			{Name: "Type_FLOAT32  ", Type: querypb.Type_FLOAT32},
-			{Name: "Type_FLOAT64  ", Type: querypb.Type_FLOAT64},
-			{Name: "Type_TIMESTAMP", Type: querypb.Type_TIMESTAMP},
-			{Name: "Type_DATE     ", Type: querypb.Type_DATE},
-			{Name: "Type_TIME     ", Type: querypb.Type_TIME},
-			{Name: "Type_DATETIME ", Type: querypb.Type_DATETIME},
-			{Name: "Type_YEAR     ", Type: querypb.Type_YEAR},
-			{Name: "Type_DECIMAL  ", Type: querypb.Type_DECIMAL},
-			{Name: "Type_TEXT     ", Type: querypb.Type_TEXT},
-			{Name: "Type_BLOB     ", Type: querypb.Type_BLOB},
-			{Name: "Type_VARCHAR  ", Type: querypb.Type_VARCHAR},
-			{Name: "Type_VARBINARY", Type: querypb.Type_VARBINARY},
-			{Name: "Type_CHAR     ", Type: querypb.Type_CHAR},
-			{Name: "Type_BINARY   ", Type: querypb.Type_BINARY},
-			{Name: "Type_BIT      ", Type: querypb.Type_BIT},
-			{Name: "Type_ENUM     ", Type: querypb.Type_ENUM},
-			{Name: "Type_SET      ", Type: querypb.Type_SET},
+			{Name: "Type_INT8     ", Type: querypb.Type_INT8, Charset: collations.CollationBinaryID, Flags: uint32(querypb.MySqlFlag_NUM_FLAG)},
+			{Name: "Type_UINT8    ", Type: querypb.Type_UINT8, Charset: collations.CollationBinaryID, Flags: uint32(querypb.MySqlFlag_NUM_FLAG | querypb.MySqlFlag_UNSIGNED_FLAG)},
+			{Name: "Type_INT16    ", Type: querypb.Type_INT16, Charset: collations.CollationBinaryID, Flags: uint32(querypb.MySqlFlag_NUM_FLAG)},
+			{Name: "Type_UINT16   ", Type: querypb.Type_UINT16, Charset: collations.CollationBinaryID, Flags: uint32(querypb.MySqlFlag_NUM_FLAG | querypb.MySqlFlag_UNSIGNED_FLAG)},
+			{Name: "Type_INT24    ", Type: querypb.Type_INT24, Charset: collations.CollationBinaryID, Flags: uint32(querypb.MySqlFlag_NUM_FLAG)},
+			{Name: "Type_UINT24   ", Type: querypb.Type_UINT24, Charset: collations.CollationBinaryID, Flags: uint32(querypb.MySqlFlag_NUM_FLAG | querypb.MySqlFlag_UNSIGNED_FLAG)},
+			{Name: "Type_INT32    ", Type: querypb.Type_INT32, Charset: collations.CollationBinaryID, Flags: uint32(querypb.MySqlFlag_NUM_FLAG)},
+			{Name: "Type_UINT32   ", Type: querypb.Type_UINT32, Charset: collations.CollationBinaryID, Flags: uint32(querypb.MySqlFlag_NUM_FLAG | querypb.MySqlFlag_UNSIGNED_FLAG)},
+			{Name: "Type_INT64    ", Type: querypb.Type_INT64, Charset: collations.CollationBinaryID, Flags: uint32(querypb.MySqlFlag_NUM_FLAG)},
+			{Name: "Type_UINT64   ", Type: querypb.Type_UINT64, Charset: collations.CollationBinaryID, Flags: uint32(querypb.MySqlFlag_NUM_FLAG | querypb.MySqlFlag_UNSIGNED_FLAG)},
+			{Name: "Type_FLOAT32  ", Type: querypb.Type_FLOAT32, Charset: collations.CollationBinaryID, Flags: uint32(querypb.MySqlFlag_NUM_FLAG)},
+			{Name: "Type_FLOAT64  ", Type: querypb.Type_FLOAT64, Charset: collations.CollationBinaryID, Flags: uint32(querypb.MySqlFlag_NUM_FLAG)},
+			{Name: "Type_TIMESTAMP", Type: querypb.Type_TIMESTAMP, Charset: collations.CollationBinaryID, Flags: uint32(querypb.MySqlFlag_BINARY_FLAG | querypb.MySqlFlag_TIMESTAMP_FLAG)},
+			{Name: "Type_DATE     ", Type: querypb.Type_DATE, Charset: collations.CollationBinaryID, Flags: uint32(querypb.MySqlFlag_BINARY_FLAG)},
+			{Name: "Type_TIME     ", Type: querypb.Type_TIME, Charset: collations.CollationBinaryID, Flags: uint32(querypb.MySqlFlag_BINARY_FLAG)},
+			{Name: "Type_DATETIME ", Type: querypb.Type_DATETIME, Charset: collations.CollationBinaryID, Flags: uint32(querypb.MySqlFlag_BINARY_FLAG)},
+			{Name: "Type_YEAR     ", Type: querypb.Type_YEAR, Charset: collations.CollationBinaryID, Flags: uint32(querypb.MySqlFlag_UNSIGNED_FLAG | querypb.MySqlFlag_NUM_FLAG)},
+			{Name: "Type_DECIMAL  ", Type: querypb.Type_DECIMAL, Charset: collations.CollationBinaryID, Flags: uint32(querypb.MySqlFlag_NUM_FLAG)},
+			{Name: "Type_TEXT     ", Type: querypb.Type_TEXT, Charset: uint32(collations.MySQL8().DefaultConnectionCharset())},
+			{Name: "Type_BLOB     ", Type: querypb.Type_BLOB, Charset: collations.CollationBinaryID, Flags: uint32(querypb.MySqlFlag_BINARY_FLAG)},
+			{Name: "Type_VARCHAR  ", Type: querypb.Type_VARCHAR, Charset: uint32(collations.MySQL8().DefaultConnectionCharset())},
+			{Name: "Type_VARBINARY", Type: querypb.Type_VARBINARY, Charset: collations.CollationBinaryID, Flags: uint32(querypb.MySqlFlag_BINARY_FLAG)},
+			{Name: "Type_CHAR     ", Type: querypb.Type_CHAR, Charset: uint32(collations.MySQL8().DefaultConnectionCharset())},
+			{Name: "Type_BINARY   ", Type: querypb.Type_BINARY, Charset: collations.CollationBinaryID, Flags: uint32(querypb.MySqlFlag_BINARY_FLAG)},
+			{Name: "Type_BIT      ", Type: querypb.Type_BIT, Charset: collations.CollationBinaryID, Flags: uint32(querypb.MySqlFlag_BINARY_FLAG)},
+			{Name: "Type_ENUM     ", Type: querypb.Type_ENUM, Charset: uint32(collations.MySQL8().DefaultConnectionCharset()), Flags: uint32(querypb.MySqlFlag_ENUM_FLAG)},
+			{Name: "Type_SET      ", Type: querypb.Type_SET, Charset: uint32(collations.MySQL8().DefaultConnectionCharset()), Flags: uint32(querypb.MySqlFlag_SET_FLAG)},
 			// Skip TUPLE, not possible in Result.
-			{Name: "Type_GEOMETRY ", Type: querypb.Type_GEOMETRY},
-			{Name: "Type_JSON     ", Type: querypb.Type_JSON},
+			{Name: "Type_GEOMETRY ", Type: querypb.Type_GEOMETRY, Charset: collations.CollationBinaryID, Flags: uint32(querypb.MySqlFlag_BINARY_FLAG | querypb.MySqlFlag_BLOB_FLAG)},
+			{Name: "Type_JSON     ", Type: querypb.Type_JSON, Charset: collations.CollationUtf8mb4ID},
+			{Name: "Type_VECTOR   ", Type: querypb.Type_VECTOR, Charset: collations.CollationBinaryID},
 		},
 		Rows: [][]sqltypes.Value{
 			{
@@ -484,8 +493,10 @@ func TestQueries(t *testing.T) {
 				sqltypes.MakeTrusted(querypb.Type_SET, []byte("Type_SET")),
 				sqltypes.MakeTrusted(querypb.Type_GEOMETRY, []byte("Type_GEOMETRY")),
 				sqltypes.MakeTrusted(querypb.Type_JSON, []byte("Type_JSON")),
+				sqltypes.MakeTrusted(querypb.Type_VECTOR, []byte("Type_VECTOR")),
 			},
 			{
+				sqltypes.NULL,
 				sqltypes.NULL,
 				sqltypes.NULL,
 				sqltypes.NULL,
@@ -524,8 +535,9 @@ func TestQueries(t *testing.T) {
 	checkQuery(t, "first empty string", sConn, cConn, &sqltypes.Result{
 		Fields: []*querypb.Field{
 			{
-				Name: "name",
-				Type: querypb.Type_VARCHAR,
+				Name:    "name",
+				Type:    querypb.Type_VARCHAR,
+				Charset: uint32(collations.MySQL8().DefaultConnectionCharset()),
 			},
 		},
 		Rows: [][]sqltypes.Value{
@@ -542,7 +554,9 @@ func TestQueries(t *testing.T) {
 	checkQuery(t, "type only", sConn, cConn, &sqltypes.Result{
 		Fields: []*querypb.Field{
 			{
-				Type: querypb.Type_INT64,
+				Type:    querypb.Type_INT64,
+				Charset: collations.CollationBinaryID,
+				Flags:   uint32(querypb.MySqlFlag_NUM_FLAG),
 			},
 		},
 		Rows: [][]sqltypes.Value{
@@ -651,13 +665,7 @@ func checkQueryInternal(t *testing.T, query string, sConn, cConn *Conn, result *
 		}
 		got, gotWarnings, err := cConn.ExecuteFetchWithWarningCount(query, maxrows, wantfields)
 		if !allRows && len(result.Rows) > 1 {
-			if err == nil {
-				t.Errorf("ExecuteFetch should have failed but got: %v", got)
-			}
-			sqlErr, ok := err.(*SQLError)
-			if !ok || sqlErr.Number() != ERVitessMaxRowsExceeded {
-				t.Errorf("Expected ERVitessMaxRowsExceeded %v, got %v", ERVitessMaxRowsExceeded, sqlErr.Number())
-			}
+			require.ErrorContains(t, err, "Row count exceeded")
 			return
 		}
 		if err != nil {
@@ -671,6 +679,7 @@ func checkQueryInternal(t *testing.T, query string, sConn, cConn *Conn, result *
 		if !got.Equal(&expected) {
 			for i, f := range got.Fields {
 				if i < len(expected.Fields) && !proto.Equal(f, expected.Fields[i]) {
+					t.Logf("Query = %v", query)
 					t.Logf("Got      field(%v) = %v", i, f)
 					t.Logf("Expected field(%v) = %v", i, expected.Fields[i])
 				}
@@ -752,35 +761,13 @@ func checkQueryInternal(t *testing.T, query string, sConn, cConn *Conn, result *
 
 	for i := 0; i < count; i++ {
 		kontinue := sConn.handleNextCommand(&handler)
-		if !kontinue {
-			t.Fatalf("error handling command: %d", i)
-		}
+		require.True(t, kontinue, "error handling command: %d", i)
+
 	}
 
 	wg.Wait()
+	require.Equal(t, "", fatalError, fatalError)
 
-	if fatalError != "" {
-		t.Fatalf(fatalError)
-	}
-}
-
-//nolint
-func writeResult(conn *Conn, result *sqltypes.Result) error {
-	if len(result.Fields) == 0 {
-		return conn.writeOKPacket(&PacketOK{
-			affectedRows: result.RowsAffected,
-			lastInsertID: result.InsertID,
-			statusFlags:  conn.StatusFlags,
-			warnings:     0,
-		})
-	}
-	if err := conn.writeFields(result); err != nil {
-		return err
-	}
-	if err := conn.writeRows(result); err != nil {
-		return err
-	}
-	return conn.writeEndResult(false, 0, 0, 0)
 }
 
 func RowString(row []sqltypes.Value) string {

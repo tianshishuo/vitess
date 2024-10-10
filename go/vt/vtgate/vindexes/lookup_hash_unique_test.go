@@ -17,10 +17,10 @@ limitations under the License.
 package vindexes
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/sqltypes"
@@ -28,24 +28,54 @@ import (
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
+func lookupHashUniqueCreateVindexTestCase(
+	testName string,
+	vindexParams map[string]string,
+	expectErr error,
+	expectUnknownParams []string,
+) createVindexTestCase {
+	return createVindexTestCase{
+		testName: testName,
+
+		vindexType:   "lookup_hash_unique",
+		vindexName:   "lookup_hash_unique",
+		vindexParams: vindexParams,
+
+		expectCost:          10,
+		expectErr:           expectErr,
+		expectIsUnique:      true,
+		expectNeedsVCursor:  true,
+		expectString:        "lookup_hash_unique",
+		expectUnknownParams: expectUnknownParams,
+	}
+}
+
+func TestLookupHashUniqueCreateVindex(t *testing.T) {
+	testLookupCreateVindexCommonCases(t, lookupHashUniqueCreateVindexTestCase)
+}
+
 func TestLookupHashUniqueNew(t *testing.T) {
-	l := createLookup(t, "lookup_hash_unique", false)
+	l := createLookup(t, "lookup_hash_unique", false /* writeOnly */)
 	if want, got := l.(*LookupHashUnique).writeOnly, false; got != want {
 		t.Errorf("Create(lookup, false): %v, want %v", got, want)
 	}
 
-	vindex, _ := CreateVindex("lookup_hash_unique", "lookup_hash_unique", map[string]string{
+	vindex, err := CreateVindex("lookup_hash_unique", "lookup_hash_unique", map[string]string{
 		"table":      "t",
 		"from":       "fromc",
 		"to":         "toc",
 		"write_only": "true",
 	})
+	unknownParams := vindex.(ParamValidating).UnknownParams()
+	require.Empty(t, unknownParams)
+	require.NoError(t, err)
+
 	l = vindex.(SingleColumn)
 	if want, got := l.(*LookupHashUnique).writeOnly, true; got != want {
 		t.Errorf("Create(lookup, false): %v, want %v", got, want)
 	}
 
-	_, err := CreateVindex("lookup_hash_unique", "lookup_hash_unique", map[string]string{
+	vdx, err := CreateVindex("lookup_hash_unique", "lookup_hash_unique", map[string]string{
 		"table":      "t",
 		"from":       "fromc",
 		"to":         "toc",
@@ -55,21 +85,17 @@ func TestLookupHashUniqueNew(t *testing.T) {
 	if err == nil || err.Error() != want {
 		t.Errorf("Create(bad_scatter): %v, want %s", err, want)
 	}
-}
-
-func TestLookupHashUniqueInfo(t *testing.T) {
-	lhu := createLookup(t, "lookup_hash_unique", false)
-	assert.Equal(t, 10, lhu.Cost())
-	assert.Equal(t, "lookup_hash_unique", lhu.String())
-	assert.True(t, lhu.IsUnique())
-	assert.True(t, lhu.NeedsVCursor())
+	if err == nil {
+		unknownParams = vdx.(ParamValidating).UnknownParams()
+		require.Empty(t, unknownParams)
+	}
 }
 
 func TestLookupHashUniqueMap(t *testing.T) {
-	lhu := createLookup(t, "lookup_hash_unique", false)
+	lhu := createLookup(t, "lookup_hash_unique", false /* writeOnly */)
 	vc := &vcursor{numRows: 1}
 
-	got, err := lhu.Map(vc, []sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewInt64(2)})
+	got, err := lhu.Map(context.Background(), vc, []sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewInt64(2)})
 	require.NoError(t, err)
 	want := []key.Destination{
 		key.DestinationKeyspaceID([]byte("\x16k@\xb4J\xbaK\xd6")),
@@ -80,7 +106,7 @@ func TestLookupHashUniqueMap(t *testing.T) {
 	}
 
 	vc.numRows = 0
-	got, err = lhu.Map(vc, []sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewInt64(2)})
+	got, err = lhu.Map(context.Background(), vc, []sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewInt64(2)})
 	require.NoError(t, err)
 	want = []key.Destination{
 		key.DestinationNone{},
@@ -91,7 +117,7 @@ func TestLookupHashUniqueMap(t *testing.T) {
 	}
 
 	vc.numRows = 2
-	_, err = lhu.Map(vc, []sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewInt64(2)})
+	_, err = lhu.Map(context.Background(), vc, []sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewInt64(2)})
 	wantErr := "LookupHash.Map: unexpected multiple results from vindex t: INT64(1)"
 	if err == nil || err.Error() != wantErr {
 		t.Errorf("lhu(query fail) err: %v, want %s", err, wantErr)
@@ -102,7 +128,7 @@ func TestLookupHashUniqueMap(t *testing.T) {
 		sqltypes.MakeTestFields("b|a", "bigint|varbinary"),
 		"1|notint",
 	)
-	got, err = lhu.Map(vc, []sqltypes.Value{sqltypes.NewInt64(1)})
+	got, err = lhu.Map(context.Background(), vc, []sqltypes.Value{sqltypes.NewInt64(1)})
 	require.NoError(t, err)
 	want = []key.Destination{
 		key.DestinationNone{},
@@ -113,7 +139,7 @@ func TestLookupHashUniqueMap(t *testing.T) {
 
 	// Test query fail.
 	vc.mustFail = true
-	_, err = lhu.Map(vc, []sqltypes.Value{sqltypes.NewInt64(1)})
+	_, err = lhu.Map(context.Background(), vc, []sqltypes.Value{sqltypes.NewInt64(1)})
 	wantErr = "lookup.Map: execute failed"
 	if err == nil || err.Error() != wantErr {
 		t.Errorf("lhu(query fail) err: %v, want %s", err, wantErr)
@@ -125,7 +151,7 @@ func TestLookupHashUniqueMapWriteOnly(t *testing.T) {
 	lhu := createLookup(t, "lookup_hash_unique", true)
 	vc := &vcursor{numRows: 0}
 
-	got, err := lhu.Map(vc, []sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewInt64(2)})
+	got, err := lhu.Map(context.Background(), vc, []sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewInt64(2)})
 	require.NoError(t, err)
 	want := []key.Destination{
 		key.DestinationKeyRange{
@@ -141,14 +167,12 @@ func TestLookupHashUniqueMapWriteOnly(t *testing.T) {
 }
 
 func TestLookupHashUniqueVerify(t *testing.T) {
-	lhu := createLookup(t, "lookup_hash_unique", false)
+	lhu := createLookup(t, "lookup_hash_unique", false /* writeOnly */)
 	vc := &vcursor{numRows: 1}
 
 	// The check doesn't actually happen. But we give correct values
 	// to avoid confusion.
-	got, err := lhu.Verify(vc,
-		[]sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewInt64(2)},
-		[][]byte{[]byte("\x16k@\xb4J\xbaK\xd6"), []byte("\x06\xe7\xea\"Βp\x8f")})
+	got, err := lhu.Verify(context.Background(), vc, []sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewInt64(2)}, [][]byte{[]byte("\x16k@\xb4J\xbaK\xd6"), []byte("\x06\xe7\xea\"Βp\x8f")})
 	require.NoError(t, err)
 	want := []bool{true, true}
 	if !reflect.DeepEqual(got, want) {
@@ -156,14 +180,14 @@ func TestLookupHashUniqueVerify(t *testing.T) {
 	}
 
 	vc.numRows = 0
-	got, err = lhu.Verify(vc, []sqltypes.Value{sqltypes.NewInt64(1)}, [][]byte{[]byte("\x16k@\xb4J\xbaK\xd6")})
+	got, err = lhu.Verify(context.Background(), vc, []sqltypes.Value{sqltypes.NewInt64(1)}, [][]byte{[]byte("\x16k@\xb4J\xbaK\xd6")})
 	require.NoError(t, err)
 	want = []bool{false}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("lhu.Verify(mismatch): %v, want %v", got, want)
 	}
 
-	_, err = lhu.Verify(vc, []sqltypes.Value{sqltypes.NewInt64(1)}, [][]byte{[]byte("bogus")})
+	_, err = lhu.Verify(context.Background(), vc, []sqltypes.Value{sqltypes.NewInt64(1)}, [][]byte{[]byte("bogus")})
 	wantErr := "lookup.Verify.vunhash: invalid keyspace id: 626f677573"
 	if err == nil || err.Error() != wantErr {
 		t.Errorf("lhu.Verify(bogus) err: %v, want %s", err, wantErr)
@@ -174,7 +198,7 @@ func TestLookupHashUniqueVerifyWriteOnly(t *testing.T) {
 	lhu := createLookup(t, "lookup_hash_unique", true)
 	vc := &vcursor{numRows: 0}
 
-	got, err := lhu.Verify(vc, []sqltypes.Value{sqltypes.NewInt64(1)}, [][]byte{[]byte("test")})
+	got, err := lhu.Verify(context.Background(), vc, []sqltypes.Value{sqltypes.NewInt64(1)}, [][]byte{[]byte("test")})
 	require.NoError(t, err)
 	want := []bool{true}
 	if !reflect.DeepEqual(got, want) {
@@ -186,16 +210,16 @@ func TestLookupHashUniqueVerifyWriteOnly(t *testing.T) {
 }
 
 func TestLookupHashUniqueCreate(t *testing.T) {
-	lhu := createLookup(t, "lookup_hash_unique", false)
+	lhu := createLookup(t, "lookup_hash_unique", false /* writeOnly */)
 	vc := &vcursor{}
 
-	err := lhu.(Lookup).Create(vc, [][]sqltypes.Value{{sqltypes.NewInt64(1)}}, [][]byte{[]byte("\x16k@\xb4J\xbaK\xd6")}, false /* ignoreMode */)
+	err := lhu.(Lookup).Create(context.Background(), vc, [][]sqltypes.Value{{sqltypes.NewInt64(1)}}, [][]byte{[]byte("\x16k@\xb4J\xbaK\xd6")}, false /* ignoreMode */)
 	require.NoError(t, err)
 	if got, want := len(vc.queries), 1; got != want {
 		t.Errorf("vc.queries length: %v, want %v", got, want)
 	}
 
-	err = lhu.(Lookup).Create(vc, [][]sqltypes.Value{{sqltypes.NewInt64(1)}}, [][]byte{[]byte("bogus")}, false /* ignoreMode */)
+	err = lhu.(Lookup).Create(context.Background(), vc, [][]sqltypes.Value{{sqltypes.NewInt64(1)}}, [][]byte{[]byte("bogus")}, false /* ignoreMode */)
 	want := "lookup.Create.vunhash: invalid keyspace id: 626f677573"
 	if err == nil || err.Error() != want {
 		t.Errorf("lhu.Create(bogus) err: %v, want %s", err, want)
@@ -203,16 +227,16 @@ func TestLookupHashUniqueCreate(t *testing.T) {
 }
 
 func TestLookupHashUniqueDelete(t *testing.T) {
-	lhu := createLookup(t, "lookup_hash_unique", false)
+	lhu := createLookup(t, "lookup_hash_unique", false /* writeOnly */)
 	vc := &vcursor{}
 
-	err := lhu.(Lookup).Delete(vc, [][]sqltypes.Value{{sqltypes.NewInt64(1)}}, []byte("\x16k@\xb4J\xbaK\xd6"))
+	err := lhu.(Lookup).Delete(context.Background(), vc, [][]sqltypes.Value{{sqltypes.NewInt64(1)}}, []byte("\x16k@\xb4J\xbaK\xd6"))
 	require.NoError(t, err)
 	if got, want := len(vc.queries), 1; got != want {
 		t.Errorf("vc.queries length: %v, want %v", got, want)
 	}
 
-	err = lhu.(Lookup).Delete(vc, [][]sqltypes.Value{{sqltypes.NewInt64(1)}}, []byte("bogus"))
+	err = lhu.(Lookup).Delete(context.Background(), vc, [][]sqltypes.Value{{sqltypes.NewInt64(1)}}, []byte("bogus"))
 	want := "lookup.Delete.vunhash: invalid keyspace id: 626f677573"
 	if err == nil || err.Error() != want {
 		t.Errorf("lhu.Delete(bogus) err: %v, want %s", err, want)
@@ -220,10 +244,10 @@ func TestLookupHashUniqueDelete(t *testing.T) {
 }
 
 func TestLookupHashUniqueUpdate(t *testing.T) {
-	lhu := createLookup(t, "lookup_hash_unique", false)
+	lhu := createLookup(t, "lookup_hash_unique", false /* writeOnly */)
 	vc := &vcursor{}
 
-	err := lhu.(Lookup).Update(vc, []sqltypes.Value{sqltypes.NewInt64(1)}, []byte("\x16k@\xb4J\xbaK\xd6"), []sqltypes.Value{sqltypes.NewInt64(2)})
+	err := lhu.(Lookup).Update(context.Background(), vc, []sqltypes.Value{sqltypes.NewInt64(1)}, []byte("\x16k@\xb4J\xbaK\xd6"), []sqltypes.Value{sqltypes.NewInt64(2)})
 	require.NoError(t, err)
 	if got, want := len(vc.queries), 2; got != want {
 		t.Errorf("vc.queries length: %v, want %v", got, want)

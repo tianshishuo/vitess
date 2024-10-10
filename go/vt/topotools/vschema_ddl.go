@@ -17,7 +17,6 @@ limitations under the License.
 package topotools
 
 import (
-	"fmt"
 	"reflect"
 
 	"vitess.io/vitess/go/vt/sqlparser"
@@ -125,7 +124,7 @@ func ApplyVSchemaDDL(ksName string, ks *vschemapb.Keyspace, alterVschema *sqlpar
 		//    already exists.
 		spec := alterVschema.VindexSpec
 		name := spec.Name.String()
-		if !spec.Type.IsEmpty() {
+		if spec.Type.NotEmpty() {
 			owner, params := spec.ParseParams()
 			if vindex, ok := ks.Vindexes[name]; ok {
 				if vindex.Type != spec.Type.String() {
@@ -215,6 +214,20 @@ func ApplyVSchemaDDL(ksName string, ks *vschemapb.Keyspace, alterVschema *sqlpar
 
 		return ks, nil
 
+	case sqlparser.DropSequenceDDLAction:
+		if ks.Sharded {
+			return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "drop sequence table: unsupported on sharded keyspace %s", ksName)
+		}
+
+		name := alterVschema.Table.Name.String()
+		if _, ok := ks.Tables[name]; !ok {
+			return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "vschema does not contain sequence %s in keyspace %s", name, ksName)
+		}
+
+		delete(ks.Tables, name)
+
+		return ks, nil
+
 	case sqlparser.AddAutoIncDDLAction:
 		name := alterVschema.Table.Name.String()
 		table := ks.Tables[name]
@@ -226,16 +239,25 @@ func ApplyVSchemaDDL(ksName string, ks *vschemapb.Keyspace, alterVschema *sqlpar
 			return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "vschema already contains auto inc %v on table %s in keyspace %s", table.AutoIncrement, name, ksName)
 		}
 
-		sequence := alterVschema.AutoIncSpec.Sequence
-		sequenceFqn := sequence.Name.String()
-		if sequence.Qualifier.String() != "" {
-			sequenceFqn = fmt.Sprintf("%s.%s", sequence.Qualifier.String(), sequenceFqn)
-		}
-
 		table.AutoIncrement = &vschemapb.AutoIncrement{
 			Column:   alterVschema.AutoIncSpec.Column.String(),
-			Sequence: sequenceFqn,
+			Sequence: sqlparser.String(alterVschema.AutoIncSpec.Sequence),
 		}
+
+		return ks, nil
+
+	case sqlparser.DropAutoIncDDLAction:
+		name := alterVschema.Table.Name.String()
+		table := ks.Tables[name]
+		if table == nil {
+			return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "vschema does not contain table %s in keyspace %s", name, ksName)
+		}
+
+		if table.AutoIncrement == nil {
+			return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "vschema does not contain auto increment %v on table %s in keyspace %s", table.AutoIncrement, name, ksName)
+		}
+
+		table.AutoIncrement = nil
 
 		return ks, nil
 	}

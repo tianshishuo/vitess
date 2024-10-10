@@ -17,10 +17,9 @@ limitations under the License.
 package vindexes
 
 import (
+	"context"
 	"reflect"
 	"testing"
-
-	"github.com/stretchr/testify/assert"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
@@ -29,15 +28,60 @@ import (
 var charVindexMD5 SingleColumn
 
 func init() {
-	vindex, _ := CreateVindex("unicode_loose_md5", "utf8ch", nil)
+	vindex, err := CreateVindex("unicode_loose_md5", "utf8ch", nil)
+	if err != nil {
+		panic(err)
+	}
 	charVindexMD5 = vindex.(SingleColumn)
 }
 
-func TestUnicodeLooseMD5Info(t *testing.T) {
-	assert.Equal(t, 1, charVindexMD5.Cost())
-	assert.Equal(t, "utf8ch", charVindexMD5.String())
-	assert.True(t, charVindexMD5.IsUnique())
-	assert.False(t, charVindexMD5.NeedsVCursor())
+func unicodeLooseMD5CreateVindexTestCase(
+	testName string,
+	vindexParams map[string]string,
+	expectErr error,
+	expectUnknownParams []string,
+) createVindexTestCase {
+	return createVindexTestCase{
+		testName: testName,
+
+		vindexType:   "unicode_loose_md5",
+		vindexName:   "unicode_loose_md5",
+		vindexParams: vindexParams,
+
+		expectCost:          1,
+		expectErr:           expectErr,
+		expectIsUnique:      true,
+		expectNeedsVCursor:  false,
+		expectString:        "unicode_loose_md5",
+		expectUnknownParams: expectUnknownParams,
+	}
+}
+
+func TestUnicodeLooseMD5CreateVindex(t *testing.T) {
+	cases := []createVindexTestCase{
+		unicodeLooseMD5CreateVindexTestCase(
+			"no params",
+			nil,
+			nil,
+			nil,
+		),
+		unicodeLooseMD5CreateVindexTestCase(
+			"empty params",
+			map[string]string{},
+			nil,
+			nil,
+		),
+		unicodeLooseMD5CreateVindexTestCase(
+			"unknown params",
+			map[string]string{
+				"hello": "world",
+			},
+			nil,
+			[]string{"hello"},
+		),
+	}
+
+	testCreateVindexes(t, cases)
 }
 
 func TestUnicodeLooseMD5Map(t *testing.T) {
@@ -79,7 +123,7 @@ func TestUnicodeLooseMD5Map(t *testing.T) {
 		out: "\xd4\x1d\x8cُ\x00\xb2\x04\xe9\x80\t\x98\xec\xf8B~",
 	}}
 	for _, tcase := range tcases {
-		got, err := charVindexMD5.Map(nil, []sqltypes.Value{tcase.in})
+		got, err := charVindexMD5.Map(context.Background(), nil, []sqltypes.Value{tcase.in})
 		if err != nil {
 			t.Error(err)
 		}
@@ -93,7 +137,7 @@ func TestUnicodeLooseMD5Map(t *testing.T) {
 func TestUnicodeLooseMD5Verify(t *testing.T) {
 	ids := []sqltypes.Value{sqltypes.NewVarBinary("Test"), sqltypes.NewVarBinary("TEst"), sqltypes.NewVarBinary("different")}
 	ksids := [][]byte{[]byte("\v^۴\x01\xfdu$96\x90I\x1dd\xf1\xf5"), []byte("\v^۴\x01\xfdu$96\x90I\x1dd\xf1\xf5"), []byte("\v^۴\x01\xfdu$96\x90I\x1dd\xf1\xf5")}
-	got, err := charVindexMD5.Verify(nil, ids, ksids)
+	got, err := charVindexMD5.Verify(context.Background(), nil, ids, ksids)
 	if err != nil {
 		t.Fatal(err)
 	}

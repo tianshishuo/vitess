@@ -18,12 +18,11 @@ package vindexes
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"fmt"
 	"reflect"
 	"testing"
-
-	"github.com/stretchr/testify/assert"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
@@ -32,18 +31,60 @@ import (
 var xxHash SingleColumn
 
 func init() {
-	hv, err := CreateVindex("xxhash", "xxhash_name", map[string]string{"Table": "t", "Column": "c"})
+	hv, err := CreateVindex("xxhash", "xxhash_name", map[string]string{})
 	if err != nil {
 		panic(err)
 	}
 	xxHash = hv.(SingleColumn)
 }
 
-func TestXXHashInfo(t *testing.T) {
-	assert.Equal(t, 1, xxHash.Cost())
-	assert.Equal(t, "xxhash_name", xxHash.String())
-	assert.True(t, xxHash.IsUnique())
-	assert.False(t, xxHash.NeedsVCursor())
+func xxhashCreateVindexTestCase(
+	testName string,
+	vindexParams map[string]string,
+	expectErr error,
+	expectUnknownParams []string,
+) createVindexTestCase {
+	return createVindexTestCase{
+		testName: testName,
+
+		vindexType:   "xxhash",
+		vindexName:   "xxhash",
+		vindexParams: vindexParams,
+
+		expectCost:          1,
+		expectErr:           expectErr,
+		expectIsUnique:      true,
+		expectNeedsVCursor:  false,
+		expectString:        "xxhash",
+		expectUnknownParams: expectUnknownParams,
+	}
+}
+
+func TestXXHashCreateVindex(t *testing.T) {
+	cases := []createVindexTestCase{
+		xxhashCreateVindexTestCase(
+			"no params",
+			nil,
+			nil,
+			nil,
+		),
+		xxhashCreateVindexTestCase(
+			"empty params",
+			map[string]string{},
+			nil,
+			nil,
+		),
+		xxhashCreateVindexTestCase(
+			"unknown params",
+			map[string]string{
+				"hello": "world",
+			},
+			nil,
+			[]string{"hello"},
+		),
+	}
+
+	testCreateVindexes(t, cases)
 }
 
 func TestXXHashMap(t *testing.T) {
@@ -83,7 +124,7 @@ func TestXXHashMap(t *testing.T) {
 	}}
 
 	for _, tcase := range tcases {
-		got, err := xxHash.Map(nil, []sqltypes.Value{tcase.in})
+		got, err := xxHash.Map(context.Background(), nil, []sqltypes.Value{tcase.in})
 		if err != nil {
 			t.Error(err)
 		}
@@ -101,7 +142,7 @@ func TestXXHashVerify(t *testing.T) {
 	hexBytes, _ := hex.DecodeString(hexValStr)
 	ids := []sqltypes.Value{sqltypes.NewUint64(1), sqltypes.NewUint64(2), sqltypes.NewHexVal([]byte(hexValStrSQL)), sqltypes.NewHexNum([]byte(hexNumStrSQL))}
 	ksids := [][]byte{{0xd4, 0x64, 0x5, 0x36, 0x76, 0x12, 0xb4, 0xb7}, {0xd4, 0x64, 0x5, 0x36, 0x76, 0x12, 0xb4, 0xb7}, vXXHash(hexBytes), vXXHash(hexBytes)}
-	got, err := xxHash.Verify(nil, ids, ksids)
+	got, err := xxHash.Verify(context.Background(), nil, ids, ksids)
 	if err != nil {
 		t.Fatal(err)
 	}

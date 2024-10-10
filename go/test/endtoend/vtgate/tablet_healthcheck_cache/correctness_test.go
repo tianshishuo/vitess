@@ -25,8 +25,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gotest.tools/assert"
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/test/endtoend/cluster"
@@ -105,13 +105,13 @@ func TestMain(m *testing.M) {
 			SchemaSQL: schemaSQL,
 			VSchema:   vSchema,
 		}
-		clusterInstance.VtTabletExtraArgs = append(clusterInstance.VtTabletExtraArgs, []string{"-health_check_interval", "1s"}...)
+		clusterInstance.VtTabletExtraArgs = append(clusterInstance.VtTabletExtraArgs, []string{"--health_check_interval", "1s"}...)
 		err = clusterInstance.StartKeyspace(*keyspace, shards, 1, false)
 		if err != nil {
 			return 1
 		}
 
-		clusterInstance.VtGateExtraArgs = append(clusterInstance.VtGateExtraArgs, []string{"-tablet_refresh_interval", tabletRefreshInterval.String()}...)
+		clusterInstance.VtGateExtraArgs = append(clusterInstance.VtGateExtraArgs, []string{"--tablet_refresh_interval", tabletRefreshInterval.String()}...)
 		err = clusterInstance.StartVtgate()
 		if err != nil {
 			return 1
@@ -159,7 +159,7 @@ func TestHealthCheckCacheWithTabletChurn(t *testing.T) {
 		deleteTablet(t, tablet)
 		expectedTabletHCcacheEntries--
 
-		// We need to sleep for at least vtgate's -tablet_refresh_interval to be sure we
+		// We need to sleep for at least vtgate's --tablet_refresh_interval to be sure we
 		// have resynchronized the healthcheck cache with the topo server via the topology
 		// watcher and pruned the deleted tablet from the healthcheck cache.
 		time.Sleep(tabletRefreshInterval)
@@ -183,7 +183,9 @@ func addTablet(t *testing.T, tabletUID int, tabletType string) *cluster.Vttablet
 		Alias:     fmt.Sprintf("%s-%010d", cell, tabletUID),
 	}
 	// Start Mysqlctl process
-	tablet.MysqlctlProcess = *cluster.MysqlCtlProcessInstanceOptionalInit(tablet.TabletUID, tablet.MySQLPort, clusterInstance.TmpDirectory, !clusterInstance.ReusingVTDATAROOT)
+	mysqlctlProcess, err := cluster.MysqlCtlProcessInstanceOptionalInit(tablet.TabletUID, tablet.MySQLPort, clusterInstance.TmpDirectory, !clusterInstance.ReusingVTDATAROOT)
+	require.Nil(t, err)
+	tablet.MysqlctlProcess = *mysqlctlProcess
 	proc, err := tablet.MysqlctlProcess.StartProcess()
 	require.Nil(t, err)
 
@@ -201,20 +203,20 @@ func addTablet(t *testing.T, tabletUID int, tabletType string) *cluster.Vttablet
 		clusterInstance.Hostname,
 		clusterInstance.TmpDirectory,
 		clusterInstance.VtTabletExtraArgs,
-		clusterInstance.EnableSemiSync,
 		clusterInstance.DefaultCharset)
 
 	// wait for mysqld to be ready
 	err = proc.Wait()
 	require.Nil(t, err)
 
+	tablet.VttabletProcess.ServingStatus = ""
 	err = tablet.VttabletProcess.Setup()
 	require.Nil(t, err)
 
 	serving := tablet.VttabletProcess.WaitForStatus("SERVING", time.Duration(60*time.Second))
 	assert.Equal(t, serving, true, "Tablet did not become ready within a reasonable time")
 	err = clusterInstance.VtgateProcess.WaitForStatusOfTabletInShard(fmt.Sprintf("%s.%s.%s",
-		tablet.VttabletProcess.Keyspace, tablet.VttabletProcess.Shard, tablet.Type), 1)
+		tablet.VttabletProcess.Keyspace, tablet.VttabletProcess.Shard, tablet.Type), 1, 30*time.Second)
 	require.Nil(t, err)
 
 	t.Logf("Added tablet: %s", tablet.Alias)
@@ -232,7 +234,7 @@ func deleteTablet(t *testing.T, tablet *cluster.Vttablet) {
 	}(tablet)
 	wg.Wait()
 
-	err := clusterInstance.VtctlclientProcess.ExecuteCommand("DeleteTablet", tablet.Alias)
+	err := clusterInstance.VtctldClientProcess.ExecuteCommand("DeleteTablets", tablet.Alias)
 	require.Nil(t, err)
 
 	t.Logf("Deleted tablet: %s", tablet.Alias)

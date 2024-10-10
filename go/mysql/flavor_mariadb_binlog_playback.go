@@ -17,17 +17,9 @@ limitations under the License.
 
 package mysql
 
-// These two methods are isolated here so they can be easily changed
-// in other trees.
-
-// enableBinlogPlaybackCommand is part of the Flavor interface.
-func (mariadbFlavor) enableBinlogPlaybackCommand() string {
-	return ""
-}
-
-// disableBinlogPlaybackCommand is part of the Flavor interface.
-func (mariadbFlavor) disableBinlogPlaybackCommand() string {
-	return ""
+// baseShowTables is part of the Flavor interface.
+func (mariadbFlavor) baseShowTables() string {
+	return mysqlFlavor{}.baseShowTables()
 }
 
 // baseShowTablesWithSizes is part of the Flavor interface.

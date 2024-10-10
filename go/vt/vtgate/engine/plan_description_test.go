@@ -19,6 +19,7 @@ package engine
 import (
 	"testing"
 
+	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vtgate/evalengine"
 
 	"vitess.io/vitess/go/test/utils"
@@ -30,16 +31,16 @@ import (
 func TestCreateRoutePlanDescription(t *testing.T) {
 	route := createRoute()
 
-	planDescription := PrimitiveToPlanDescription(route)
+	planDescription := PrimitiveToPlanDescription(route, nil)
 
 	expected := PrimitiveDescription{
 		OperatorType:      "Route",
 		Variant:           "Scatter",
 		Keyspace:          &vindexes.Keyspace{Name: "ks"},
 		TargetDestination: key.DestinationAllShards{},
-		Other: map[string]interface{}{
+		Other: map[string]any{
 			"Query":      route.Query,
-			"Table":      route.TableName,
+			"Table":      route.GetTableName(),
 			"FieldQuery": route.FieldQuery,
 			"Vindex":     route.Vindex.String(),
 		},
@@ -50,7 +51,7 @@ func TestCreateRoutePlanDescription(t *testing.T) {
 }
 
 func createRoute() *Route {
-	hash, _ := vindexes.NewHash("vindex name", nil)
+	hash, _ := vindexes.CreateVindex("hash", "vindex name", nil)
 	return &Route{
 		RoutingParameters: &RoutingParameters{
 			Opcode:            Scatter,
@@ -75,13 +76,13 @@ func TestPlanDescriptionWithInputs(t *testing.T) {
 		Input:  route,
 	}
 
-	planDescription := PrimitiveToPlanDescription(limit)
+	planDescription := PrimitiveToPlanDescription(limit, nil)
 
 	expected := PrimitiveDescription{
 		OperatorType: "Limit",
-		Other: map[string]interface{}{
-			"Count":  evalengine.FormatExpr(count),
-			"Offset": evalengine.FormatExpr(offset),
+		Other: map[string]any{
+			"Count":  sqlparser.String(count),
+			"Offset": sqlparser.String(offset),
 		},
 		Inputs: []PrimitiveDescription{routeDescr},
 	}
@@ -95,9 +96,9 @@ func getDescriptionFor(route *Route) PrimitiveDescription {
 		Variant:           route.Opcode.String(),
 		Keyspace:          &vindexes.Keyspace{Name: "ks"},
 		TargetDestination: key.DestinationAllShards{},
-		Other: map[string]interface{}{
+		Other: map[string]any{
 			"Query":      route.Query,
-			"Table":      route.TableName,
+			"Table":      route.GetTableName(),
 			"FieldQuery": route.FieldQuery,
 			"Vindex":     route.Vindex.String(),
 		},

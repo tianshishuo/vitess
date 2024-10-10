@@ -17,18 +17,22 @@ limitations under the License.
 package testlib
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
+	"vitess.io/vitess/go/mysql/replication"
 	"vitess.io/vitess/go/vt/discovery"
-
-	"context"
-
-	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
 	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/vtctl/reparentutil"
+	"vitess.io/vitess/go/vt/vtctl/reparentutil/reparenttestutil"
+	"vitess.io/vitess/go/vt/vtenv"
 	"vitess.io/vitess/go/vt/vttablet/tmclient"
 	"vitess.io/vitess/go/vt/wrangler"
 
@@ -42,9 +46,10 @@ func TestShardReplicationStatuses(t *testing.T) {
 	}()
 	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
 
-	ctx := context.Background()
-	ts := memorytopo.NewServer("cell1", "cell2")
-	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ts := memorytopo.NewServer(ctx, "cell1", "cell2")
+	wr := wrangler.New(vtenv.NewTestEnv(), logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
 
 	// create shard and tablets
 	if _, err := ts.GetOrCreateShard(ctx, "test_keyspace", "0"); err != nil {
@@ -62,9 +67,9 @@ func TestShardReplicationStatuses(t *testing.T) {
 	}
 
 	// primary action loop (to initialize host and port)
-	primary.FakeMysqlDaemon.CurrentPrimaryPosition = mysql.Position{
-		GTIDSet: mysql.MariadbGTIDSet{
-			5: mysql.MariadbGTID{
+	primary.FakeMysqlDaemon.CurrentPrimaryPosition = replication.Position{
+		GTIDSet: replication.MariadbGTIDSet{
+			5: replication.MariadbGTID{
 				Domain:   5,
 				Server:   456,
 				Sequence: 892,
@@ -75,9 +80,9 @@ func TestShardReplicationStatuses(t *testing.T) {
 	defer primary.StopActionLoop(t)
 
 	// replica loop
-	replica.FakeMysqlDaemon.CurrentPrimaryPosition = mysql.Position{
-		GTIDSet: mysql.MariadbGTIDSet{
-			5: mysql.MariadbGTID{
+	replica.FakeMysqlDaemon.CurrentPrimaryPosition = replication.Position{
+		GTIDSet: replication.MariadbGTIDSet{
+			5: replication.MariadbGTID{
 				Domain:   5,
 				Server:   456,
 				Sequence: 890,
@@ -85,12 +90,19 @@ func TestShardReplicationStatuses(t *testing.T) {
 		},
 	}
 	replica.FakeMysqlDaemon.CurrentSourceHost = primary.Tablet.MysqlHostname
-	replica.FakeMysqlDaemon.CurrentSourcePort = int(primary.Tablet.MysqlPort)
+	replica.FakeMysqlDaemon.CurrentSourcePort = primary.Tablet.MysqlPort
+	replica.FakeMysqlDaemon.SetReplicationSourceInputs = append(replica.FakeMysqlDaemon.SetReplicationSourceInputs, topoproto.MysqlAddr(primary.Tablet))
+	replica.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
+		// These 3 statements come from tablet startup
+		"STOP REPLICA",
+		"FAKE SET SOURCE",
+		"START REPLICA",
+	}
 	replica.StartActionLoop(t, wr)
 	defer replica.StopActionLoop(t)
 
 	// run ShardReplicationStatuses
-	ti, rs, err := wr.ShardReplicationStatuses(ctx, "test_keyspace", "0")
+	ti, rs, err := reparentutil.ShardReplicationStatuses(ctx, wr.TopoServer(), wr.TabletManagerClient(), "test_keyspace", "0")
 	if err != nil {
 		t.Fatalf("ShardReplicationStatuses failed: %v", err)
 	}
@@ -118,9 +130,10 @@ func TestReparentTablet(t *testing.T) {
 	}()
 	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
 
-	ctx := context.Background()
-	ts := memorytopo.NewServer("cell1", "cell2")
-	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ts := memorytopo.NewServer(ctx, "cell1", "cell2")
+	wr := wrangler.New(vtenv.NewTestEnv(), logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
 
 	// create shard and tablets
 	if _, err := ts.GetOrCreateShard(ctx, "test_keyspace", "0"); err != nil {
@@ -128,6 +141,7 @@ func TestReparentTablet(t *testing.T) {
 	}
 	primary := NewFakeTablet(t, wr, "cell1", 1, topodatapb.TabletType_PRIMARY, nil)
 	replica := NewFakeTablet(t, wr, "cell1", 2, topodatapb.TabletType_REPLICA, nil)
+	reparenttestutil.SetKeyspaceDurability(context.Background(), t, ts, "test_keyspace", "semi_sync")
 
 	// mark the primary inside the shard
 	if _, err := ts.UpdateShardFields(ctx, "test_keyspace", "0", func(si *topo.ShardInfo) error {
@@ -149,9 +163,12 @@ func TestReparentTablet(t *testing.T) {
 	replica.FakeMysqlDaemon.IOThreadRunning = true
 	replica.FakeMysqlDaemon.SetReplicationSourceInputs = append(replica.FakeMysqlDaemon.SetReplicationSourceInputs, topoproto.MysqlAddr(primary.Tablet))
 	replica.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
-		"STOP SLAVE",
-		"FAKE SET MASTER",
-		"START SLAVE",
+		// These 3 statements come from tablet startup
+		"STOP REPLICA",
+		"FAKE SET SOURCE",
+		"START REPLICA",
+		"STOP REPLICA",
+		"START REPLICA",
 	}
 	replica.StartActionLoop(t, wr)
 	defer replica.StopActionLoop(t)
@@ -166,4 +183,134 @@ func TestReparentTablet(t *testing.T) {
 		t.Fatalf("replica.FakeMysqlDaemon.CheckSuperQueryList failed: %v", err)
 	}
 	checkSemiSyncEnabled(t, false, true, replica)
+}
+
+// TestSetReplicationSource tests that SetReplicationSource works as intended under various circumstances.
+func TestSetReplicationSource(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ts := memorytopo.NewServer(ctx, "cell1", "cell2")
+	wr := wrangler.New(vtenv.NewTestEnv(), logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
+
+	// create shard and tablets
+	_, err := ts.GetOrCreateShard(ctx, "test_keyspace", "0")
+	require.NoError(t, err, "CreateShard failed")
+
+	primary := NewFakeTablet(t, wr, "cell1", 1, topodatapb.TabletType_PRIMARY, nil)
+	reparenttestutil.SetKeyspaceDurability(context.Background(), t, ts, "test_keyspace", "semi_sync")
+
+	// mark the primary inside the shard
+	_, err = ts.UpdateShardFields(ctx, "test_keyspace", "0", func(si *topo.ShardInfo) error {
+		si.PrimaryAlias = primary.Tablet.Alias
+		return nil
+	})
+	require.NoError(t, err, "UpdateShardFields failed")
+	pos, err := replication.DecodePosition("MySQL56/8bc65c84-3fe4-11ed-a912-257f0fcdd6c9:1-8")
+	require.NoError(t, err)
+	primary.FakeMysqlDaemon.CurrentPrimaryPositionLocked(pos)
+
+	// primary action loop (to initialize host and port)
+	primary.StartActionLoop(t, wr)
+	defer primary.StopActionLoop(t)
+
+	// test when we receive a relay log error while starting replication
+	t.Run("Relay log error", func(t *testing.T) {
+		replica := NewFakeTablet(t, wr, "cell1", 2, topodatapb.TabletType_REPLICA, nil)
+		// replica loop
+		// We have to set the settings as replicating. Otherwise,
+		// the replication manager intervenes and tries to fix replication,
+		// which ends up making this test unpredictable.
+		replica.FakeMysqlDaemon.Replicating = true
+		replica.FakeMysqlDaemon.IOThreadRunning = true
+		replica.FakeMysqlDaemon.SetReplicationSourceInputs = append(replica.FakeMysqlDaemon.SetReplicationSourceInputs, topoproto.MysqlAddr(primary.Tablet))
+		replica.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
+			// These 3 statements come from tablet startup
+			"STOP REPLICA",
+			"FAKE SET SOURCE",
+			"START REPLICA",
+			// We stop and reset the replication parameters because of relay log issues.
+			"STOP REPLICA",
+			"STOP REPLICA",
+			"RESET REPLICA",
+			"START REPLICA",
+		}
+		replica.StartActionLoop(t, wr)
+		defer replica.StopActionLoop(t)
+
+		// Set the correct error message that indicates we have received a relay log error.
+		replica.FakeMysqlDaemon.StartReplicationError = errors.New("ERROR 1201 (HY000): Could not initialize master info structure; more error messages can be found in the MySQL error log")
+		// run ReparentTablet
+		err = wr.SetReplicationSource(ctx, replica.Tablet)
+		require.NoError(t, err, "SetReplicationSource failed")
+
+		// check what was run
+		err = replica.FakeMysqlDaemon.CheckSuperQueryList()
+		require.NoError(t, err, "CheckSuperQueryList failed")
+		checkSemiSyncEnabled(t, false, true, replica)
+	})
+
+	t.Run("Errant GTIDs on the replica", func(t *testing.T) {
+		replica := NewFakeTablet(t, wr, "cell1", 4, topodatapb.TabletType_REPLICA, nil)
+		// replica loop
+		replica.FakeMysqlDaemon.Replicating = true
+		replica.FakeMysqlDaemon.IOThreadRunning = true
+		replica.FakeMysqlDaemon.SetReplicationSourceInputs = append(replica.FakeMysqlDaemon.SetReplicationSourceInputs, topoproto.MysqlAddr(primary.Tablet))
+		replica.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
+			// These 3 statements come from tablet startup
+			"STOP REPLICA",
+			"FAKE SET SOURCE",
+			"START REPLICA",
+		}
+		replica.StartActionLoop(t, wr)
+		defer replica.StopActionLoop(t)
+
+		// Set replica's GTID to have a write that the primary's GTID doesn't have
+		pos, err = replication.DecodePosition("MySQL56/8bc65c84-3fe4-11ed-a912-257f0fcdd6c9:1-7,8bc65cca-3fe4-11ed-bbfb-091034d48b3e:1")
+		require.NoError(t, err)
+		replica.FakeMysqlDaemon.CurrentRelayLogPosition = pos
+
+		// run SetReplicationSource
+		err = wr.SetReplicationSource(ctx, replica.Tablet)
+		require.ErrorContains(t, err, "Errant GTID detected")
+
+		// check what was run
+		err = replica.FakeMysqlDaemon.CheckSuperQueryList()
+		require.NoError(t, err, "CheckSuperQueryList failed")
+		checkSemiSyncEnabled(t, false, true, replica)
+	})
+
+	// test setting an empty hostname because of primary shutdown
+	t.Run("Primary tablet already shutdown", func(t *testing.T) {
+		replica := NewFakeTablet(t, wr, "cell1", 3, topodatapb.TabletType_REPLICA, nil)
+		// replica loop
+		replica.FakeMysqlDaemon.Replicating = true
+		replica.FakeMysqlDaemon.IOThreadRunning = true
+		replica.FakeMysqlDaemon.SetReplicationSourceInputs = append(replica.FakeMysqlDaemon.SetReplicationSourceInputs, topoproto.MysqlAddr(primary.Tablet))
+		replica.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
+			// These 3 statements come from tablet startup
+			"STOP REPLICA",
+			"FAKE SET SOURCE",
+			"START REPLICA",
+			// For the SetReplicationSource call, we shouldn't get any queries at all!
+		}
+		replica.StartActionLoop(t, wr)
+		defer replica.StopActionLoop(t)
+
+		// stop the primary
+		primary.StopActionLoop(t)
+		// update the primary topo record
+		wr.TopoServer().UpdateTabletFields(ctx, primary.Tablet.Alias, func(tablet *topodatapb.Tablet) error {
+			tablet.MysqlHostname = ""
+			return nil
+		})
+
+		// run SetReplicationSource
+		err = wr.SetReplicationSource(ctx, replica.Tablet)
+		require.ErrorContains(t, err, "Shard primary has empty mysql hostname")
+
+		// check what was run
+		err = replica.FakeMysqlDaemon.CheckSuperQueryList()
+		require.NoError(t, err, "CheckSuperQueryList failed")
+		checkSemiSyncEnabled(t, false, true, replica)
+	})
 }

@@ -64,7 +64,7 @@ func commandApplyRoutingRules(cmd *cobra.Command, args []string) error {
 	}
 
 	if applyRoutingRulesOptions.Rules == "" && applyRoutingRulesOptions.RulesFilePath == "" {
-		return errors.New("must pass exactly one of --rules and --rules-file")
+		return errors.New("must pass exactly one of --rules or --rules-file")
 	}
 
 	cli.FinishedParsing(cmd)
@@ -82,7 +82,7 @@ func commandApplyRoutingRules(cmd *cobra.Command, args []string) error {
 	}
 
 	rr := &vschemapb.RoutingRules{}
-	if err := json2.Unmarshal(rulesBytes, &rr); err != nil {
+	if err := json2.UnmarshalPB(rulesBytes, rr); err != nil {
 		return err
 	}
 
@@ -146,9 +146,9 @@ func commandGetRoutingRules(cmd *cobra.Command, args []string) error {
 }
 
 func init() {
-	ApplyRoutingRules.Flags().StringVarP(&applyRoutingRulesOptions.Rules, "rules", "r", "", "Routing rules, specified as a string")
-	ApplyRoutingRules.Flags().StringVarP(&applyRoutingRulesOptions.RulesFilePath, "rules-file", "f", "", "Path to a file containing routing rules specified as JSON")
-	ApplyRoutingRules.Flags().StringSliceVarP(&applyRoutingRulesOptions.Cells, "cells", "c", nil, "Limit the VSchema graph rebuildingg to the specified cells. Ignored if --skip-rebuild is specified.")
+	ApplyRoutingRules.Flags().StringVarP(&applyRoutingRulesOptions.Rules, "rules", "r", "", "Routing rules, specified as a string.")
+	ApplyRoutingRules.Flags().StringVarP(&applyRoutingRulesOptions.RulesFilePath, "rules-file", "f", "", "Path to a file containing routing rules specified as JSON.")
+	ApplyRoutingRules.Flags().StringSliceVarP(&applyRoutingRulesOptions.Cells, "cells", "c", nil, "Limit the VSchema graph rebuilding to the specified cells. Ignored if --skip-rebuild is specified.")
 	ApplyRoutingRules.Flags().BoolVar(&applyRoutingRulesOptions.SkipRebuild, "skip-rebuild", false, "Skip rebuilding the SrvVSchema objects.")
 	ApplyRoutingRules.Flags().BoolVarP(&applyRoutingRulesOptions.DryRun, "dry-run", "d", false, "Load the specified routing rules as a validation step, but do not actually apply the rules to the topo.")
 	Root.AddCommand(ApplyRoutingRules)

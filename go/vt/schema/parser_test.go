@@ -48,117 +48,6 @@ func TestParseAlterTableOptions(t *testing.T) {
 	}
 }
 
-func TestReplaceTableNameInCreateTableStatement(t *testing.T) {
-	replacementTableName := `my_table`
-	tt := []struct {
-		stmt    string
-		expect  string
-		isError bool
-	}{
-		{
-			stmt:    "CREATE TABLE tbl (id int)",
-			isError: true,
-		},
-		{
-			stmt:   "CREATE TABLE `tbl` (id int)",
-			expect: "CREATE TABLE `my_table` (id int)",
-		},
-		{
-			stmt:   "CREATE     TABLE     `tbl`    (id int)",
-			expect: "CREATE     TABLE     `my_table`    (id int)",
-		},
-		{
-			stmt:   "create table `tbl` (id int)",
-			expect: "create table `my_table` (id int)",
-		},
-		{
-			stmt:    "CREATE TABLE `schema`.`tbl` (id int)",
-			isError: true,
-		},
-		{
-			stmt:    "CREATE TABLE IF NOT EXISTS `tbl` (id int)",
-			isError: true,
-		},
-	}
-	for _, ts := range tt {
-		t.Run(ts.stmt, func(*testing.T) {
-			result, err := ReplaceTableNameInCreateTableStatement(ts.stmt, replacementTableName)
-			if ts.isError {
-				assert.Error(t, err)
-			} else {
-				assert.NoError(t, err)
-				assert.Equal(t, ts.expect, result)
-			}
-		})
-	}
-}
-
-func TestReplaceViewNameInCreateViewStatement(t *testing.T) {
-	replacementViewName := `my_view`
-	tt := []struct {
-		stmt    string
-		expect  string
-		isError bool
-	}{
-		{
-			stmt:    "CREATE VIEW vw AS SELECT * FROM tbl",
-			isError: true,
-		},
-		{
-			stmt:   "CREATE VIEW `vw` AS SELECT * FROM tbl",
-			expect: "CREATE VIEW `my_view` AS SELECT * FROM tbl",
-		},
-		{
-			stmt:   "CREATE     VIEW    `vw`   AS      SELECT    *  FROM     tbl",
-			expect: "CREATE     VIEW    `my_view`   AS      SELECT    *  FROM     tbl",
-		},
-		{
-			stmt:   "create view `vw` as select * from tbl",
-			expect: "create view `my_view` as select * from tbl",
-		},
-		{
-			stmt:   "create or replace view `vw` as select * from tbl",
-			expect: "create or replace view `my_view` as select * from tbl",
-		},
-		{
-			stmt:   "create ALGORITHM =TEMPTABLE view `vw` as select * from tbl",
-			expect: "create ALGORITHM =TEMPTABLE view `my_view` as select * from tbl",
-		},
-		{
-			stmt:    "CREATE VIEW `schema`.`vw` AS SELECT * FROM tbl",
-			isError: true,
-		},
-	}
-	for _, ts := range tt {
-		t.Run(ts.stmt, func(*testing.T) {
-			result, err := ReplaceViewNameInCreateViewStatement(ts.stmt, replacementViewName)
-			if ts.isError {
-				assert.Error(t, err)
-			} else {
-				assert.NoError(t, err)
-				assert.Equal(t, ts.expect, result)
-			}
-		})
-	}
-}
-
-func TestLegacyParseRevertUUID(t *testing.T) {
-
-	{
-		uuid, err := legacyParseRevertUUID("revert 4e5dcf80_354b_11eb_82cd_f875a4d24e90")
-		assert.NoError(t, err)
-		assert.Equal(t, "4e5dcf80_354b_11eb_82cd_f875a4d24e90", uuid)
-	}
-	{
-		_, err := legacyParseRevertUUID("revert 4e5dcf80_354b_11eb_82cd_f875a4")
-		assert.Error(t, err)
-	}
-	{
-		_, err := legacyParseRevertUUID("revert vitess_migration '4e5dcf80_354b_11eb_82cd_f875a4d24e90'")
-		assert.Error(t, err)
-	}
-}
-
 func TestParseEnumValues(t *testing.T) {
 	{
 		inputs := []string{
@@ -177,6 +66,19 @@ func TestParseEnumValues(t *testing.T) {
 			`abc`,
 			`func('x-small','small','medium','large','x-large')`,
 			`set('x-small','small','medium','large','x-large')`,
+		}
+		for _, input := range inputs {
+			enumValues := ParseEnumValues(input)
+			assert.Equal(t, input, enumValues)
+		}
+	}
+
+	{
+		inputs := []string{
+			``,
+			`abc`,
+			`func('x small','small','medium','large','x large')`,
+			`set('x small','small','medium','large','x large')`,
 		}
 		for _, input := range inputs {
 			enumValues := ParseEnumValues(input)
@@ -220,6 +122,18 @@ func TestParseEnumTokens(t *testing.T) {
 		assert.Equal(t, expect, enumTokens)
 	}
 	{
+		input := `'x small','small','medium','large','x large'`
+		enumTokens := parseEnumOrSetTokens(input)
+		expect := []string{"x small", "small", "medium", "large", "x large"}
+		assert.Equal(t, expect, enumTokens)
+	}
+	{
+		input := `'with '' quote','and \n newline'`
+		enumTokens := parseEnumOrSetTokens(input)
+		expect := []string{"with ' quote", "and \n newline"}
+		assert.Equal(t, expect, enumTokens)
+	}
+	{
 		input := `enum('x-small','small','medium','large','x-large')`
 		enumTokens := parseEnumOrSetTokens(input)
 		assert.Nil(t, enumTokens)
@@ -236,12 +150,12 @@ func TestParseEnumTokensMap(t *testing.T) {
 		input := `'x-small','small','medium','large','x-large'`
 
 		enumTokensMap := ParseEnumOrSetTokensMap(input)
-		expect := map[string]string{
-			"1": "x-small",
-			"2": "small",
-			"3": "medium",
-			"4": "large",
-			"5": "x-large",
+		expect := map[int]string{
+			1: "x-small",
+			2: "small",
+			3: "medium",
+			4: "large",
+			5: "x-large",
 		}
 		assert.Equal(t, expect, enumTokensMap)
 	}
@@ -252,7 +166,7 @@ func TestParseEnumTokensMap(t *testing.T) {
 		}
 		for _, input := range inputs {
 			enumTokensMap := ParseEnumOrSetTokensMap(input)
-			expect := map[string]string{}
+			expect := map[int]string{}
 			assert.Equal(t, expect, enumTokensMap)
 		}
 	}

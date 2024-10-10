@@ -20,9 +20,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 
 	"vitess.io/vitess/go/trace"
+
 	vtadminpb "vitess.io/vitess/go/vt/proto/vtadmin"
 )
 
@@ -35,15 +36,15 @@ import (
 // As an example, here's a minimal JSON file for a single Vitess cluster running locally
 // (such as the one described in https://vitess.io/docs/get-started/local-docker):
 //
-// 		{
-// 			"vtgates": [
-// 				{
-// 					"host": {
-// 						"hostname": "127.0.0.1:15991"
-// 					}
-// 				}
-// 			]
-// 		}
+//	{
+//		"vtgates": [
+//			{
+//				"host": {
+//					"hostname": "127.0.0.1:15991"
+//				}
+//			}
+//		]
+//	}
 //
 // For more examples of various static file configurations, see the unit tests.
 type JSONDiscovery struct {
@@ -129,7 +130,7 @@ func (d *JSONDiscovery) discoverVTGate(ctx context.Context, tags []string) (*vta
 		return nil, ErrNoVTGates
 	}
 
-	gate := gates[rand.Intn(len(gates))]
+	gate := gates[rand.IntN(len(gates))]
 	return gate, nil
 }
 
@@ -144,6 +145,24 @@ func (d *JSONDiscovery) DiscoverVTGateAddr(ctx context.Context, tags []string) (
 	}
 
 	return gate.Hostname, nil
+}
+
+// DiscoverVTGateAddrs is part of the Discovery interface.
+func (d *JSONDiscovery) DiscoverVTGateAddrs(ctx context.Context, tags []string) ([]string, error) {
+	span, ctx := trace.NewSpan(ctx, "JSONDiscovery.DiscoverVTGateAddrs")
+	defer span.Finish()
+
+	gates, err := d.discoverVTGates(ctx, tags)
+	if err != nil {
+		return nil, err
+	}
+
+	addrs := make([]string, len(gates))
+	for i, gate := range gates {
+		addrs[i] = gate.Hostname
+	}
+
+	return addrs, nil
 }
 
 // DiscoverVTGates is part of the Discovery interface.
@@ -211,7 +230,7 @@ func (d *JSONDiscovery) discoverVtctld(ctx context.Context, tags []string) (*vta
 		return nil, ErrNoVtctlds
 	}
 
-	vtctld := vtctlds[rand.Intn(len(vtctlds))]
+	vtctld := vtctlds[rand.IntN(len(vtctlds))]
 	return vtctld, nil
 }
 
@@ -226,6 +245,24 @@ func (d *JSONDiscovery) DiscoverVtctldAddr(ctx context.Context, tags []string) (
 	}
 
 	return vtctld.Hostname, nil
+}
+
+// DiscoverVtctldAddrs is part of the Discovery interface.
+func (d *JSONDiscovery) DiscoverVtctldAddrs(ctx context.Context, tags []string) ([]string, error) {
+	span, ctx := trace.NewSpan(ctx, "JSONDiscovery.DiscoverVtctldAddrs")
+	defer span.Finish()
+
+	vtctlds, err := d.discoverVtctlds(ctx, tags)
+	if err != nil {
+		return nil, err
+	}
+
+	addrs := make([]string, len(vtctlds))
+	for i, vtctld := range vtctlds {
+		addrs[i] = vtctld.Hostname
+	}
+
+	return addrs, nil
 }
 
 // DiscoverVtctlds is part of the Discovery interface.

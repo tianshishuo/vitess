@@ -17,9 +17,16 @@ limitations under the License.
 package textutil
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"vitess.io/vitess/go/sqltypes"
+
+	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 func TestSplitDelimitedList(t *testing.T) {
@@ -64,5 +71,204 @@ func TestSplitUnescape(t *testing.T) {
 		elems, err := SplitUnescape(s, ",")
 		assert.NoError(t, err)
 		assert.Equal(t, expected, elems)
+	}
+	{
+		s := "invalid%2"
+		elems, err := SplitUnescape(s, ",")
+		assert.Error(t, err)
+		assert.Equal(t, []string{}, elems)
+	}
+}
+
+func TestSingleWordCamel(t *testing.T) {
+	tt := []struct {
+		word   string
+		expect string
+	}{
+		{
+			word:   "",
+			expect: "",
+		},
+		{
+			word:   "_",
+			expect: "_",
+		},
+		{
+			word:   "a",
+			expect: "A",
+		},
+		{
+			word:   "A",
+			expect: "A",
+		},
+		{
+			word:   "_A",
+			expect: "_a",
+		},
+		{
+			word:   "mysql",
+			expect: "Mysql",
+		},
+		{
+			word:   "mySQL",
+			expect: "Mysql",
+		},
+	}
+	for _, tc := range tt {
+		t.Run(tc.word, func(t *testing.T) {
+			camel := SingleWordCamel(tc.word)
+			assert.Equal(t, tc.expect, camel)
+		})
+	}
+}
+
+func TestValueIsSimulatedNull(t *testing.T) {
+	tt := []struct {
+		name   string
+		val    interface{}
+		isNull bool
+	}{
+		{
+			name:   "case string false",
+			val:    "test",
+			isNull: false,
+		},
+		{
+			name:   "case []string true",
+			val:    []string{sqltypes.NULL.String()},
+			isNull: true,
+		},
+		{
+			name:   "case []string false",
+			val:    []string{sqltypes.NULL.String(), sqltypes.NULL.String()},
+			isNull: false,
+		},
+		{
+			name:   "case binlogdatapb.OnDDLAction exec",
+			val:    binlogdatapb.OnDDLAction_EXEC,
+			isNull: false,
+		},
+		{
+			name:   "case int false",
+			val:    1,
+			isNull: false,
+		},
+		{
+			name:   "case []topodatapb.TabletType true",
+			val:    []topodatapb.TabletType{topodatapb.TabletType(SimulatedNullInt)},
+			isNull: true,
+		},
+		{
+			name:   "case binlogdatapb.VReplicationWorkflowState running",
+			val:    binlogdatapb.VReplicationWorkflowState_Running,
+			isNull: false,
+		},
+		{
+			name:   "case float false",
+			val:    float64(1),
+			isNull: false,
+		},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			isNull := ValueIsSimulatedNull(tc.val)
+			assert.Equal(t, tc.isNull, isNull)
+		})
+	}
+}
+
+func TestTitle(t *testing.T) {
+	tt := []struct {
+		s      string
+		expect string
+	}{
+		{s: "hello world", expect: "Hello World"},
+		{s: "snake_case", expect: "Snake_case"},
+		{s: "TITLE CASE", expect: "TITLE CASE"},
+		{s: "HelLo wOrLd", expect: "HelLo WOrLd"},
+		{s: "", expect: ""},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.s, func(t *testing.T) {
+			title := Title(tc.s)
+			assert.Equal(t, tc.expect, title)
+		})
+	}
+}
+
+func TestTruncateText(t *testing.T) {
+	defaultLocation := TruncationLocationMiddle
+	defaultMaxLen := 100
+	defaultTruncationIndicator := "..."
+
+	tests := []struct {
+		name                string
+		text                string
+		maxLen              int
+		location            TruncationLocation
+		truncationIndicator string
+		want                string
+		wantErr             string
+	}{
+		{
+			name:     "no truncation",
+			text:     "hello world",
+			maxLen:   defaultMaxLen,
+			location: defaultLocation,
+			want:     "hello world",
+		},
+		{
+			name:     "no truncation - exact",
+			text:     strings.Repeat("a", defaultMaxLen),
+			maxLen:   defaultMaxLen,
+			location: defaultLocation,
+			want:     strings.Repeat("a", defaultMaxLen),
+		},
+		{
+			name:                "barely too long - mid",
+			text:                strings.Repeat("a", defaultMaxLen+1),
+			truncationIndicator: defaultTruncationIndicator,
+			maxLen:              defaultMaxLen,
+			location:            defaultLocation,
+			want:                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa...aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		},
+		{
+			name:                "barely too long - end",
+			text:                strings.Repeat("a", defaultMaxLen+1),
+			truncationIndicator: defaultTruncationIndicator,
+			maxLen:              defaultMaxLen,
+			location:            TruncationLocationEnd,
+			want:                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa...",
+		},
+		{
+			name:                "too small",
+			text:                strings.Repeat("a", defaultMaxLen),
+			truncationIndicator: defaultTruncationIndicator,
+			maxLen:              4,
+			location:            defaultLocation,
+			wantErr:             "the truncation indicator is too long for the provided text",
+		},
+		{
+			name:                "bad location",
+			text:                strings.Repeat("a", defaultMaxLen+1),
+			truncationIndicator: defaultTruncationIndicator,
+			maxLen:              defaultMaxLen,
+			location:            100,
+			wantErr:             "invalid truncation location: 100",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			val, err := TruncateText(tt.text, tt.maxLen, tt.location, tt.truncationIndicator)
+			if tt.wantErr != "" {
+				require.EqualError(t, err, tt.wantErr)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tt.want, val)
+				require.LessOrEqual(t, len(val), tt.maxLen)
+			}
+		})
 	}
 }

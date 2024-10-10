@@ -17,47 +17,44 @@ limitations under the License.
 package vreplication
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"strconv"
 
-	"vitess.io/vitess/go/vt/sqlparser"
-
+	"vitess.io/vitess/go/constants/sidecar"
+	"vitess.io/vitess/go/mysql/sqlerror"
 	"vitess.io/vitess/go/sqltypes"
-	"vitess.io/vitess/go/vt/vtgate/evalengine"
+	"vitess.io/vitess/go/textutil"
+	"vitess.io/vitess/go/vt/binlog/binlogplayer"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vterrors"
+
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 )
 
 const (
-	vreplicationLogTableName   = "_vt.vreplication_log"
-	createVReplicationLogTable = `CREATE TABLE IF NOT EXISTS _vt.vreplication_log (
-		id BIGINT(20) AUTO_INCREMENT,
-		vrepl_id INT NOT NULL,
-		type VARBINARY(256) NOT NULL,
-		state VARBINARY(100) NOT NULL,
-		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-		message text NOT NULL,
-		count BIGINT(20) NOT NULL DEFAULT 1,
-		PRIMARY KEY (id))`
+	vreplicationLogTableName = "vreplication_log"
+	// This comes from the fact that the message column in the vreplication_log table is of type TEXT.
+	maxVReplicationLogMessageLen = 65535
 )
 
 const (
-	// Enum values for type column of _vt.vreplication_log
+	// Enum values for type column in the vreplication_log table.
 
-	// LogStreamCreate is used when a row in _vt.vreplication is inserted via VReplicationExec
+	// LogStreamCreate is used when a row in the vreplication table is inserted via VReplicationExec.
 	LogStreamCreate = "Stream Created"
-	// LogStreamUpdate is used when a row in _vt.vreplication is updated via VReplicationExec
+	// LogStreamUpdate is used when a row in the vreplication table is updated via VReplicationExec.
 	LogStreamUpdate = "Stream Updated"
-	// LogStreamDelete is used when a row in _vt.vreplication is deleted via VReplicationExec
+	// LogStreamDelete is used when a row in the vreplication table is deleted via VReplicationExec.
 	LogStreamDelete = "Stream Deleted"
-	// LogMessage is used for generic log messages
+	// LogMessage is used for generic log messages.
 	LogMessage = "Message"
-	// LogCopyStart is used when the copy phase is started
+	// LogCopyStart is used when the copy phase is started.
 	LogCopyStart = "Started Copy Phase"
-	// LogCopyEnd is used when the copy phase is done
+	// LogCopyEnd is used when the copy phase is done.
 	LogCopyEnd = "Ended Copy Phase"
-	// LogStateChange is used when the state of the stream changes
+	// LogStateChange is used when the state of the stream changes.
 	LogStateChange = "State Changed"
 
 	// TODO: LogError is not used atm. Currently irrecoverable errors, resumable errors and informational messages
@@ -71,58 +68,169 @@ const (
 	LogError = "Error"
 )
 
-func getLastLog(dbClient *vdbClient, vreplID uint32) (id int64, typ, state, message string, err error) {
+func getLastLog(dbClient *vdbClient, vreplID int32) (id int64, typ, state, message string, err error) {
 	var qr *sqltypes.Result
-	query := fmt.Sprintf("select id, type, state, message from _vt.vreplication_log where vrepl_id = %d order by id desc limit 1", vreplID)
-	if qr, err = withDDL.Exec(context.Background(), query, dbClient.ExecuteFetch, dbClient.ExecuteFetch); err != nil {
+	query := fmt.Sprintf("select id, type, state, message from %s.vreplication_log where vrepl_id = %d order by id desc limit 1",
+		sidecar.GetIdentifier(), vreplID)
+	if qr, err = dbClient.Execute(query); err != nil {
 		return 0, "", "", "", err
 	}
 	if len(qr.Rows) != 1 {
 		return 0, "", "", "", nil
 	}
 	row := qr.Rows[0]
-	id, _ = evalengine.ToInt64(row[0])
+	id, _ = row[0].ToCastInt64()
 	typ = row[1].ToString()
 	state = row[2].ToString()
 	message = row[3].ToString()
 	return id, typ, state, message, nil
 }
 
-func insertLog(dbClient *vdbClient, typ string, vreplID uint32, state, message string) error {
+func insertLog(dbClient *vdbClient, typ string, vreplID int32, state, message string) {
 	// getLastLog returns the last log for a stream. During insertion, if the type/state/message match we do not insert
 	// a new log but increment the count. This prevents spamming of the log table in case the same message is logged continuously.
 	id, _, lastLogState, lastLogMessage, err := getLastLog(dbClient, vreplID)
 	if err != nil {
-		return err
+		log.Errorf("Could not insert vreplication_log record because we failed to get the last log record: %v", err)
+		return
 	}
 	if typ == LogStateChange && state == lastLogState {
 		// handles case where current state is Running, controller restarts after an error and initializes the state Running
-		return nil
+		return
 	}
 	var query string
 	if id > 0 && message == lastLogMessage {
-		query = fmt.Sprintf("update _vt.vreplication_log set count = count + 1 where id = %d", id)
+		query = fmt.Sprintf("update %s.vreplication_log set count = count + 1 where id = %d", sidecar.GetIdentifier(), id)
 	} else {
 		buf := sqlparser.NewTrackedBuffer(nil)
-		buf.Myprintf("insert into _vt.vreplication_log(vrepl_id, type, state, message) values(%s, %s, %s, %s)",
-			strconv.Itoa(int(vreplID)), encodeString(typ), encodeString(state), encodeString(message))
+		if len(message) > maxVReplicationLogMessageLen {
+			message, err = textutil.TruncateText(message, maxVReplicationLogMessageLen, binlogplayer.TruncationLocation, binlogplayer.TruncationIndicator)
+			if err != nil {
+				log.Errorf("Could not insert vreplication_log record because we failed to truncate the message: %v", err)
+				return
+			}
+		}
+		buf.Myprintf("insert into %s.vreplication_log(vrepl_id, type, state, message) values(%s, %s, %s, %s)",
+			sidecar.GetIdentifier(), strconv.Itoa(int(vreplID)), encodeString(typ), encodeString(state), encodeString(message))
 		query = buf.ParsedQuery().Query
 	}
-	if _, err = withDDL.Exec(context.Background(), query, dbClient.ExecuteFetch, dbClient.ExecuteFetch); err != nil {
-		return fmt.Errorf("could not insert into log table: %v: %v", query, err)
+	if _, err = dbClient.ExecuteFetch(query, 10000); err != nil {
+		log.Errorf("Could not insert into vreplication_log table: %v: %v", query, err)
 	}
-	return nil
 }
 
-// insertLogWithParams is called when a stream is created. The attributes of the stream are stored as a json string
-func insertLogWithParams(dbClient *vdbClient, action string, vreplID uint32, params map[string]string) error {
+// insertLogWithParams is called when a stream is created. The attributes of the stream are stored as a json string.
+func insertLogWithParams(dbClient *vdbClient, action string, vreplID int32, params map[string]string) {
 	var message string
 	if params != nil {
 		obj, _ := json.Marshal(params)
 		message = string(obj)
 	}
-	if err := insertLog(dbClient, action, vreplID, params["state"], message); err != nil {
-		return err
+	insertLog(dbClient, action, vreplID, params["state"], message)
+}
+
+// isUnrecoverableError returns true if vreplication cannot recover from the given error and should completely terminate.
+func isUnrecoverableError(err error) bool {
+	if err == nil {
+		return false
 	}
-	return nil
+	switch vterrors.Code(err) {
+	case vtrpcpb.Code_FAILED_PRECONDITION:
+		if vterrors.RxWrongTablet.MatchString(err.Error()) {
+			// If the chosen tablet type picked changes, say due to PRS/ERS, we should retry.
+			return false
+		}
+		return true
+	}
+	sqlErr, isSQLErr := sqlerror.NewSQLErrorFromError(err).(*sqlerror.SQLError)
+	if !isSQLErr {
+		return false
+	}
+	if sqlErr.Num == sqlerror.ERUnknownError {
+		return false
+	}
+	switch sqlErr.Num {
+	case
+		// in case-insensitive alphabetical order
+		sqlerror.ERAccessDeniedError,
+		sqlerror.ERBadFieldError,
+		sqlerror.ERBadNullError,
+		sqlerror.ERCantDropFieldOrKey,
+		sqlerror.ERDataOutOfRange,
+		sqlerror.ERDataTooLong,
+		sqlerror.ERDBAccessDenied,
+		sqlerror.ERDupEntry,
+		sqlerror.ERDupFieldName,
+		sqlerror.ERDupKeyName,
+		sqlerror.ERDupUnique,
+		sqlerror.ERFeatureDisabled,
+		sqlerror.ERFunctionNotDefined,
+		sqlerror.ERIllegalValueForType,
+		sqlerror.ERInvalidCastToJSON,
+		sqlerror.ERInvalidJSONBinaryData,
+		sqlerror.ERInvalidJSONCharset,
+		sqlerror.ERInvalidJSONText,
+		sqlerror.ERInvalidJSONTextInParams,
+		sqlerror.ERJSONDocumentTooDeep,
+		sqlerror.ERJSONValueTooBig,
+		sqlerror.ERRegexpError,
+		sqlerror.ERRegexpStringNotTerminated,
+		sqlerror.ERRegexpIllegalArgument,
+		sqlerror.ERRegexpIndexOutOfBounds,
+		sqlerror.ERRegexpInternal,
+		sqlerror.ERRegexpRuleSyntax,
+		sqlerror.ERRegexpBadEscapeSequence,
+		sqlerror.ERRegexpUnimplemented,
+		sqlerror.ERRegexpMismatchParen,
+		sqlerror.ERRegexpBadInterval,
+		sqlerror.ERRRegexpMaxLtMin,
+		sqlerror.ERRegexpInvalidBackRef,
+		sqlerror.ERRegexpLookBehindLimit,
+		sqlerror.ERRegexpMissingCloseBracket,
+		sqlerror.ERRegexpInvalidRange,
+		sqlerror.ERRegexpStackOverflow,
+		sqlerror.ERRegexpTimeOut,
+		sqlerror.ERRegexpPatternTooBig,
+		sqlerror.ERRegexpInvalidCaptureGroup,
+		sqlerror.ERRegexpInvalidFlag,
+		sqlerror.ERNoDefault,
+		sqlerror.ERNoDefaultForField,
+		sqlerror.ERNonUniq,
+		sqlerror.ERNonUpdateableTable,
+		sqlerror.ERNoSuchTable,
+		sqlerror.ERNotAllowedCommand,
+		sqlerror.ERNotSupportedYet,
+		sqlerror.EROptionPreventsStatement,
+		sqlerror.ERParseError,
+		sqlerror.ERPrimaryCantHaveNull,
+		sqlerror.ErrCantCreateGeometryObject,
+		sqlerror.ErrGISDataWrongEndianess,
+		sqlerror.ErrNonPositiveRadius,
+		sqlerror.ErrNotImplementedForCartesianSRS,
+		sqlerror.ErrNotImplementedForProjectedSRS,
+		sqlerror.ErrWrongValueForType,
+		sqlerror.ERSPDoesNotExist,
+		sqlerror.ERSpecifiedAccessDenied,
+		sqlerror.ERSyntaxError,
+		sqlerror.ERTooBigRowSize,
+		sqlerror.ERTooBigSet,
+		sqlerror.ERTruncatedWrongValue,
+		sqlerror.ERTruncatedWrongValueForField,
+		sqlerror.ERUnknownCollation,
+		sqlerror.ERUnknownProcedure,
+		sqlerror.ERUnknownTable,
+		sqlerror.ERWarnDataOutOfRange,
+		sqlerror.ERWarnDataTruncated,
+		sqlerror.ERWrongFKDef,
+		sqlerror.ERWrongFieldSpec,
+		sqlerror.ERWrongParamCountToProcedure,
+		sqlerror.ERWrongParametersToProcedure,
+		sqlerror.ERWrongUsage,
+		sqlerror.ERWrongValue,
+		sqlerror.ERVectorConversion,
+		sqlerror.ERWrongValueCountOnRow:
+		log.Errorf("Got unrecoverable error: %v", sqlErr)
+		return true
+	}
+	return false
 }

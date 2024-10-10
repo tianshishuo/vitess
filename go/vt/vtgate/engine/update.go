@@ -17,9 +17,9 @@ limitations under the License.
 package engine
 
 import (
+	"context"
 	"fmt"
 	"sort"
-	"time"
 
 	"vitess.io/vitess/go/vt/vtgate/evalengine"
 
@@ -36,47 +36,24 @@ var _ Primitive = (*Update)(nil)
 
 // VindexValues contains changed values for a vindex.
 type VindexValues struct {
-	PvMap  map[string]evalengine.Expr
-	Offset int // Offset from ownedVindexQuery to provide input decision for vindex update.
+	EvalExprMap map[string]evalengine.Expr
+	Offset      int // Offset from ownedVindexQuery to provide input decision for vindex update.
 }
 
 // Update represents the instructions to perform an update.
 type Update struct {
+	// Update does not take inputs
+	noInputs
+
 	*DML
 
 	// ChangedVindexValues contains values for updated Vindexes during an update statement.
 	ChangedVindexValues map[string]*VindexValues
-
-	// Update does not take inputs
-	noInputs
-}
-
-// RouteType returns a description of the query routing type used by the primitive
-func (upd *Update) RouteType() string {
-	return upd.Opcode.String()
-}
-
-// GetKeyspaceName specifies the Keyspace that this primitive routes to.
-func (upd *Update) GetKeyspaceName() string {
-	return upd.Keyspace.Name
-}
-
-// GetTableName specifies the table that this primitive routes to.
-func (upd *Update) GetTableName() string {
-	if upd.Table != nil {
-		return upd.Table.Name.String()
-	}
-	return ""
 }
 
 // TryExecute performs a non-streaming exec.
-func (upd *Update) TryExecute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
-	if upd.QueryTimeout != 0 {
-		cancel := vcursor.SetContextTimeout(time.Duration(upd.QueryTimeout) * time.Millisecond)
-		defer cancel()
-	}
-
-	rss, _, err := upd.findRoute(vcursor, bindVars)
+func (upd *Update) TryExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
+	rss, bvs, err := upd.findRoute(ctx, vcursor, bindVars)
 	if err != nil {
 		return nil, err
 	}
@@ -87,9 +64,9 @@ func (upd *Update) TryExecute(vcursor VCursor, bindVars map[string]*querypb.Bind
 
 	switch upd.Opcode {
 	case Unsharded:
-		return upd.execUnsharded(vcursor, bindVars, rss)
-	case Equal, IN, Scatter, ByDestination:
-		return upd.execMultiDestination(vcursor, bindVars, rss, upd.updateVindexEntries)
+		return upd.execUnsharded(ctx, upd, vcursor, bindVars, rss)
+	case Equal, EqualUnique, IN, Scatter, ByDestination, SubShard, MultiEqual:
+		return upd.execMultiDestination(ctx, upd, vcursor, bindVars, rss, upd.updateVindexEntries, bvs)
 	default:
 		// Unreachable.
 		return nil, fmt.Errorf("unsupported opcode: %v", upd.Opcode)
@@ -97,8 +74,8 @@ func (upd *Update) TryExecute(vcursor VCursor, bindVars map[string]*querypb.Bind
 }
 
 // TryStreamExecute performs a streaming exec.
-func (upd *Update) TryStreamExecute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
-	res, err := upd.TryExecute(vcursor, bindVars, wantfields)
+func (upd *Update) TryStreamExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
+	res, err := upd.TryExecute(ctx, vcursor, bindVars, wantfields)
 	if err != nil {
 		return err
 	}
@@ -107,7 +84,7 @@ func (upd *Update) TryStreamExecute(vcursor VCursor, bindVars map[string]*queryp
 }
 
 // GetFields fetches the field info.
-func (upd *Update) GetFields(vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
+func (upd *Update) GetFields(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
 	return nil, fmt.Errorf("BUG: unreachable code for %q", upd.Query)
 }
 
@@ -117,7 +94,7 @@ func (upd *Update) GetFields(vcursor VCursor, bindVars map[string]*querypb.BindV
 // for DMLs to reuse existing transactions.
 // Note 2: While changes are being committed, the changing row could be
 // unreachable by either the new or old column values.
-func (upd *Update) updateVindexEntries(vcursor VCursor, bindVars map[string]*querypb.BindVariable, rss []*srvtopo.ResolvedShard) error {
+func (upd *Update) updateVindexEntries(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, rss []*srvtopo.ResolvedShard) error {
 	if len(upd.ChangedVindexValues) == 0 {
 		return nil
 	}
@@ -125,7 +102,7 @@ func (upd *Update) updateVindexEntries(vcursor VCursor, bindVars map[string]*que
 	for i := range rss {
 		queries[i] = &querypb.BoundQuery{Sql: upd.OwnedVindexQuery, BindVariables: bindVars}
 	}
-	subQueryResult, errors := vcursor.ExecuteMultiShard(rss, queries, false, false)
+	subQueryResult, errors := vcursor.ExecuteMultiShard(ctx, upd, rss, queries, false /* rollbackOnError */, false /* canAutocommit */)
 	for _, err := range errors {
 		if err != nil {
 			return err
@@ -140,46 +117,76 @@ func (upd *Update) updateVindexEntries(vcursor VCursor, bindVars map[string]*que
 	for colNum, field := range subQueryResult.Fields {
 		fieldColNumMap[field.Name] = colNum
 	}
-	env := evalengine.EnvWithBindVars(bindVars, vcursor.ConnCollation())
+	env := evalengine.NewExpressionEnv(ctx, bindVars, vcursor)
 
 	for _, row := range subQueryResult.Rows {
-		ksid, err := resolveKeyspaceID(vcursor, upd.KsidVindex, row[0:upd.KsidLength])
+		ksid, err := resolveKeyspaceID(ctx, vcursor, upd.KsidVindex, row[0:upd.KsidLength])
 		if err != nil {
 			return err
 		}
-		for _, colVindex := range upd.Table.Owned {
-			// Update columns only if they're being changed.
-			if updColValues, ok := upd.ChangedVindexValues[colVindex.Name]; ok {
-				offset := updColValues.Offset
-				if !row[offset].IsNull() {
-					val, err := evalengine.ToInt64(row[offset])
+
+		for _, colVindex := range upd.Vindexes {
+			// Skip this vindex if no rows are being changed
+			updColValues, ok := upd.ChangedVindexValues[colVindex.Name]
+			if !ok {
+				continue
+			}
+
+			offset := updColValues.Offset
+			if !row[offset].IsNull() {
+				val, err := row[offset].ToCastInt64()
+				if err != nil {
+					return err
+				}
+				if val == int64(1) { // 1 means that the old and new value are same and vindex update is not required.
+					continue
+				}
+			}
+
+			fromIds := make([]sqltypes.Value, 0, len(colVindex.Columns))
+			var vindexColumnKeys []sqltypes.Value
+			for _, vCol := range colVindex.Columns {
+				// Fetch the column values.
+				origColValue := row[fieldColNumMap[vCol.String()]]
+				fromIds = append(fromIds, origColValue)
+				if colValue, exists := updColValues.EvalExprMap[vCol.String()]; exists {
+					resolvedVal, err := env.Evaluate(colValue)
 					if err != nil {
 						return err
 					}
-					if val == int64(1) { // 1 means that the old and new value are same and vindex update is not required.
-						continue
-					}
+					vindexColumnKeys = append(vindexColumnKeys, resolvedVal.Value(vcursor.ConnCollation()))
+				} else {
+					// Set the column value to original as this column in vindex is not updated.
+					vindexColumnKeys = append(vindexColumnKeys, origColValue)
 				}
-				fromIds := make([]sqltypes.Value, 0, len(colVindex.Columns))
-				var vindexColumnKeys []sqltypes.Value
-				for _, vCol := range colVindex.Columns {
-					// Fetch the column values.
-					origColValue := row[fieldColNumMap[vCol.String()]]
-					fromIds = append(fromIds, origColValue)
-					if colValue, exists := updColValues.PvMap[vCol.String()]; exists {
-						resolvedVal, err := env.Evaluate(colValue)
-						if err != nil {
-							return err
-						}
-						vindexColumnKeys = append(vindexColumnKeys, resolvedVal.Value())
-					} else {
-						// Set the column value to original as this column in vindex is not updated.
-						vindexColumnKeys = append(vindexColumnKeys, origColValue)
+			}
+
+			if colVindex.Owned {
+				if err := colVindex.Vindex.(vindexes.Lookup).Update(ctx, vcursor, fromIds, ksid, vindexColumnKeys); err != nil {
+					return err
+				}
+			} else {
+				allNulls := true
+				for _, key := range vindexColumnKeys {
+					allNulls = key.IsNull()
+					if !allNulls {
+						break
 					}
 				}
 
-				if err := colVindex.Vindex.(vindexes.Lookup).Update(vcursor, fromIds, ksid, vindexColumnKeys); err != nil {
+				// All columns for this Vindex are set to null, so we can skip verification
+				if allNulls {
+					continue
+				}
+
+				// If values were supplied, we validate against keyspace id.
+				verified, err := vindexes.Verify(ctx, colVindex.Vindex, vcursor, [][]sqltypes.Value{vindexColumnKeys}, [][]byte{ksid})
+				if err != nil {
 					return err
+				}
+
+				if !verified[0] {
+					return fmt.Errorf("values %v for column %v does not map to keyspace ids", vindexColumnKeys, colVindex.Columns)
 				}
 			}
 		}
@@ -188,12 +195,13 @@ func (upd *Update) updateVindexEntries(vcursor VCursor, bindVars map[string]*que
 }
 
 func (upd *Update) description() PrimitiveDescription {
-	other := map[string]interface{}{
+	other := map[string]any{
 		"Query":                upd.Query,
 		"Table":                upd.GetTableName(),
 		"OwnedVindexQuery":     upd.OwnedVindexQuery,
 		"MultiShardAutocommit": upd.MultiShardAutocommit,
 		"QueryTimeout":         upd.QueryTimeout,
+		"NoAutoCommit":         upd.PreventAutoCommit,
 	}
 
 	addFieldsIfNotEmpty(upd.DML, other)

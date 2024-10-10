@@ -18,26 +18,20 @@ package ldapauthserver
 
 import (
 	"encoding/json"
-	"flag"
 	"fmt"
 	"net"
 	"os"
 	"sync"
 	"time"
 
-	ldap "gopkg.in/ldap.v2"
+	"gopkg.in/ldap.v2"
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/netutil"
 	"vitess.io/vitess/go/vt/log"
-	querypb "vitess.io/vitess/go/vt/proto/query"
 	"vitess.io/vitess/go/vt/vttls"
-)
 
-var (
-	ldapAuthConfigFile   = flag.String("mysql_ldap_auth_config_file", "", "JSON File from which to read LDAP server config.")
-	ldapAuthConfigString = flag.String("mysql_ldap_auth_config_string", "", "JSON representation of LDAP server config.")
-	ldapAuthMethod       = flag.String("mysql_ldap_auth_method", string(mysql.MysqlClearPassword), "client-side authentication method to use. Supported values: mysql_clear_password, dialog.")
+	querypb "vitess.io/vitess/go/vt/proto/query"
 )
 
 // AuthServerLdap implements AuthServer with an LDAP backend
@@ -53,17 +47,17 @@ type AuthServerLdap struct {
 }
 
 // Init is public so it can be called from plugin_auth_ldap.go (go/cmd/vtgate)
-func Init() {
-	if *ldapAuthConfigFile == "" && *ldapAuthConfigString == "" {
+func Init(ldapAuthConfigFile, ldapAuthConfigString, ldapAuthMethod string) {
+	if ldapAuthConfigFile == "" && ldapAuthConfigString == "" {
 		log.Infof("Not configuring AuthServerLdap because mysql_ldap_auth_config_file and mysql_ldap_auth_config_string are empty")
 		return
 	}
-	if *ldapAuthConfigFile != "" && *ldapAuthConfigString != "" {
+	if ldapAuthConfigFile != "" && ldapAuthConfigString != "" {
 		log.Infof("Both mysql_ldap_auth_config_file and mysql_ldap_auth_config_string are non-empty, can only use one.")
 		return
 	}
 
-	if *ldapAuthMethod != string(mysql.MysqlClearPassword) && *ldapAuthMethod != string(mysql.MysqlDialog) {
+	if ldapAuthMethod != string(mysql.MysqlClearPassword) && ldapAuthMethod != string(mysql.MysqlDialog) {
 		log.Exitf("Invalid mysql_ldap_auth_method value: only support mysql_clear_password or dialog")
 	}
 	ldapAuthServer := &AuthServerLdap{
@@ -71,10 +65,10 @@ func Init() {
 		ServerConfig: ServerConfig{},
 	}
 
-	data := []byte(*ldapAuthConfigString)
-	if *ldapAuthConfigFile != "" {
+	data := []byte(ldapAuthConfigString)
+	if ldapAuthConfigFile != "" {
 		var err error
-		data, err = os.ReadFile(*ldapAuthConfigFile)
+		data, err = os.ReadFile(ldapAuthConfigFile)
 		if err != nil {
 			log.Exitf("Failed to read mysql_ldap_auth_config_file: %v", err)
 		}
@@ -84,7 +78,7 @@ func Init() {
 	}
 
 	var authMethod mysql.AuthMethod
-	switch mysql.AuthMethodDescription(*ldapAuthMethod) {
+	switch mysql.AuthMethodDescription(ldapAuthMethod) {
 	case mysql.MysqlClearPassword:
 		authMethod = mysql.NewMysqlClearAuthMethod(ldapAuthServer, ldapAuthServer)
 	case mysql.MysqlDialog:
@@ -136,7 +130,7 @@ func (asl *AuthServerLdap) validate(username, password string) (mysql.Getter, er
 	return &LdapUserData{asl: asl, groups: groups, username: username, lastUpdated: time.Now(), updating: false}, nil
 }
 
-//this needs to be passed an already connected client...should check for this
+// this needs to be passed an already connected client...should check for this
 func (asl *AuthServerLdap) getGroups(username string) ([]string, error) {
 	err := asl.Client.Bind(asl.User, asl.Password)
 	if err != nil {

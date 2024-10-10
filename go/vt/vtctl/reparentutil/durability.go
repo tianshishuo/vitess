@@ -18,55 +18,67 @@ package reparentutil
 
 import (
 	"fmt"
-	"sync"
-
-	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
-	"vitess.io/vitess/go/vt/topo/topoproto"
 
 	"vitess.io/vitess/go/vt/log"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/topo/topoproto"
 	"vitess.io/vitess/go/vt/vtctl/reparentutil/promotionrule"
 )
 
 //=======================================================================
 
-// A newDurabler is a function that creates a new durabler based on the
-// properties specified in the input map. Every durabler must
-// register a newDurabler function.
-type newDurabler func() durabler
+// A NewDurabler is a function that creates a new Durabler based on the
+// properties specified in the input map. Every Durabler must
+// register a NewDurabler function.
+type NewDurabler func() Durabler
 
 var (
-	// durabilityPolicies is a map that stores the functions needed to create a new durabler
-	durabilityPolicies = make(map[string]newDurabler)
-	// curDurabilityPolicy is the current durability policy in use
-	curDurabilityPolicy durabler
-	// curDurabilityPolicyMutex is the mutex protecting the curDurabilityPolicy variable
-	curDurabilityPolicyMutex sync.Mutex
+	// durabilityPolicies is a map that stores the functions needed to create a new Durabler
+	durabilityPolicies = make(map[string]NewDurabler)
 )
 
 func init() {
 	// register all the durability rules with their functions to create them
-	registerDurability("none", func() durabler {
+	RegisterDurability("none", func() Durabler {
 		return &durabilityNone{}
 	})
-	registerDurability("semi_sync", func() durabler {
-		return &durabilitySemiSync{}
+	RegisterDurability("semi_sync", func() Durabler {
+		return &durabilitySemiSync{
+			rdonlySemiSync: false,
+		}
 	})
-	registerDurability("cross_cell", func() durabler {
-		return &durabilityCrossCell{}
+	RegisterDurability("cross_cell", func() Durabler {
+		return &durabilityCrossCell{
+			rdonlySemiSync: false,
+		}
 	})
-	registerDurability("test", func() durabler {
+	RegisterDurability("semi_sync_with_rdonly_ack", func() Durabler {
+		return &durabilitySemiSync{
+			rdonlySemiSync: true,
+		}
+	})
+	RegisterDurability("cross_cell_with_rdonly_ack", func() Durabler {
+		return &durabilityCrossCell{
+			rdonlySemiSync: true,
+		}
+	})
+	RegisterDurability("test", func() Durabler {
 		return &durabilityTest{}
 	})
 }
 
-// durabler is the interface which is used to get the promotion rules for candidates and the semi sync setup
-type durabler interface {
-	promotionRule(*topodatapb.Tablet) promotionrule.CandidatePromotionRule
-	semiSyncAckers(*topodatapb.Tablet) int
-	isReplicaSemiSync(primary, replica *topodatapb.Tablet) bool
+// Durabler is the interface which is used to get the promotion rules for candidates and the semi sync setup
+type Durabler interface {
+	// PromotionRule represents the precedence in which we want to tablets to be promoted.
+	// The higher the promotion rule of a tablet, the more we want it to be promoted in case of a failover
+	PromotionRule(*topodatapb.Tablet) promotionrule.CandidatePromotionRule
+	// SemiSyncAckers represents the number of semi-sync ackers required for a given tablet if it were to become the PRIMARY instance
+	SemiSyncAckers(*topodatapb.Tablet) int
+	// IsReplicaSemiSync returns whether the "replica" should send semi-sync acks if "primary" were to become the PRIMARY instance
+	IsReplicaSemiSync(primary, replica *topodatapb.Tablet) bool
 }
 
-func registerDurability(name string, newDurablerFunc newDurabler) {
+func RegisterDurability(name string, newDurablerFunc NewDurabler) {
 	if durabilityPolicies[name] != nil {
 		log.Fatalf("durability policy %v already registered", name)
 	}
@@ -75,40 +87,44 @@ func registerDurability(name string, newDurablerFunc newDurabler) {
 
 //=======================================================================
 
-// SetDurabilityPolicy is used to set the durability policy from the registered policies
-func SetDurabilityPolicy(name string) error {
+// GetDurabilityPolicy is used to get a new durability policy from the registered policies
+func GetDurabilityPolicy(name string) (Durabler, error) {
 	newDurabilityCreationFunc, found := durabilityPolicies[name]
 	if !found {
-		return fmt.Errorf("durability policy %v not found", name)
+		return nil, fmt.Errorf("durability policy %v not found", name)
 	}
-	log.Infof("Setting durability policy to %v", name)
-	curDurabilityPolicyMutex.Lock()
-	defer curDurabilityPolicyMutex.Unlock()
-	curDurabilityPolicy = newDurabilityCreationFunc()
-	return nil
+	return newDurabilityCreationFunc(), nil
+}
+
+// CheckDurabilityPolicyExists is used to check if the durability policy is part of the registered policies
+func CheckDurabilityPolicyExists(name string) bool {
+	_, found := durabilityPolicies[name]
+	return found
 }
 
 // PromotionRule returns the promotion rule for the instance.
-func PromotionRule(tablet *topodatapb.Tablet) promotionrule.CandidatePromotionRule {
-	curDurabilityPolicyMutex.Lock()
-	defer curDurabilityPolicyMutex.Unlock()
-	return curDurabilityPolicy.promotionRule(tablet)
+func PromotionRule(durability Durabler, tablet *topodatapb.Tablet) promotionrule.CandidatePromotionRule {
+	// Prevent panics.
+	if tablet == nil || tablet.Alias == nil {
+		return promotionrule.MustNot
+	}
+	return durability.PromotionRule(tablet)
 }
 
 // SemiSyncAckers returns the primary semi-sync setting for the instance.
 // 0 means none. Non-zero specifies the number of required ackers.
-func SemiSyncAckers(tablet *topodatapb.Tablet) int {
-	curDurabilityPolicyMutex.Lock()
-	defer curDurabilityPolicyMutex.Unlock()
-	return curDurabilityPolicy.semiSyncAckers(tablet)
+func SemiSyncAckers(durability Durabler, tablet *topodatapb.Tablet) int {
+	return durability.SemiSyncAckers(tablet)
 }
 
 // IsReplicaSemiSync returns the replica semi-sync setting from the tablet record.
 // Prefer using this function if tablet record is available.
-func IsReplicaSemiSync(primary, replica *topodatapb.Tablet) bool {
-	curDurabilityPolicyMutex.Lock()
-	defer curDurabilityPolicyMutex.Unlock()
-	return curDurabilityPolicy.isReplicaSemiSync(primary, replica)
+func IsReplicaSemiSync(durability Durabler, primary, replica *topodatapb.Tablet) bool {
+	// Prevent panics.
+	if primary == nil || primary.Alias == nil || replica == nil || replica.Alias == nil {
+		return false
+	}
+	return durability.IsReplicaSemiSync(primary, replica)
 }
 
 //=======================================================================
@@ -116,7 +132,8 @@ func IsReplicaSemiSync(primary, replica *topodatapb.Tablet) bool {
 // durabilityNone has no semi-sync and returns NeutralPromoteRule for Primary and Replica tablet types, MustNotPromoteRule for everything else
 type durabilityNone struct{}
 
-func (d *durabilityNone) promotionRule(tablet *topodatapb.Tablet) promotionrule.CandidatePromotionRule {
+// PromotionRule implements the Durabler interface
+func (d *durabilityNone) PromotionRule(tablet *topodatapb.Tablet) promotionrule.CandidatePromotionRule {
 	switch tablet.Type {
 	case topodatapb.TabletType_PRIMARY, topodatapb.TabletType_REPLICA:
 		return promotionrule.Neutral
@@ -124,11 +141,13 @@ func (d *durabilityNone) promotionRule(tablet *topodatapb.Tablet) promotionrule.
 	return promotionrule.MustNot
 }
 
-func (d *durabilityNone) semiSyncAckers(tablet *topodatapb.Tablet) int {
+// SemiSyncAckers implements the Durabler interface
+func (d *durabilityNone) SemiSyncAckers(tablet *topodatapb.Tablet) int {
 	return 0
 }
 
-func (d *durabilityNone) isReplicaSemiSync(primary, replica *topodatapb.Tablet) bool {
+// IsReplicaSemiSync implements the Durabler interface
+func (d *durabilityNone) IsReplicaSemiSync(primary, replica *topodatapb.Tablet) bool {
 	return false
 }
 
@@ -136,9 +155,12 @@ func (d *durabilityNone) isReplicaSemiSync(primary, replica *topodatapb.Tablet) 
 
 // durabilitySemiSync has 1 semi-sync setup. It only allows Primary and Replica type servers to acknowledge semi sync
 // It returns NeutralPromoteRule for Primary and Replica tablet types, MustNotPromoteRule for everything else
-type durabilitySemiSync struct{}
+type durabilitySemiSync struct {
+	rdonlySemiSync bool
+}
 
-func (d *durabilitySemiSync) promotionRule(tablet *topodatapb.Tablet) promotionrule.CandidatePromotionRule {
+// PromotionRule implements the Durabler interface
+func (d *durabilitySemiSync) PromotionRule(tablet *topodatapb.Tablet) promotionrule.CandidatePromotionRule {
 	switch tablet.Type {
 	case topodatapb.TabletType_PRIMARY, topodatapb.TabletType_REPLICA:
 		return promotionrule.Neutral
@@ -146,14 +168,18 @@ func (d *durabilitySemiSync) promotionRule(tablet *topodatapb.Tablet) promotionr
 	return promotionrule.MustNot
 }
 
-func (d *durabilitySemiSync) semiSyncAckers(tablet *topodatapb.Tablet) int {
+// SemiSyncAckers implements the Durabler interface
+func (d *durabilitySemiSync) SemiSyncAckers(tablet *topodatapb.Tablet) int {
 	return 1
 }
 
-func (d *durabilitySemiSync) isReplicaSemiSync(primary, replica *topodatapb.Tablet) bool {
+// IsReplicaSemiSync implements the Durabler interface
+func (d *durabilitySemiSync) IsReplicaSemiSync(primary, replica *topodatapb.Tablet) bool {
 	switch replica.Type {
 	case topodatapb.TabletType_PRIMARY, topodatapb.TabletType_REPLICA:
 		return true
+	case topodatapb.TabletType_RDONLY:
+		return d.rdonlySemiSync
 	}
 	return false
 }
@@ -163,9 +189,12 @@ func (d *durabilitySemiSync) isReplicaSemiSync(primary, replica *topodatapb.Tabl
 // durabilityCrossCell has 1 semi-sync setup. It only allows Primary and Replica type servers from a different cell to acknowledge semi sync.
 // This means that a transaction must be in two cells for it to be acknowledged
 // It returns NeutralPromoteRule for Primary and Replica tablet types, MustNotPromoteRule for everything else
-type durabilityCrossCell struct{}
+type durabilityCrossCell struct {
+	rdonlySemiSync bool
+}
 
-func (d *durabilityCrossCell) promotionRule(tablet *topodatapb.Tablet) promotionrule.CandidatePromotionRule {
+// PromotionRule implements the Durabler interface
+func (d *durabilityCrossCell) PromotionRule(tablet *topodatapb.Tablet) promotionrule.CandidatePromotionRule {
 	switch tablet.Type {
 	case topodatapb.TabletType_PRIMARY, topodatapb.TabletType_REPLICA:
 		return promotionrule.Neutral
@@ -173,18 +202,18 @@ func (d *durabilityCrossCell) promotionRule(tablet *topodatapb.Tablet) promotion
 	return promotionrule.MustNot
 }
 
-func (d *durabilityCrossCell) semiSyncAckers(tablet *topodatapb.Tablet) int {
+// SemiSyncAckers implements the Durabler interface
+func (d *durabilityCrossCell) SemiSyncAckers(tablet *topodatapb.Tablet) int {
 	return 1
 }
 
-func (d *durabilityCrossCell) isReplicaSemiSync(primary, replica *topodatapb.Tablet) bool {
-	// Prevent panics.
-	if primary.Alias == nil || replica.Alias == nil {
-		return false
-	}
+// IsReplicaSemiSync implements the Durabler interface
+func (d *durabilityCrossCell) IsReplicaSemiSync(primary, replica *topodatapb.Tablet) bool {
 	switch replica.Type {
 	case topodatapb.TabletType_PRIMARY, topodatapb.TabletType_REPLICA:
 		return primary.Alias.Cell != replica.Alias.Cell
+	case topodatapb.TabletType_RDONLY:
+		return d.rdonlySemiSync && primary.Alias.Cell != replica.Alias.Cell
 	}
 	return false
 }
@@ -194,7 +223,8 @@ func (d *durabilityCrossCell) isReplicaSemiSync(primary, replica *topodatapb.Tab
 // durabilityTest is like durabilityNone. It overrides the type for a specific tablet to prefer. It is only meant to be used for testing purposes!
 type durabilityTest struct{}
 
-func (d *durabilityTest) promotionRule(tablet *topodatapb.Tablet) promotionrule.CandidatePromotionRule {
+// PromotionRule implements the Durabler interface
+func (d *durabilityTest) PromotionRule(tablet *topodatapb.Tablet) promotionrule.CandidatePromotionRule {
 	if topoproto.TabletAliasString(tablet.Alias) == "zone2-0000000200" {
 		return promotionrule.Prefer
 	}
@@ -206,10 +236,12 @@ func (d *durabilityTest) promotionRule(tablet *topodatapb.Tablet) promotionrule.
 	return promotionrule.MustNot
 }
 
-func (d *durabilityTest) semiSyncAckers(tablet *topodatapb.Tablet) int {
+// SemiSyncAckers implements the Durabler interface
+func (d *durabilityTest) SemiSyncAckers(tablet *topodatapb.Tablet) int {
 	return 0
 }
 
-func (d *durabilityTest) isReplicaSemiSync(primary, replica *topodatapb.Tablet) bool {
+// IsReplicaSemiSync implements the Durabler interface
+func (d *durabilityTest) IsReplicaSemiSync(primary, replica *topodatapb.Tablet) bool {
 	return false
 }

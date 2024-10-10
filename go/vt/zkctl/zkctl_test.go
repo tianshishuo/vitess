@@ -17,7 +17,10 @@ limitations under the License.
 package zkctl
 
 import (
+	"fmt"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 // This test depend on starting and stopping a ZK instance,
@@ -33,20 +36,25 @@ func TestLifeCycle(t *testing.T) {
 	myID := 255
 
 	zkConf := MakeZkConfigFromString(config, uint32(myID))
+	tpcKeepAliveCfg := "tcpKeepAlive=true"
+	adminServerCfg := "admin.serverPort=8081"
+	zkConf.Extra = []string{tpcKeepAliveCfg, adminServerCfg}
+
+	zkObservedConf, err := MakeZooCfg([]string{zkConf.ConfigFile()}, zkConf, "header")
+	require.NoError(t, err)
+	require.Contains(t, zkObservedConf, fmt.Sprintf("\n%s\n", tpcKeepAliveCfg), "Expected tpcKeepAliveCfg in zkObservedConf")
+	require.Contains(t, zkObservedConf, fmt.Sprintf("\n%s\n", adminServerCfg), "Expected adminServerCfg in zkObservedConf")
+
 	zkd := NewZkd(zkConf)
-	if err := zkd.Init(); err != nil {
-		t.Fatalf("Init() err: %v", err)
-	}
+	err = zkd.Init()
+	require.NoError(t, err)
 
-	if err := zkd.Shutdown(); err != nil {
-		t.Fatalf("Shutdown() err: %v", err)
-	}
+	err = zkd.Shutdown()
+	require.NoError(t, err)
 
-	if err := zkd.Start(); err != nil {
-		t.Fatalf("Start() err: %v", err)
-	}
+	err = zkd.Start()
+	require.NoError(t, err)
 
-	if err := zkd.Teardown(); err != nil {
-		t.Fatalf("Teardown() err: %v", err)
-	}
+	err = zkd.Teardown()
+	require.NoError(t, err)
 }

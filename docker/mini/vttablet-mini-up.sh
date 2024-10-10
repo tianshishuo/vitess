@@ -50,7 +50,6 @@ vttablet \
  -init_shard $shard \
  -init_tablet_type $tablet_type \
  -health_check_interval 5s \
- -enable_semi_sync \
  -enable_replication_reporter \
  -backup_storage_implementation file \
  -file_backup_storage_root $VTDATAROOT/backups \
@@ -65,7 +64,6 @@ vttablet \
  -mycnf_mysql_port $mysql_port \
  -service_map 'grpc-queryservice,grpc-tabletmanager,grpc-updatestream' \
  -pid_file $VTDATAROOT/$tablet_dir/vttablet.pid \
- -vtctld_addr http://$hostname:$vtctld_web_port/ \
  > $VTDATAROOT/$tablet_dir/vttablet.out 2>&1 &
 
 # Block waiting for the tablet to be listening

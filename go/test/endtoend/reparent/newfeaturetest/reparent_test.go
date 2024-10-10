@@ -18,232 +18,162 @@ package newfeaturetest
 
 import (
 	"context"
-	"os/exec"
+	"fmt"
 	"testing"
-	"time"
 
+	"github.com/stretchr/testify/require"
+
+	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/test/endtoend/cluster"
 	"vitess.io/vitess/go/test/endtoend/reparent/utils"
-	"vitess.io/vitess/go/vt/log"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
-// ERS TESTS
-
-// TestERSPromoteRdonly tests that we never end up promoting a rdonly instance as the primary
-func TestERSPromoteRdonly(t *testing.T) {
+// TestRecoverWithMultipleVttabletFailures tests that ERS succeeds with the default values
+// even when there are multiple vttablet failures. In this test we use the semi_sync policy
+// to allow multiple failures to happen and still be recoverable.
+// The test takes down the vttablets of the primary and a rdonly tablet and runs ERS with the
+// default values of remote_operation_timeout, lock-timeout flags and wait_replicas_timeout subflag.
+func TestRecoverWithMultipleVttabletFailures(t *testing.T) {
 	defer cluster.PanicHandler(t)
-	clusterInstance := utils.SetupReparentCluster(t, true)
+	clusterInstance := utils.SetupReparentCluster(t, "semi_sync")
 	defer utils.TeardownCluster(clusterInstance)
 	tablets := clusterInstance.Keyspaces[0].Shards[0].Vttablets
-	var err error
-
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("ChangeTabletType", tablets[1].Alias, "rdonly")
-	require.NoError(t, err)
-
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("ChangeTabletType", tablets[2].Alias, "rdonly")
-	require.NoError(t, err)
-
-	utils.ConfirmReplication(t, tablets[0], tablets[1:])
-
-	// Make the current primary agent and database unavailable.
-	utils.StopTablet(t, tablets[0], true)
-
-	// We expect this one to fail because we have ignored all the replicas and have only the rdonly's which should not be promoted
-	out, err := utils.ErsIgnoreTablet(clusterInstance, nil, "30s", "30s", []*cluster.Vttablet{tablets[3]}, false)
-	require.NotNil(t, err, out)
-
-	out, err = clusterInstance.VtctlclientProcess.ExecuteCommandWithOutput("GetShard", utils.KeyspaceShard)
-	require.NoError(t, err)
-	require.Contains(t, out, `"uid": 101`, "the primary should still be 101 in the shard info")
-}
-
-// TestERSPreventCrossCellPromotion tests that we promote a replica in the same cell as the previous primary if prevent cross cell promotion flag is set
-func TestERSPreventCrossCellPromotion(t *testing.T) {
-	defer cluster.PanicHandler(t)
-	clusterInstance := utils.SetupReparentCluster(t, true)
-	defer utils.TeardownCluster(clusterInstance)
-	tablets := clusterInstance.Keyspaces[0].Shards[0].Vttablets
-	var err error
-
-	// confirm that replication is going smoothly
 	utils.ConfirmReplication(t, tablets[0], []*cluster.Vttablet{tablets[1], tablets[2], tablets[3]})
 
-	// Make the current primary agent and database unavailable.
+	// make tablets[1] a rdonly tablet.
+	err := clusterInstance.VtctldClientProcess.ExecuteCommand("ChangeTabletType", tablets[1].Alias, "rdonly")
+	require.NoError(t, err)
+
+	// Confirm that replication is still working as intended
+	utils.ConfirmReplication(t, tablets[0], tablets[1:])
+
+	// Make the rdonly and primary tablets and databases unavailable.
+	utils.StopTablet(t, tablets[1], true)
 	utils.StopTablet(t, tablets[0], true)
 
-	// We expect that tablets[2] will be promoted since it is in the same cell as the previous primary
-	out, err := utils.ErsIgnoreTablet(clusterInstance, nil, "60s", "30s", []*cluster.Vttablet{tablets[1]}, true)
+	// We expect this to succeed since we only have 1 primary eligible tablet which is down
+	out, err := utils.Ers(clusterInstance, nil, "", "")
 	require.NoError(t, err, out)
 
 	newPrimary := utils.GetNewPrimary(t, clusterInstance)
-	require.Equal(t, newPrimary.Alias, tablets[2].Alias, "tablets[2] should be the promoted primary")
+	utils.ConfirmReplication(t, newPrimary, []*cluster.Vttablet{tablets[2], tablets[3]})
 }
 
-// TestPullFromRdonly tests that if a rdonly tablet is the most advanced, then our promoted primary should have
-// caught up to it by pulling transactions from it
-func TestPullFromRdonly(t *testing.T) {
+// TetsSingeReplicaERS tests that ERS works even when there is only 1 tablet left
+// as long the durability policy allows this failure. Moreover, this also tests that the
+// replica is one such that it was a primary itself before. This way its executed gtid set
+// will have atleast 2 tablets in it. We want to make sure this tablet is not marked as errant
+// and ERS succeeds.
+func TestSingleReplicaERS(t *testing.T) {
+	// Set up a cluster with none durability policy
 	defer cluster.PanicHandler(t)
-	clusterInstance := utils.SetupReparentCluster(t, true)
+	clusterInstance := utils.SetupReparentCluster(t, "none")
 	defer utils.TeardownCluster(clusterInstance)
 	tablets := clusterInstance.Keyspaces[0].Shards[0].Vttablets
-	var err error
+	// Confirm that the replication is setup correctly in the beginning.
+	// tablets[0] is the primary tablet in the beginning.
+	utils.ConfirmReplication(t, tablets[0], []*cluster.Vttablet{tablets[1], tablets[2], tablets[3]})
+
+	// Delete and stop two tablets. We only want to have 2 tablets for this test.
+	utils.DeleteTablet(t, clusterInstance, tablets[2])
+	utils.DeleteTablet(t, clusterInstance, tablets[3])
+	utils.StopTablet(t, tablets[2], true)
+	utils.StopTablet(t, tablets[3], true)
+
+	// Reparent to the other replica
+	output, err := utils.Prs(t, clusterInstance, tablets[1])
+	require.NoError(t, err, "error in PlannedReparentShard output - %s", output)
+
+	// Check the replication is set up correctly before we failover
+	utils.ConfirmReplication(t, tablets[1], []*cluster.Vttablet{tablets[0]})
+
+	// Make the current primary vttablet unavailable.
+	utils.StopTablet(t, tablets[1], true)
+
+	// Run an ERS with only one replica reachable. Also, this replica is such that it was a primary before.
+	output, err = utils.Ers(clusterInstance, tablets[0], "", "")
+	require.NoError(t, err, "error in Emergency Reparent Shard output - %s", output)
+
+	// Check the tablet is indeed promoted
+	utils.CheckPrimaryTablet(t, clusterInstance, tablets[0])
+	// Also check the writes succeed after failover
+	utils.ConfirmReplication(t, tablets[0], []*cluster.Vttablet{})
+}
+
+// TestTabletRestart tests that a running tablet can be  restarted and everything is still fine
+func TestTabletRestart(t *testing.T) {
+	defer cluster.PanicHandler(t)
+	clusterInstance := utils.SetupReparentCluster(t, "semi_sync")
+	defer utils.TeardownCluster(clusterInstance)
+	tablets := clusterInstance.Keyspaces[0].Shards[0].Vttablets
+
+	utils.StopTablet(t, tablets[1], false)
+	tablets[1].VttabletProcess.ServingStatus = "SERVING"
+	err := tablets[1].VttabletProcess.Setup()
+	require.NoError(t, err)
+}
+
+// Tests ensures that ChangeTabletType works even when semi-sync plugins are not loaded.
+func TestChangeTypeWithoutSemiSync(t *testing.T) {
+	defer cluster.PanicHandler(t)
+	clusterInstance := utils.SetupReparentCluster(t, "none")
+	defer utils.TeardownCluster(clusterInstance)
+	tablets := clusterInstance.Keyspaces[0].Shards[0].Vttablets
 
 	ctx := context.Background()
-	// make tablets[1] a rdonly tablet.
-	// rename tablet so that the test is not confusing
-	rdonly := tablets[1]
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("ChangeTabletType", rdonly.Alias, "rdonly")
+
+	primary, replica := tablets[0], tablets[1]
+
+	// Unload semi sync plugins
+	for _, tablet := range tablets[0:4] {
+		qr := utils.RunSQL(ctx, t, "select @@global.super_read_only", tablet)
+		result := fmt.Sprintf("%v", qr.Rows[0][0].ToString())
+		if result == "1" {
+			utils.RunSQL(ctx, t, "set global super_read_only = 0", tablet)
+		}
+
+		semisyncType, err := utils.SemiSyncExtensionLoaded(ctx, tablet)
+		require.NoError(t, err)
+		switch semisyncType {
+		case mysql.SemiSyncTypeSource:
+			utils.RunSQL(ctx, t, "UNINSTALL PLUGIN rpl_semi_sync_replica", tablet)
+			utils.RunSQL(ctx, t, "UNINSTALL PLUGIN rpl_semi_sync_source", tablet)
+		case mysql.SemiSyncTypeMaster:
+			utils.RunSQL(ctx, t, "UNINSTALL PLUGIN rpl_semi_sync_slave", tablet)
+			utils.RunSQL(ctx, t, "UNINSTALL PLUGIN rpl_semi_sync_master", tablet)
+		default:
+			require.Fail(t, "Unknown semi sync type")
+		}
+	}
+
+	utils.ValidateTopology(t, clusterInstance, true)
+	utils.CheckPrimaryTablet(t, clusterInstance, primary)
+
+	// Change replica's type to rdonly
+	err := clusterInstance.VtctldClientProcess.ExecuteCommand("ChangeTabletType", replica.Alias, "rdonly")
 	require.NoError(t, err)
 
-	// confirm that all the tablets can replicate successfully right now
-	utils.ConfirmReplication(t, tablets[0], []*cluster.Vttablet{rdonly, tablets[2], tablets[3]})
-
-	// stop replication on the other two tablets
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("StopReplication", tablets[2].Alias)
-	require.NoError(t, err)
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("StopReplication", tablets[3].Alias)
-	require.NoError(t, err)
-
-	// stop semi-sync on the primary so that any transaction now added does not require an ack
-	utils.RunSQL(ctx, t, "SET GLOBAL rpl_semi_sync_master_enabled = false", tablets[0])
-
-	// confirm that rdonly is able to replicate from our primary
-	// This will also introduce a new transaction into the rdonly tablet which the other 2 replicas don't have
-	insertVal := utils.ConfirmReplication(t, tablets[0], []*cluster.Vttablet{rdonly})
-
-	// Make the current primary agent and database unavailable.
-	utils.StopTablet(t, tablets[0], true)
-
-	// start the replication back on the two tablets
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("StartReplication", tablets[2].Alias)
-	require.NoError(t, err)
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("StartReplication", tablets[3].Alias)
-	require.NoError(t, err)
-
-	// check that tablets[2] and tablets[3] still only has 1 value
-	err = utils.CheckCountOfInsertedValues(ctx, t, tablets[2], 1)
-	require.NoError(t, err)
-	err = utils.CheckCountOfInsertedValues(ctx, t, tablets[3], 1)
-	require.NoError(t, err)
-
-	// At this point we have successfully made our rdonly tablet more advanced than tablets[2] and tablets[3] without introducing errant GTIDs
-	// We have simulated a network partition in which the primary and rdonly got isolated and then the primary went down leaving the rdonly most advanced
-
-	// We expect that tablets[2] will be promoted since it is in the same cell as the previous primary
-	// since we are preventing cross cell promotions
-	// Also it must be fully caught up
-	out, err := utils.ErsIgnoreTablet(clusterInstance, nil, "60s", "30s", nil, true)
-	require.NoError(t, err, out)
-
-	newPrimary := utils.GetNewPrimary(t, clusterInstance)
-	require.Equal(t, newPrimary.Alias, tablets[2].Alias, "tablets[2] should be the promoted primary")
-
-	// check that the new primary has the last transaction that only the rdonly had
-	err = utils.CheckInsertedValues(ctx, t, newPrimary, insertVal)
+	// Change tablets type from rdonly back to replica
+	err = clusterInstance.VtctldClientProcess.ExecuteCommand("ChangeTabletType", replica.Alias, "replica")
 	require.NoError(t, err)
 }
 
-// TestNoReplicationStatusAndReplicationStopped checks that ERS is able to fix
-// replicas which do not have any replication status and also succeeds if the replication
-// is stopped on the primary elect.
-func TestNoReplicationStatusAndReplicationStopped(t *testing.T) {
+// TestERSWithWriteInPromoteReplica tests that ERS doesn't fail even if there is a
+// write that happens when PromoteReplica is called.
+func TestERSWithWriteInPromoteReplica(t *testing.T) {
 	defer cluster.PanicHandler(t)
-	clusterInstance := utils.SetupReparentCluster(t, true)
+	clusterInstance := utils.SetupReparentCluster(t, "semi_sync")
 	defer utils.TeardownCluster(clusterInstance)
 	tablets := clusterInstance.Keyspaces[0].Shards[0].Vttablets
 	utils.ConfirmReplication(t, tablets[0], []*cluster.Vttablet{tablets[1], tablets[2], tablets[3]})
 
-	err := clusterInstance.VtctlclientProcess.ExecuteCommand("ExecuteFetchAsDba", tablets[1].Alias, `STOP SLAVE; RESET SLAVE ALL`)
-	require.NoError(t, err)
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("ExecuteFetchAsDba", tablets[2].Alias, `STOP SLAVE;`)
-	require.NoError(t, err)
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("ExecuteFetchAsDba", tablets[3].Alias, `STOP SLAVE SQL_THREAD;`)
-	require.NoError(t, err)
-	// Run an additional command in the current primary which will only be acked by tablets[3] and be in its relay log.
-	insertedVal := utils.ConfirmReplication(t, tablets[0], nil)
-	// Failover to tablets[3]
-	out, err := utils.Ers(clusterInstance, tablets[3], "60s", "30s")
-	require.NoError(t, err, out)
-	// Verify that the tablet has the inserted value
-	err = utils.CheckInsertedValues(context.Background(), t, tablets[3], insertedVal)
-	require.NoError(t, err)
-	// Confirm that replication is setup correctly from tablets[3] to tablets[0]
-	utils.ConfirmReplication(t, tablets[3], tablets[:1])
-	// Confirm that tablets[2] which had replication stopped initially still has its replication stopped
-	utils.CheckReplicationStatus(context.Background(), t, tablets[2], false, false)
-}
-
-// TestERSForInitialization tests whether calling ERS in the beginning sets up the cluster properly or not
-func TestERSForInitialization(t *testing.T) {
-	var tablets []*cluster.Vttablet
-	clusterInstance := cluster.NewCluster("zone1", "localhost")
-	keyspace := &cluster.Keyspace{Name: utils.KeyspaceName}
-	clusterInstance.VtctldExtraArgs = append(clusterInstance.VtctldExtraArgs, "-durability_policy=semi_sync")
-	// Start topo server
-	err := clusterInstance.StartTopo()
-	require.NoError(t, err)
-	err = clusterInstance.TopoProcess.ManageTopoDir("mkdir", "/vitess/"+"zone1")
-	require.NoError(t, err)
-	for i := 0; i < 4; i++ {
-		tablet := clusterInstance.NewVttabletInstance("replica", 100+i, "zone1")
-		tablets = append(tablets, tablet)
-	}
-
-	shard := &cluster.Shard{Name: utils.ShardName}
-	shard.Vttablets = tablets
-	clusterInstance.VtTabletExtraArgs = []string{
-		"-lock_tables_timeout", "5s",
-		"-enable_semi_sync",
-		"-init_populate_metadata",
-		"-track_schema_versions=true",
-	}
-
-	// Initialize Cluster
-	err = clusterInstance.SetupCluster(keyspace, []cluster.Shard{*shard})
-	require.NoError(t, err)
-
-	//Start MySql
-	var mysqlCtlProcessList []*exec.Cmd
-	for _, shard := range clusterInstance.Keyspaces[0].Shards {
-		for _, tablet := range shard.Vttablets {
-			log.Infof("Starting MySql for tablet %v", tablet.Alias)
-			proc, err := tablet.MysqlctlProcess.StartProcess()
-			require.NoError(t, err)
-			mysqlCtlProcessList = append(mysqlCtlProcessList, proc)
-		}
-	}
-	// Wait for mysql processes to start
-	for _, proc := range mysqlCtlProcessList {
-		if err := proc.Wait(); err != nil {
-			t.Fatalf("Error starting mysql: %s", err.Error())
-		}
-	}
-
-	for _, tablet := range tablets {
-		// Start the tablet
-		err = tablet.VttabletProcess.Setup()
-		require.NoError(t, err)
-	}
-	for _, tablet := range tablets {
-		err := tablet.VttabletProcess.WaitForTabletStatuses([]string{"SERVING", "NOT_SERVING"})
-		require.NoError(t, err)
-	}
-
-	// Force the replica to reparent assuming that all the datasets are identical.
-	res, err := utils.Ers(clusterInstance, tablets[0], "60s", "30s")
-	require.NoError(t, err, res)
-
-	utils.ValidateTopology(t, clusterInstance, true)
-	// create Tables
-	utils.RunSQL(context.Background(), t, "create table vt_insert_test (id bigint, msg varchar(64), primary key (id)) Engine=InnoDB", tablets[0])
-	utils.CheckPrimaryTablet(t, clusterInstance, tablets[0])
-	utils.ValidateTopology(t, clusterInstance, false)
-	time.Sleep(100 * time.Millisecond) // wait for replication to catchup
-	strArray := utils.GetShardReplicationPositions(t, clusterInstance, utils.KeyspaceName, utils.ShardName, true)
-	assert.Equal(t, len(tablets), len(strArray))
-	assert.Contains(t, strArray[0], "primary") // primary first
-	utils.ConfirmReplication(t, tablets[0], tablets[1:])
+	// Drop a table so that when sidecardb changes are checked, we run a DML query.
+	utils.RunSQLs(context.Background(), t, []string{
+		"set sql_log_bin=0",
+		`SET @@global.super_read_only=0`,
+		`DROP TABLE _vt.heartbeat`,
+		"set sql_log_bin=1",
+	}, tablets[3])
+	_, err := utils.Ers(clusterInstance, tablets[3], "60s", "30s")
+	require.NoError(t, err, "ERS should not fail even if there is a sidecardb change")
 }

@@ -19,15 +19,25 @@ limitations under the License.
 package mysqlctlclient
 
 import (
-	"flag"
+	"context"
 	"fmt"
 
-	"context"
+	"github.com/spf13/pflag"
 
 	"vitess.io/vitess/go/vt/log"
+	mysqlctlpb "vitess.io/vitess/go/vt/proto/mysqlctl"
+	"vitess.io/vitess/go/vt/servenv"
 )
 
-var protocol = flag.String("mysqlctl_client_protocol", "grpc", "the protocol to use to talk to the mysqlctl server")
+var protocol = "grpc"
+
+func init() {
+	servenv.OnParseFor("mysqlctl", registerFlags)
+}
+
+func registerFlags(fs *pflag.FlagSet) {
+	fs.StringVar(&protocol, "mysqlctl_client_protocol", protocol, "the protocol to use to talk to the mysqlctl server")
+}
 
 // MysqlctlClient defines the interface used to send remote mysqlctl commands
 type MysqlctlClient interface {
@@ -40,18 +50,27 @@ type MysqlctlClient interface {
 	// RunMysqlUpgrade calls Mysqld.RunMysqlUpgrade remotely.
 	RunMysqlUpgrade(ctx context.Context) error
 
+	// ApplyBinlogFile calls Mysqld.ApplyBinlogFile remotely.
+	ApplyBinlogFile(ctx context.Context, req *mysqlctlpb.ApplyBinlogFileRequest) error
+
+	// ReadBinlogFilesTimestamps calls Mysqld.ReadBinlogFilesTimestamps remotely.
+	ReadBinlogFilesTimestamps(ctx context.Context, req *mysqlctlpb.ReadBinlogFilesTimestampsRequest) (*mysqlctlpb.ReadBinlogFilesTimestampsResponse, error)
+
 	// ReinitConfig calls Mysqld.ReinitConfig remotely.
 	ReinitConfig(ctx context.Context) error
 
 	// RefreshConfig calls Mysqld.RefreshConfig remotely.
 	RefreshConfig(ctx context.Context) error
 
+	// VersionString calls Mysqld.VersionString remotely.
+	VersionString(ctx context.Context) (string, error)
+
 	// Close will terminate the connection. This object won't be used anymore.
 	Close()
 }
 
 // Factory functions are registered by client implementations.
-type Factory func(network, addr string) (MysqlctlClient, error)
+type Factory func(ctx context.Context, network, addr string) (MysqlctlClient, error)
 
 var factories = make(map[string]Factory)
 
@@ -64,10 +83,10 @@ func RegisterFactory(name string, factory Factory) {
 }
 
 // New creates a client implementation as specified by a flag.
-func New(network, addr string) (MysqlctlClient, error) {
-	factory, ok := factories[*protocol]
+func New(ctx context.Context, network, addr string) (MysqlctlClient, error) {
+	factory, ok := factories[protocol]
 	if !ok {
-		return nil, fmt.Errorf("unknown mysqlctl client protocol: %v", *protocol)
+		return nil, fmt.Errorf("unknown mysqlctl client protocol: %v", protocol)
 	}
-	return factory(network, addr)
+	return factory(ctx, network, addr)
 }

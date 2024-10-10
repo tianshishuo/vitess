@@ -17,6 +17,7 @@ limitations under the License.
 package testutil
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"sync"
@@ -40,6 +41,7 @@ import (
 	grpcvtctldtestutil "vitess.io/vitess/go/vt/vtctl/grpcvtctldserver/testutil"
 	"vitess.io/vitess/go/vt/vtctl/localvtctldclient"
 	"vitess.io/vitess/go/vt/vtctl/vtctldclient"
+	"vitess.io/vitess/go/vt/vtenv"
 
 	vtadminpb "vitess.io/vitess/go/vt/proto/vtadmin"
 	vtctlservicepb "vitess.io/vitess/go/vt/proto/vtctlservice"
@@ -70,6 +72,10 @@ type TestClusterConfig struct {
 	Tablets []*vtadminpb.Tablet
 	// DBConfig controls the behavior of the cluster's vtsql.DB.
 	DBConfig Dbcfg
+	// Config controls certain cluster config options, primarily used to
+	// properly setup various RPC pools for different testing scenarios.
+	// Other fields (such as ID, Name, and DiscoveryImpl) are ignored.
+	Config *cluster.Config
 }
 
 const discoveryTestImplName = "vtadmin.testutil"
@@ -94,19 +100,6 @@ func BuildCluster(t testing.TB, cfg TestClusterConfig) *cluster.Cluster {
 	disco.AddTaggedGates(nil, &vtadminpb.VTGate{Hostname: fmt.Sprintf("%s-%s-gate", cfg.Cluster.Name, cfg.Cluster.Id)})
 	disco.AddTaggedVtctlds(nil, &vtadminpb.Vtctld{Hostname: "doesn't matter"})
 
-	clusterConf := cluster.Config{
-		ID:            cfg.Cluster.Id,
-		Name:          cfg.Cluster.Name,
-		DiscoveryImpl: discoveryTestImplName,
-	}
-
-	m.Lock()
-	testdisco = disco
-	c, err := cluster.New(clusterConf)
-	m.Unlock()
-
-	require.NoError(t, err, "failed to create cluster from configs %+v %+v", clusterConf, cfg)
-
 	tablets := make([]*vtadminpb.Tablet, len(cfg.Tablets))
 	for i, t := range cfg.Tablets {
 		tablet := &vtadminpb.Tablet{
@@ -118,15 +111,30 @@ func BuildCluster(t testing.TB, cfg TestClusterConfig) *cluster.Cluster {
 		tablets[i] = tablet
 	}
 
-	db := c.DB.(*vtsql.VTGateProxy)
-	db.DialFunc = func(_ vitessdriver.Configuration) (*sql.DB, error) {
-		return sql.OpenDB(&fakevtsql.Connector{Tablets: tablets, ShouldErr: cfg.DBConfig.ShouldErr}), nil
+	var clusterConf cluster.Config
+	if cfg.Config != nil {
+		clusterConf = *cfg.Config
 	}
 
-	vtctld := c.Vtctld.(*vtadminvtctldclient.ClientProxy)
-	vtctld.DialFunc = func(addr string, ff grpcclient.FailFast, opts ...grpc.DialOption) (vtctldclient.VtctldClient, error) {
+	clusterConf.ID = cfg.Cluster.Id
+	clusterConf.Name = cfg.Cluster.Name
+	clusterConf.DiscoveryImpl = discoveryTestImplName
+
+	clusterConf = clusterConf.WithVtctldTestConfigOptions(vtadminvtctldclient.WithDialFunc(func(ctx context.Context, addr string, ff grpcclient.FailFast, opts ...grpc.DialOption) (vtctldclient.VtctldClient, error) {
 		return cfg.VtctldClient, nil
-	}
+	})).WithVtSQLTestConfigOptions(vtsql.WithDialFunc(func(c vitessdriver.Configuration) (*sql.DB, error) {
+		return sql.OpenDB(&fakevtsql.Connector{Tablets: tablets, ShouldErr: cfg.DBConfig.ShouldErr}), nil
+	}))
+
+	m.Lock()
+	testdisco = disco
+	c, err := cluster.New(
+		context.Background(), // consider updating this function to allow callers to provide a context.
+		clusterConf,
+	)
+	m.Unlock()
+
+	require.NoError(t, err, "failed to create cluster from configs %+v %+v", clusterConf, cfg)
 
 	return c
 }
@@ -157,12 +165,12 @@ type IntegrationTestCluster struct {
 //
 // (TODO|@ajm188): Unify this with the BuildCluster API. Also this does not
 // support any cluster methods that involve vtgate/vitessdriver queries.
-func BuildIntegrationTestCluster(t testing.TB, c *vtadminpb.Cluster, cells ...string) *IntegrationTestCluster {
+func BuildIntegrationTestCluster(t testing.TB, ctx context.Context, c *vtadminpb.Cluster, cells ...string) *IntegrationTestCluster {
 	t.Helper()
 
-	ts, factory := memorytopo.NewServerAndFactory(cells...)
+	ts, factory := memorytopo.NewServerAndFactory(ctx, cells...)
 	vtctld := grpcvtctldtestutil.NewVtctldServerWithTabletManagerClient(t, ts, nil, func(ts *topo.Server) vtctlservicepb.VtctldServer {
-		return grpcvtctldserver.NewVtctldServer(ts)
+		return grpcvtctldserver.NewVtctldServer(vtenv.NewTestEnv(), ts)
 	})
 
 	localclient := localvtctldclient.New(vtctld)

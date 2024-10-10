@@ -17,10 +17,10 @@ limitations under the License.
 package vindexes
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/sqltypes"
@@ -30,19 +30,62 @@ import (
 var numeric SingleColumn
 
 func init() {
-	vindex, _ := CreateVindex("numeric", "num", nil)
+	vindex, err := CreateVindex("numeric", "num", nil)
+	if err != nil {
+		panic(err)
+	}
 	numeric = vindex.(SingleColumn)
 }
 
-func TestNumericInfo(t *testing.T) {
-	assert.Equal(t, 0, numeric.Cost())
-	assert.Equal(t, "num", numeric.String())
-	assert.True(t, numeric.IsUnique())
-	assert.False(t, numeric.NeedsVCursor())
+func numericCreateVindexTestCase(
+	testName string,
+	vindexParams map[string]string,
+	expectErr error,
+	expectUnknownParams []string,
+) createVindexTestCase {
+	return createVindexTestCase{
+		testName: testName,
+
+		vindexType:   "numeric",
+		vindexName:   "numeric",
+		vindexParams: vindexParams,
+
+		expectCost:          0,
+		expectErr:           expectErr,
+		expectIsUnique:      true,
+		expectNeedsVCursor:  false,
+		expectString:        "numeric",
+		expectUnknownParams: expectUnknownParams,
+	}
+}
+
+func TestNumericCreateVindex(t *testing.T) {
+	cases := []createVindexTestCase{
+		numericCreateVindexTestCase(
+			"no params",
+			nil,
+			nil,
+			nil,
+		),
+		numericCreateVindexTestCase(
+			"empty params",
+			map[string]string{},
+			nil,
+			nil,
+		),
+		numericCreateVindexTestCase(
+			"unknown params",
+			map[string]string{"hello": "world"},
+			nil,
+			[]string{"hello"},
+		),
+	}
+
+	testCreateVindexes(t, cases)
 }
 
 func TestNumericMap(t *testing.T) {
-	got, err := numeric.Map(nil, []sqltypes.Value{
+	got, err := numeric.Map(context.Background(), nil, []sqltypes.Value{
 		sqltypes.NewInt64(1),
 		sqltypes.NewInt64(2),
 		sqltypes.NewInt64(3),
@@ -75,9 +118,7 @@ func TestNumericMap(t *testing.T) {
 }
 
 func TestNumericVerify(t *testing.T) {
-	got, err := numeric.Verify(nil,
-		[]sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewInt64(2)},
-		[][]byte{[]byte("\x00\x00\x00\x00\x00\x00\x00\x01"), []byte("\x00\x00\x00\x00\x00\x00\x00\x01")})
+	got, err := numeric.Verify(context.Background(), nil, []sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewInt64(2)}, [][]byte{[]byte("\x00\x00\x00\x00\x00\x00\x00\x01"), []byte("\x00\x00\x00\x00\x00\x00\x00\x01")})
 	require.NoError(t, err)
 	want := []bool{true, false}
 	if !reflect.DeepEqual(got, want) {
@@ -85,8 +126,8 @@ func TestNumericVerify(t *testing.T) {
 	}
 
 	// Failure test
-	_, err = numeric.Verify(nil, []sqltypes.Value{sqltypes.NewVarBinary("aa")}, [][]byte{nil})
-	require.EqualError(t, err, "could not parse value: 'aa'")
+	_, err = numeric.Verify(context.Background(), nil, []sqltypes.Value{sqltypes.NewVarBinary("aa")}, [][]byte{nil})
+	require.EqualError(t, err, "cannot parse uint64 from \"aa\"")
 }
 
 func TestNumericReverseMap(t *testing.T) {

@@ -18,16 +18,15 @@ limitations under the License.
 Package topotools contains high level functions based on vt/topo and
 vt/actionnode. It should not depend on anything else that's higher
 level. In particular, it cannot depend on:
-- vt/wrangler: much higher level, wrangler depends on topotools.
-- vt/tabletmanager/initiator: we don't want the various remote
-  protocol dependencies here.
+  - vt/wrangler: much higher level, wrangler depends on topotools.
+  - vt/tabletmanager/initiator: we don't want the various remote
+    protocol dependencies here.
 
 topotools is used by wrangler, so it ends up in all tools using
 wrangler (vtctl, vtctld, ...). It is also included by vttablet, so it contains:
-- most of the logic to create a shard / keyspace (tablet's init code)
-- some of the logic to perform a TabletExternallyReparented (RPC call
-  to primary vttablet to let it know it's the primary).
-
+  - most of the logic to create a shard / keyspace (tablet's init code)
+  - some of the logic to perform a TabletExternallyReparented (RPC call
+    to primary vttablet to let it know it's the primary).
 */
 package topotools
 
@@ -37,6 +36,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 
 	"google.golang.org/protobuf/proto"
 
@@ -44,9 +44,10 @@ import (
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/vterrors"
 
-	querypb "vitess.io/vitess/go/vt/proto/query"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/proto/vttime"
 )
 
@@ -57,6 +58,47 @@ func ConfigureTabletHook(hk *hook.Hook, tabletAlias *topodatapb.TabletAlias) {
 		hk.ExtraEnv = make(map[string]string, 1)
 	}
 	hk.ExtraEnv["TABLET_ALIAS"] = topoproto.TabletAliasString(tabletAlias)
+}
+
+// ChangeTags changes the tags of the tablet. Make this external, since these
+// transitions need to be forced from time to time.
+//
+// If successful, the updated tablet record is returned.
+func ChangeTags(ctx context.Context, ts *topo.Server, tabletAlias *topodatapb.TabletAlias, tabletTags map[string]string, replace bool) (*topodatapb.Tablet, error) {
+	var result *topodatapb.Tablet
+	_, err := ts.UpdateTabletFields(ctx, tabletAlias, func(tablet *topodatapb.Tablet) error {
+		if replace && maps.Equal(tablet.Tags, tabletTags) {
+			result = tablet
+			return topo.NewError(topo.NoUpdateNeeded, topoproto.TabletAliasString(tabletAlias))
+		}
+		if replace || tablet.Tags == nil {
+			tablet.Tags = tabletTags
+		} else {
+			var doUpdate bool
+			for key, val := range tabletTags {
+				if val == "" {
+					if _, found := tablet.Tags[key]; found {
+						delete(tablet.Tags, key)
+						doUpdate = true
+					}
+					continue
+				}
+				if tablet.Tags[key] != val {
+					tablet.Tags[key] = val
+					doUpdate = true
+				}
+			}
+			if !doUpdate {
+				return topo.NewError(topo.NoUpdateNeeded, topoproto.TabletAliasString(tabletAlias))
+			}
+		}
+		result = tablet
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // ChangeType changes the type of the tablet. Make this external, since these
@@ -126,7 +168,7 @@ func DoCellsHaveRdonlyTablets(ctx context.Context, ts *topo.Server, cells []stri
 	}
 
 	for _, cell := range cells {
-		tablets, err := ts.GetTabletsByCell(ctx, cell)
+		tablets, err := ts.GetTabletsByCell(ctx, cell, nil)
 		if err != nil {
 			return false, err
 		}
@@ -137,6 +179,39 @@ func DoCellsHaveRdonlyTablets(ctx context.Context, ts *topo.Server, cells []stri
 	}
 
 	return false, nil
+}
+
+// GetShardPrimaryForTablet returns the TabletInfo of the given tablet's shard's primary.
+//
+// It returns an error if:
+// - The shard does not exist in the topo.
+// - The shard has no primary in the topo.
+// - The shard primary does not think it is PRIMARY.
+// - The shard primary tablet record does not match the keyspace and shard of the replica.
+func GetShardPrimaryForTablet(ctx context.Context, ts *topo.Server, tablet *topodatapb.Tablet) (*topo.TabletInfo, error) {
+	shard, err := ts.GetShard(ctx, tablet.Keyspace, tablet.Shard)
+	if err != nil {
+		return nil, err
+	}
+
+	if !shard.HasPrimary() {
+		return nil, vterrors.Errorf(vtrpc.Code_FAILED_PRECONDITION, "no primary tablet for shard %v/%v", tablet.Keyspace, tablet.Shard)
+	}
+
+	shardPrimary, err := ts.GetTablet(ctx, shard.PrimaryAlias)
+	if err != nil {
+		return nil, fmt.Errorf("cannot lookup primary tablet %v for shard %v/%v: %w", topoproto.TabletAliasString(shard.PrimaryAlias), tablet.Keyspace, tablet.Shard, err)
+	}
+
+	if shardPrimary.Type != topodatapb.TabletType_PRIMARY {
+		return nil, vterrors.Errorf(vtrpc.Code_FAILED_PRECONDITION, "TopologyServer has inconsistent state for shard primary %v", topoproto.TabletAliasString(shard.PrimaryAlias))
+	}
+
+	if shardPrimary.Keyspace != tablet.Keyspace || shardPrimary.Shard != tablet.Shard {
+		return nil, vterrors.Errorf(vtrpc.Code_FAILED_PRECONDITION, "primary %v and potential replica %v not in same keyspace shard (%v/%v)", topoproto.TabletAliasString(shard.PrimaryAlias), topoproto.TabletAliasString(tablet.Alias), tablet.Keyspace, tablet.Shard)
+	}
+
+	return shardPrimary, nil
 }
 
 // IsPrimaryTablet is a helper function to determine whether the current tablet
@@ -184,7 +259,6 @@ func DeleteTablet(ctx context.Context, ts *topo.Server, tablet *topodatapb.Table
 	// try to remove replication data, no fatal if we fail
 	if err := topo.DeleteTabletReplicationData(ctx, ts, tablet); err != nil {
 		if topo.IsErrType(err, topo.NoNode) {
-			log.V(6).Infof("no ShardReplication object for cell %v", tablet.Alias.Cell)
 			err = nil
 		}
 		if err != nil {
@@ -208,7 +282,28 @@ func TabletIdent(tablet *topodatapb.Tablet) string {
 	return fmt.Sprintf("%s-%d (%s%s)", tablet.Alias.Cell, tablet.Alias.Uid, tablet.Hostname, tagStr)
 }
 
-// TargetIdent returns a concise string representation of a query target
-func TargetIdent(target *querypb.Target) string {
-	return fmt.Sprintf("%s/%s (%s)", target.Keyspace, target.Shard, target.TabletType)
+// TabletEquality returns true iff two Tablets are identical for testing purposes
+func TabletEquality(left, right *topodatapb.Tablet) bool {
+	if left.Keyspace != right.Keyspace {
+		return false
+	}
+	if left.Shard != right.Shard {
+		return false
+	}
+	if left.Hostname != right.Hostname {
+		return false
+	}
+	if left.Type != right.Type {
+		return false
+	}
+	if left.MysqlHostname != right.MysqlHostname {
+		return false
+	}
+	if left.MysqlPort != right.MysqlPort {
+		return false
+	}
+	if left.PrimaryTermStartTime.String() != right.PrimaryTermStartTime.String() {
+		return false
+	}
+	return topoproto.TabletAliasString(left.Alias) == topoproto.TabletAliasString(right.Alias)
 }

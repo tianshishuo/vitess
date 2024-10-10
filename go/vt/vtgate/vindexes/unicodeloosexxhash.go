@@ -18,6 +18,7 @@ package vindexes
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 
 	"vitess.io/vitess/go/sqltypes"
@@ -25,8 +26,9 @@ import (
 )
 
 var (
-	_ SingleColumn = (*UnicodeLooseXXHash)(nil)
-	_ Hashing      = (*UnicodeLooseXXHash)(nil)
+	_ SingleColumn    = (*UnicodeLooseXXHash)(nil)
+	_ Hashing         = (*UnicodeLooseXXHash)(nil)
+	_ ParamValidating = (*UnicodeLooseXXHash)(nil)
 )
 
 // UnicodeLooseXXHash is a vindex that normalizes and hashes unicode strings
@@ -35,12 +37,16 @@ var (
 // Ref: http://www.unicode.org/reports/tr10/#Multi_Level_Comparison.
 // This is compatible with MySQL's utf8_unicode_ci collation.
 type UnicodeLooseXXHash struct {
-	name string
+	name          string
+	unknownParams []string
 }
 
-// NewUnicodeLooseXXHash creates a new UnicodeLooseXXHash struct.
-func NewUnicodeLooseXXHash(name string, _ map[string]string) (Vindex, error) {
-	return &UnicodeLooseXXHash{name: name}, nil
+// newUnicodeLooseXXHash creates a new UnicodeLooseXXHash struct.
+func newUnicodeLooseXXHash(name string, m map[string]string) (Vindex, error) {
+	return &UnicodeLooseXXHash{
+		name:          name,
+		unknownParams: FindUnknownParams(m, nil),
+	}, nil
 }
 
 // String returns the name of the vindex.
@@ -64,7 +70,7 @@ func (vind *UnicodeLooseXXHash) NeedsVCursor() bool {
 }
 
 // Verify returns true if ids maps to ksids.
-func (vind *UnicodeLooseXXHash) Verify(_ VCursor, ids []sqltypes.Value, ksids [][]byte) ([]bool, error) {
+func (vind *UnicodeLooseXXHash) Verify(ctx context.Context, vcursor VCursor, ids []sqltypes.Value, ksids [][]byte) ([]bool, error) {
 	out := make([]bool, 0, len(ids))
 	for i, id := range ids {
 		data, err := vind.Hash(id)
@@ -77,7 +83,7 @@ func (vind *UnicodeLooseXXHash) Verify(_ VCursor, ids []sqltypes.Value, ksids []
 }
 
 // Map can map ids to key.Destination objects.
-func (vind *UnicodeLooseXXHash) Map(cursor VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
+func (vind *UnicodeLooseXXHash) Map(ctx context.Context, vcursor VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
 	out := make([]key.Destination, 0, len(ids))
 	for _, id := range ids {
 		data, err := vind.Hash(id)
@@ -90,9 +96,14 @@ func (vind *UnicodeLooseXXHash) Map(cursor VCursor, ids []sqltypes.Value) ([]key
 }
 
 func (vind *UnicodeLooseXXHash) Hash(id sqltypes.Value) ([]byte, error) {
-	return unicodeHash(vXXHash, id)
+	return unicodeHash(&collateXX, id)
+}
+
+// UnknownParams implements the ParamValidating interface.
+func (vind *UnicodeLooseXXHash) UnknownParams() []string {
+	return vind.unknownParams
 }
 
 func init() {
-	Register("unicode_loose_xxhash", NewUnicodeLooseXXHash)
+	Register("unicode_loose_xxhash", newUnicodeLooseXXHash)
 }

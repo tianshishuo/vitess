@@ -26,13 +26,11 @@ import (
 	"sync"
 
 	"github.com/tchap/go-patricia/patricia"
-	"google.golang.org/protobuf/proto"
 
 	"vitess.io/vitess/go/json2"
 	"vitess.io/vitess/go/vt/log"
-	"vitess.io/vitess/go/vt/tableacl/acl"
-
 	tableaclpb "vitess.io/vitess/go/vt/proto/tableacl"
+	"vitess.io/vitess/go/vt/tableacl/acl"
 )
 
 // ACLResult embeds an acl.ACL and also tell which table group it belongs to.
@@ -88,16 +86,16 @@ var currentTableACL tableACL
 // The config file can be binary-proto-encoded, or json-encoded.
 // In the json case, it looks like this:
 //
-// {
-//   "table_groups": [
-//     {
-//       "table_names_or_prefixes": ["name1"],
-//       "readers": ["client1"],
-//       "writers": ["client1"],
-//       "admins": ["client1"]
-//     }
-//   ]
-// }
+//	{
+//	  "table_groups": [
+//	    {
+//	      "table_names_or_prefixes": ["name1"],
+//	      "readers": ["client1"],
+//	      "writers": ["client1"],
+//	      "admins": ["client1"]
+//	    }
+//	  ]
+//	}
 func Init(configFile string, aclCB func()) error {
 	return currentTableACL.init(configFile, aclCB)
 }
@@ -113,9 +111,9 @@ func (tacl *tableACL) init(configFile string, aclCB func()) error {
 		return err
 	}
 	config := &tableaclpb.Config{}
-	if err := proto.Unmarshal(data, config); err != nil {
+	if err := config.UnmarshalVT(data); err != nil {
 		// try to parse tableacl as json file
-		if jsonErr := json2.Unmarshal(data, config); jsonErr != nil {
+		if jsonErr := json2.UnmarshalPB(data, config); jsonErr != nil {
 			log.Infof("unable to parse tableACL config file as a protobuf or json file.  protobuf err: %v  json err: %v", err, jsonErr)
 			return fmt.Errorf("unable to unmarshal Table ACL data: %s", data)
 		}
@@ -188,7 +186,7 @@ func (tacl *tableACL) Set(config *tableaclpb.Config) error {
 	}
 	tacl.Lock()
 	tacl.entries = entries
-	tacl.config = proto.Clone(config).(*tableaclpb.Config)
+	tacl.config = config.CloneVT()
 	callback := tacl.callback
 	tacl.Unlock()
 	if callback != nil {
@@ -277,7 +275,7 @@ func GetCurrentConfig() *tableaclpb.Config {
 func (tacl *tableACL) Config() *tableaclpb.Config {
 	tacl.RLock()
 	defer tacl.RUnlock()
-	return proto.Clone(tacl.config).(*tableaclpb.Config)
+	return tacl.config.CloneVT()
 }
 
 // Register registers an AclFactory.

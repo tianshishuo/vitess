@@ -56,6 +56,15 @@ func TestPrometheusGauge(t *testing.T) {
 	checkHandlerForMetrics(t, name, 0)
 }
 
+func TestPrometheusGaugeFloat64(t *testing.T) {
+	name := "blah_gauge_f64"
+	c := stats.NewGaugeFloat64(name, "help")
+	c.Set(3.14)
+	checkHandlerForMetrics(t, name, 3)
+	c.Reset()
+	checkHandlerForMetrics(t, name, 0)
+}
+
 func TestPrometheusCounterFunc(t *testing.T) {
 	name := "blah_counterfunc"
 	stats.NewCounterFunc(name, "help", func() int64 {
@@ -231,10 +240,33 @@ func TestPrometheusCountersFuncWithMultiLabels(t *testing.T) {
 	checkHandlerForMetricWithMultiLabels(t, name, labels, []string{"bar", "baz"}, 1)
 }
 
+func TestPrometheusStringMapFuncWithMultiLabels(t *testing.T) {
+	name := "blah_stringmapfuncwithmultilabels"
+	keyLabels := []string{"label1", "label2"}
+	valueLabel := "label3"
+
+	stats.NewStringMapFuncWithMultiLabels(name, "help", keyLabels, valueLabel, func() map[string]string {
+		m := make(map[string]string)
+		m["foo.bar"] = "hello"
+		m["bar.baz"] = "world"
+		return m
+	})
+
+	allLabels := append(keyLabels, valueLabel)
+
+	checkHandlerForMetricWithMultiLabels(t, name, allLabels, []string{"foo", "bar", "hello"}, 1)
+	checkHandlerForMetricWithMultiLabels(t, name, allLabels, []string{"bar", "baz", "world"}, 1)
+}
+
 func checkHandlerForMetricWithMultiLabels(t *testing.T, metric string, labels []string, labelValues []string, value int64) {
 	response := testMetricsHandler(t)
 
-	expected := fmt.Sprintf("%s_%s{%s=\"%s\",%s=\"%s\"} %d", namespace, metric, labels[0], labelValues[0], labels[1], labelValues[1], value)
+	kvPairs := make([]string, 0)
+	for i := 0; i < len(labels); i++ {
+		kvPairs = append(kvPairs, fmt.Sprintf("%s=\"%s\"", labels[i], labelValues[i]))
+	}
+
+	expected := fmt.Sprintf("%s_%s{%s} %d", namespace, metric, strings.Join(kvPairs, ","), value)
 
 	if !strings.Contains(response.Body.String(), expected) {
 		t.Fatalf("Expected %s got %s", expected, response.Body.String())
@@ -346,6 +378,26 @@ func testMetricsHandler(t *testing.T) *httptest.ResponseRecorder {
 
 	promhttp.Handler().ServeHTTP(response, req)
 	return response
+}
+
+func TestPrometheusLabels(t *testing.T) {
+	m1 := stats.NewCountersWithSingleLabel("ThisIsMetric1", "helpstring1", "ThisIsALabel")
+	m1.Add("labelvalue1", 420)
+
+	m2 := stats.NewCountersWithMultiLabels("ThisIsMetric2", "helpstring2", []string{"ThisIsALabel"})
+	m2.Add([]string{"labelvalue2"}, 420)
+
+	response := testMetricsHandler(t)
+
+	expect := []string{
+		"namespace_this_is_metric1{this_is_a_label=\"labelvalue1\"} 420",
+		"namespace_this_is_metric2{this_is_a_label=\"labelvalue2\"} 420",
+	}
+	for _, line := range expect {
+		if !strings.Contains(response.Body.String(), line) {
+			t.Fatalf("Expected result to contain %s, got %s", line, response.Body.String())
+		}
+	}
 }
 
 func TestMain(m *testing.M) {

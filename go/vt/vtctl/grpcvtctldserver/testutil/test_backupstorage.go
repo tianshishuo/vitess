@@ -18,6 +18,7 @@ package testutil
 
 import (
 	"context"
+	"fmt"
 	"sort"
 
 	"vitess.io/vitess/go/vt/mysqlctl/backupstorage"
@@ -54,6 +55,29 @@ func (bs *backupStorage) ListBackups(ctx context.Context, dir string) ([]backups
 	return handles, nil
 }
 
+// RemoveBackup is part of the backupstorage.BackupStorage interface.
+func (bs *backupStorage) RemoveBackup(ctx context.Context, dir string, name string) error {
+	bucket, ok := bs.Backups[dir]
+	if !ok {
+		return fmt.Errorf("no bucket for key %s in testutil.BackupStorage", dir)
+	}
+
+	idx := -1
+	for i, backup := range bucket {
+		if backup == name {
+			idx = i
+			break
+		}
+	}
+
+	if idx == -1 {
+		return fmt.Errorf("no backup found for %s/%s", dir, name)
+	}
+
+	bs.Backups[dir] = append(bucket[:idx], bucket[idx+1:]...)
+	return nil
+}
+
 // Close is part of the backupstorage.BackupStorage interface.
 func (bs *backupStorage) Close() error { return nil }
 
@@ -80,7 +104,7 @@ func (a handlesByName) Less(i, j int) bool { return a[i].Name() < a[j].Name() }
 // *backupstorage.BackupStorageImplementation to this value before use.
 const BackupStorageImplementation = "grpcvtctldserver.testutil"
 
-// BackupStorage is the singleton test backupstorage.BackupStorage intastnce. It
+// BackupStorage is the singleton test backupstorage.BackupStorage instance. It
 // is public and singleton to allow tests to both mutate and assert against its
 // state.
 var BackupStorage = &backupStorage{

@@ -67,6 +67,7 @@ var querypbTypes = []querypb.Type{querypb.Type_NULL_TYPE,
 	querypb.Type_SET,
 	querypb.Type_GEOMETRY,
 	querypb.Type_JSON,
+	querypb.Type_VECTOR,
 	querypb.Type_EXPRESSION}
 
 // All valid vindexes
@@ -138,7 +139,7 @@ func FuzzVindex(data []byte) int {
 	// 2) Create()
 
 	// Target 1:
-	_, _ = Map(l, vc, allValues)
+	_, _ = Map(ctx, l, vc, allValues)
 
 	// Target 2:
 	s1 := reflect.TypeOf(l).String()
@@ -152,7 +153,7 @@ func FuzzVindex(data []byte) int {
 		if err != nil {
 			return 0
 		}
-		_ = l.(Lookup).Create(vc, allValues, ksids, false)
+		_ = l.(Lookup).Create(ctx, vc, allValues, ksids, false /* ignoreMode */)
 	}
 	return 1
 }

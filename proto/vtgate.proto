@@ -75,6 +75,7 @@ message Session {
     topodata.TabletAlias tablet_alias = 3;
     // reserved connection if a dedicated connection is needed
     int64 reserved_id = 4;
+    bool vindex_only = 5;
   }
   // shard_sessions keep track of per-shard transaction info.
   repeated ShardSession shard_sessions = 2;
@@ -147,9 +148,21 @@ message Session {
   // enable_system_settings defines if we can use reserved connections.
   bool enable_system_settings = 23;
 
-  // enable_set_var enables the use of SET_VAR query hint to reduce the number of reserved connection
-  // this feature is part of this RFC (https://github.com/vitessio/vitess/issues/9706)'s second proposal
-  bool enable_set_var = 24;
+  map<string, int64> advisory_lock = 24;
+
+  // query_timeout is the maximum amount of time a query is permitted to run
+  int64 query_timeout = 25;
+
+  map<string, PrepareData> prepare_statement = 26;
+
+  // MigrationContext
+  string migration_context = 27;
+}
+
+// PrepareData keeps the prepared statement and other information related for execution of it.
+message PrepareData {
+  string prepare_statement = 1;
+  int32 params_count = 2;
 }
 
 // ReadAfterWrite contains information regarding gtid set and timeout
@@ -162,9 +175,6 @@ message ReadAfterWrite {
 
 // ExecuteRequest is the payload to Execute.
 message ExecuteRequest {
-  // Deprecated:
-  // bool not_in_transaction = 5;
-  reserved 5;
   // caller_id identifies the caller. This is the effective caller ID,
   // set by the application to further identify the caller.
   vtrpc.CallerID caller_id = 1;
@@ -176,10 +186,12 @@ message ExecuteRequest {
   query.BoundQuery query = 3;
 
   // These values are deprecated. Use session instead.
-  // TODO(sougou): remove in 3.1
-  topodata.TabletType tablet_type = 4;
-  string keyspace_shard = 6;
-  query.ExecuteOptions options = 7;
+  // topodata.TabletType tablet_type = 4;
+  // string keyspace_shard = 6;
+  // query.ExecuteOptions options = 7;
+  // Deprecated: use session.in_transaction instead
+  // bool not_in_transaction = 5;
+  reserved 4, 5, 6, 7;
 }
 
 // ExecuteResponse is the returned value from Execute.
@@ -209,11 +221,12 @@ message ExecuteBatchRequest {
   repeated query.BoundQuery queries = 3;
 
   // These values are deprecated. Use session instead.
-  // TODO(sougou): remove in 3.1
-  topodata.TabletType tablet_type = 4;
-  bool as_transaction = 5;
-  string keyspace_shard = 6;
-  query.ExecuteOptions options = 7;
+  //  topodata.TabletType tablet_type = 4;
+  //  bool as_transaction = 5;
+  //  string keyspace_shard = 6;
+  //  query.ExecuteOptions options = 7;
+  reserved 4, 5, 6, 7;
+
 }
 
 
@@ -241,10 +254,10 @@ message StreamExecuteRequest {
   query.BoundQuery query = 2;
 
   // These values are deprecated. Use session instead.
-  // TODO(sougou): remove in 3.1
-  topodata.TabletType tablet_type = 3;
-  string keyspace_shard = 4;
-  query.ExecuteOptions options = 5;
+  //  topodata.TabletType tablet_type = 3;
+  //  string keyspace_shard = 4;
+  //  query.ExecuteOptions options = 5;
+  reserved 3,4,5;
 
   // session carries the session state.
   Session session = 6;
@@ -258,6 +271,9 @@ message StreamExecuteResponse {
   // The first value contains only Fields information.
   // The next values contain the actual rows, a few values per result.
   query.QueryResult result = 1;
+
+  // session is the updated session information.
+  Session session = 2;
 }
 
 // ResolveTransactionRequest is the payload to ResolveTransaction.
@@ -281,6 +297,15 @@ message VStreamFlags {
   uint32 heartbeat_interval = 2;
   // stop streams on a reshard (journal event)
   bool stop_on_reshard = 3;
+  // if specified, these cells (comma-separated) are used to pick source tablets from.
+  // defaults to the cell of the vtgate serving the VStream API.
+  string cells = 4;
+  string cell_preference = 5;
+  string tablet_order = 6;
+  // When set, all new row events from the `heartbeat` table, for all shards, in the sidecardb will be streamed.
+  bool stream_keyspace_heartbeats = 7;
+  // Include reshard journal events in the stream.
+  bool include_reshard_journal_events = 8;
 }
 
 // VStreamRequest is the payload for VStream.

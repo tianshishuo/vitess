@@ -34,6 +34,17 @@ import (
 )
 
 var (
+	// ChangeTabletTags makes a ChangeTabletTags gRPC call to a vtctld.
+	ChangeTabletTags = &cobra.Command{
+		Use:   "ChangeTabletTags <alias> <tablet-tag> [ <tablet-tag> ... ]",
+		Short: "Changes the tablet tags for the specified tablet, if possible.",
+		Long: `Changes the tablet tags for the specified tablet, if possible.
+
+Tags must be specified as key=value pairs.`,
+		DisableFlagsInUseLine: true,
+		Args:                  cobra.MinimumNArgs(2),
+		RunE:                  commandChangeTabletTags,
+	}
 	// ChangeTabletType makes a ChangeTabletType gRPC call to a vtctld.
 	ChangeTabletType = &cobra.Command{
 		Use:   "ChangeTabletType [--dry-run] <alias> <tablet-type>",
@@ -73,6 +84,22 @@ Note: hook names may not contain slash (/) characters.
 		Args:                  cobra.MinimumNArgs(2),
 		RunE:                  commandExecuteHook,
 	}
+	// GetFullStatus makes a FullStatus gRPC call to a vttablet.
+	GetFullStatus = &cobra.Command{
+		Use:                   "GetFullStatus <alias>",
+		Short:                 "Outputs a JSON structure that contains full status of MySQL including the replication information, semi-sync information, GTID information among others.",
+		DisableFlagsInUseLine: true,
+		Args:                  cobra.ExactArgs(1),
+		RunE:                  commandGetFullStatus,
+	}
+	// GetPermissions makes a GetPermissions gRPC call to a vtctld.
+	GetPermissions = &cobra.Command{
+		Use:                   "GetPermissions <tablet_alias>",
+		Short:                 "Displays the permissions for a tablet.",
+		DisableFlagsInUseLine: true,
+		Args:                  cobra.ExactArgs(1),
+		RunE:                  commandGetPermissions,
+	}
 	// GetTablet makes a GetTablet gRPC call to a vtctld.
 	GetTablet = &cobra.Command{
 		Use:                   "GetTablet <alias>",
@@ -83,25 +110,38 @@ Note: hook names may not contain slash (/) characters.
 	}
 	// GetTablets makes a GetTablets gRPC call to a vtctld.
 	GetTablets = &cobra.Command{
-		Use:   "GetTablets [--strict] [{--cell $c1 [--cell $c2 ...], --keyspace $ks [--shard $shard], --tablet-alias $alias}]",
+		Use:   "GetTablets [--strict] [{--cell $c1 [--cell $c2 ...] [--tablet-type $t1] [--keyspace $ks [--shard $shard]], --tablet-alias $alias}]",
 		Short: "Looks up tablets according to filter criteria.",
-		Long: `Looks up tablets according to the filter criteria.
+		Long: fmt.Sprintf(`Looks up tablets according to the filter criteria.
 
-If --tablet-alias is passed, none of the other filters (keyspace, shard, cell) may
-be passed, and tablets are looked up by tablet alias only.
+If --tablet-alias is passed, none of the other filters (tablet-type, keyspace,
+shard, cell) may be passed, and tablets are looked up by tablet alias only.
 
 If --keyspace is passed, then all tablets in the keyspace are retrieved. The
 --shard flag may also be passed to further narrow the set of tablets to that
 <keyspace/shard>. Passing --shard without also passing --keyspace will fail.
 
+If --tablet-type is passed, only tablets of the specified type will be
+returned. Valid tablet types are:
+"%s".
+
 Passing --cell limits the set of tablets to those in the specified cells. The
 --cell flag accepts a CSV argument (e.g. --cell "c1,c2") and may be repeated
 (e.g. --cell "c1" --cell "c2").
 
-Valid output formats are "awk" and "json".`,
+Valid output formats are "awk" and "json".`, strings.Join(topoproto.MakeUniqueStringTypeList(topoproto.AllTabletTypes), "\", \"")),
 		DisableFlagsInUseLine: true,
 		Args:                  cobra.NoArgs,
 		RunE:                  commandGetTablets,
+	}
+	// GetTabletVersion makes a GetVersion RPC to a vtctld.
+	GetTabletVersion = &cobra.Command{
+		Use:                   "GetTabletVersion <alias>",
+		Short:                 "Print the version of a tablet from its debug vars.",
+		DisableFlagsInUseLine: true,
+		Aliases:               []string{"GetVersion"},
+		Args:                  cobra.ExactArgs(1),
+		RunE:                  commandGetTabletVersion,
 	}
 	// PingTablet makes a PingTablet gRPC call to a vtctld.
 	PingTablet = &cobra.Command{
@@ -130,9 +170,9 @@ Valid output formats are "awk" and "json".`,
 	// RunHealthCheck makes a RunHealthCheck gRPC call to a vtctld.
 	RunHealthCheck = &cobra.Command{
 		Use:                   "RunHealthCheck <tablet_alias>",
-		Aliases:               []string{"RunHealthcheck"},
 		Short:                 "Runs a healthcheck on the remote tablet.",
 		DisableFlagsInUseLine: true,
+		Aliases:               []string{"RunHealthcheck"},
 		Args:                  cobra.ExactArgs(1),
 		RunE:                  commandRunHealthCheck,
 	}
@@ -182,6 +222,40 @@ Note that, in the SleepTablet implementation, the value should be positively-sig
 		RunE:                  commandStopReplication,
 	}
 )
+
+var changeTabletTagsOptions = struct {
+	Replace bool
+}{}
+
+func commandChangeTabletTags(cmd *cobra.Command, args []string) error {
+	allArgs := cmd.Flags().Args()
+
+	alias, err := topoproto.ParseTabletAlias(allArgs[0])
+	if err != nil {
+		return err
+	}
+
+	tags, err := cli.TabletTagsFromPosArgs(allArgs[1:])
+	if err != nil {
+		return err
+	}
+
+	cli.FinishedParsing(cmd)
+
+	resp, err := client.ChangeTabletTags(commandCtx, &vtctldatapb.ChangeTabletTagsRequest{
+		TabletAlias: alias,
+		Tags:        tags,
+		Replace:     changeTabletTagsOptions.Replace,
+	})
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("- %v\n", cli.MarshalMapAWK(resp.BeforeTags))
+	fmt.Printf("+ %v\n", cli.MarshalMapAWK(resp.AfterTags))
+
+	return nil
+}
 
 var changeTabletTypeOptions = struct {
 	DryRun bool
@@ -282,6 +356,53 @@ func commandExecuteHook(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+func commandGetFullStatus(cmd *cobra.Command, args []string) error {
+	aliasStr := cmd.Flags().Arg(0)
+	alias, err := topoproto.ParseTabletAlias(aliasStr)
+	if err != nil {
+		return err
+	}
+
+	cli.FinishedParsing(cmd)
+
+	resp, err := client.GetFullStatus(commandCtx, &vtctldatapb.GetFullStatusRequest{TabletAlias: alias})
+	if err != nil {
+		return err
+	}
+
+	data, err := cli.MarshalJSON(resp.Status)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("%s\n", data)
+
+	return nil
+}
+
+func commandGetPermissions(cmd *cobra.Command, args []string) error {
+	alias, err := topoproto.ParseTabletAlias(cmd.Flags().Arg(0))
+	if err != nil {
+		return err
+	}
+
+	cli.FinishedParsing(cmd)
+
+	resp, err := client.GetPermissions(commandCtx, &vtctldatapb.GetPermissionsRequest{
+		TabletAlias: alias,
+	})
+	if err != nil {
+		return err
+	}
+	p, err := cli.MarshalJSON(resp.Permissions)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%s\n", p)
+
+	return nil
+}
+
 func commandGetTablet(cmd *cobra.Command, args []string) error {
 	aliasStr := cmd.Flags().Arg(0)
 	alias, err := topoproto.ParseTabletAlias(aliasStr)
@@ -307,9 +428,10 @@ func commandGetTablet(cmd *cobra.Command, args []string) error {
 }
 
 var getTabletsOptions = struct {
-	Cells    []string
-	Keyspace string
-	Shard    string
+	Cells      []string
+	TabletType topodatapb.TabletType
+	Keyspace   string
+	Shard      string
 
 	TabletAliasStrings []string
 
@@ -336,6 +458,8 @@ func commandGetTablets(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("--shard (= %s) cannot be passed when using --tablet-alias (= %v)", getTabletsOptions.Shard, getTabletsOptions.TabletAliasStrings)
 		case len(getTabletsOptions.Cells) > 0:
 			return fmt.Errorf("--cell (= %v) cannot be passed when using --tablet-alias (= %v)", getTabletsOptions.Cells, getTabletsOptions.TabletAliasStrings)
+		case cmd.Flags().Lookup("tablet-type").Changed:
+			return fmt.Errorf("--tablet-type (= %s) cannot be passed when using --tablet-alias (= %v)", getTabletsOptions.TabletType, getTabletsOptions.TabletAliasStrings)
 		}
 
 		var err error
@@ -354,6 +478,7 @@ func commandGetTablets(cmd *cobra.Command, args []string) error {
 	resp, err := client.GetTablets(commandCtx, &vtctldatapb.GetTabletsRequest{
 		TabletAliases: aliases,
 		Cells:         getTabletsOptions.Cells,
+		TabletType:    getTabletsOptions.TabletType,
 		Keyspace:      getTabletsOptions.Keyspace,
 		Shard:         getTabletsOptions.Shard,
 		Strict:        getTabletsOptions.Strict,
@@ -376,6 +501,25 @@ func commandGetTablets(cmd *cobra.Command, args []string) error {
 		fmt.Printf("%s\n", data)
 	}
 
+	return nil
+}
+
+func commandGetTabletVersion(cmd *cobra.Command, args []string) error {
+	alias, err := topoproto.ParseTabletAlias(cmd.Flags().Arg(0))
+	if err != nil {
+		return err
+	}
+
+	cli.FinishedParsing(cmd)
+
+	resp, err := client.GetVersion(commandCtx, &vtctldatapb.GetVersionRequest{
+		TabletAlias: alias,
+	})
+	if err != nil {
+		return err
+	}
+
+	fmt.Println(resp.Version)
 	return nil
 }
 
@@ -530,23 +674,30 @@ func commandStopReplication(cmd *cobra.Command, args []string) error {
 }
 
 func init() {
-	ChangeTabletType.Flags().BoolVarP(&changeTabletTypeOptions.DryRun, "dry-run", "d", false, "Shows the proposed change without actually executing it")
+	ChangeTabletTags.Flags().BoolVarP(&changeTabletTagsOptions.Replace, "replace", "r", false, "Replace all tablet tags with the tags provided. By default tags are merged/updated.")
+	Root.AddCommand(ChangeTabletTags)
+
+	ChangeTabletType.Flags().BoolVarP(&changeTabletTypeOptions.DryRun, "dry-run", "d", false, "Shows the proposed change without actually executing it.")
 	Root.AddCommand(ChangeTabletType)
 
 	DeleteTablets.Flags().BoolVarP(&deleteTabletsOptions.AllowPrimary, "allow-primary", "p", false, "Allow the primary tablet of a shard to be deleted. Use with caution.")
 	Root.AddCommand(DeleteTablets)
 
 	Root.AddCommand(ExecuteHook)
+	Root.AddCommand(GetFullStatus)
+	Root.AddCommand(GetPermissions)
 	Root.AddCommand(GetTablet)
 
-	GetTablets.Flags().StringSliceVarP(&getTabletsOptions.TabletAliasStrings, "tablet-alias", "t", nil, "List of tablet aliases to filter by")
-	GetTablets.Flags().StringSliceVarP(&getTabletsOptions.Cells, "cell", "c", nil, "List of cells to filter tablets by")
-	GetTablets.Flags().StringVarP(&getTabletsOptions.Keyspace, "keyspace", "k", "", "Keyspace to filter tablets by")
-	GetTablets.Flags().StringVarP(&getTabletsOptions.Shard, "shard", "s", "", "Shard to filter tablets by")
-	GetTablets.Flags().StringVar(&getTabletsOptions.Format, "format", "awk", "Output format to use; valid choices are (json, awk)")
+	GetTablets.Flags().StringSliceVarP(&getTabletsOptions.TabletAliasStrings, "tablet-alias", "t", nil, "List of tablet aliases to filter by.")
+	GetTablets.Flags().StringSliceVarP(&getTabletsOptions.Cells, "cell", "c", nil, "List of cells to filter tablets by.")
+	GetTablets.Flags().Var((*topoproto.TabletTypeFlag)(&getTabletsOptions.TabletType), "tablet-type", "Tablet type to filter by (e.g. primary or replica).")
+	GetTablets.Flags().StringVarP(&getTabletsOptions.Keyspace, "keyspace", "k", "", "Keyspace to filter tablets by.")
+	GetTablets.Flags().StringVarP(&getTabletsOptions.Shard, "shard", "s", "", "Shard to filter tablets by.")
+	GetTablets.Flags().StringVar(&getTabletsOptions.Format, "format", "awk", "Output format to use; valid choices are (json, awk).")
 	GetTablets.Flags().BoolVar(&getTabletsOptions.Strict, "strict", false, "Require all cells to return successful tablet data. Without --strict, tablet listings may be partial.")
 	Root.AddCommand(GetTablets)
 
+	Root.AddCommand(GetTabletVersion)
 	Root.AddCommand(PingTablet)
 	Root.AddCommand(RefreshState)
 

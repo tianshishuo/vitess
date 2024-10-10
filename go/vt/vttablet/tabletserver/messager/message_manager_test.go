@@ -24,20 +24,20 @@ import (
 	"reflect"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"vitess.io/vitess/go/vt/vtgate/evalengine"
-
-	"vitess.io/vitess/go/test/utils"
-
 	"github.com/stretchr/testify/assert"
+	"golang.org/x/sync/semaphore"
 
 	"vitess.io/vitess/go/sqltypes"
-	"vitess.io/vitess/go/sync2"
+	"vitess.io/vitess/go/test/utils"
 	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vtenv"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/schema"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/throttle/throttlerapp"
 
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 	querypb "vitess.io/vitess/go/vt/proto/query"
@@ -64,7 +64,7 @@ var (
 
 func newMMTable() *schema.Table {
 	return &schema.Table{
-		Name: sqlparser.NewTableIdent("foo"),
+		Name: sqlparser.NewIdentifierCS("foo"),
 		Type: schema.Message,
 		MessageInfo: &schema.MessageInfo{
 			Fields:             testFields,
@@ -80,7 +80,7 @@ func newMMTable() *schema.Table {
 
 func newMMTableWithBackoff() *schema.Table {
 	return &schema.Table{
-		Name: sqlparser.NewTableIdent("foo"),
+		Name: sqlparser.NewIdentifierCS("foo"),
 		Type: schema.Message,
 		MessageInfo: &schema.MessageInfo{
 			Fields:             testFields,
@@ -108,7 +108,7 @@ func newMMRow(id int64) *querypb.Row {
 
 type testReceiver struct {
 	rcv   func(*sqltypes.Result) error
-	count sync2.AtomicInt64
+	count atomic.Int64
 	ch    chan *sqltypes.Result
 }
 
@@ -128,14 +128,14 @@ func (tr *testReceiver) WaitForCount(n int) {
 	for {
 		runtime.Gosched()
 		time.Sleep(10 * time.Millisecond)
-		if tr.count.Get() == int64(n) {
+		if tr.count.Load() == int64(n) {
 			return
 		}
 	}
 }
 
 func TestReceiverCancel(t *testing.T) {
-	mm := newMessageManager(newFakeTabletServer(), newFakeVStreamer(), newMMTable(), sync2.NewSemaphore(1, 0))
+	mm := newMessageManager(newFakeTabletServer(), newFakeVStreamer(), newMMTable(), semaphore.NewWeighted(1))
 	mm.Open()
 	defer mm.Close()
 
@@ -148,7 +148,7 @@ func TestReceiverCancel(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		runtime.Gosched()
 		time.Sleep(10 * time.Millisecond)
-		if mm.receiverCount() != 0 {
+		if len(mm.receivers) != 0 {
 			continue
 		}
 		return
@@ -157,7 +157,7 @@ func TestReceiverCancel(t *testing.T) {
 }
 
 func TestMessageManagerState(t *testing.T) {
-	mm := newMessageManager(newFakeTabletServer(), newFakeVStreamer(), newMMTable(), sync2.NewSemaphore(1, 0))
+	mm := newMessageManager(newFakeTabletServer(), newFakeVStreamer(), newMMTable(), semaphore.NewWeighted(1))
 	// Do it twice
 	for i := 0; i < 2; i++ {
 		mm.Open()
@@ -175,7 +175,7 @@ func TestMessageManagerState(t *testing.T) {
 func TestMessageManagerAdd(t *testing.T) {
 	ti := newMMTable()
 	ti.MessageInfo.CacheSize = 1
-	mm := newMessageManager(newFakeTabletServer(), newFakeVStreamer(), ti, sync2.NewSemaphore(1, 0))
+	mm := newMessageManager(newFakeTabletServer(), newFakeVStreamer(), ti, semaphore.NewWeighted(1))
 	mm.Open()
 	defer mm.Close()
 
@@ -206,7 +206,7 @@ func TestMessageManagerAdd(t *testing.T) {
 
 func TestMessageManagerSend(t *testing.T) {
 	tsv := newFakeTabletServer()
-	mm := newMessageManager(tsv, newFakeVStreamer(), newMMTable(), sync2.NewSemaphore(1, 0))
+	mm := newMessageManager(tsv, newFakeVStreamer(), newMMTable(), semaphore.NewWeighted(1))
 	mm.Open()
 	defer mm.Close()
 
@@ -216,7 +216,7 @@ func TestMessageManagerSend(t *testing.T) {
 	want := &sqltypes.Result{
 		Fields: testFields,
 	}
-	if got := <-r1.ch; !reflect.DeepEqual(got, want) {
+	if got := <-r1.ch; !got.Equal(want) {
 		t.Errorf("Received: %v, want %v", got, want)
 	}
 	// Set the channel to verify call to Postpone.
@@ -230,7 +230,7 @@ func TestMessageManagerSend(t *testing.T) {
 			sqltypes.NULL,
 		}},
 	}
-	if got := <-r1.ch; !reflect.DeepEqual(got, want) {
+	if got := <-r1.ch; !got.Equal(want) {
 		t.Errorf("Received: %v, want %v", got, want)
 	}
 
@@ -300,7 +300,7 @@ func TestMessageManagerSend(t *testing.T) {
 
 func TestMessageManagerPostponeThrottle(t *testing.T) {
 	tsv := newFakeTabletServer()
-	mm := newMessageManager(tsv, newFakeVStreamer(), newMMTable(), sync2.NewSemaphore(1, 0))
+	mm := newMessageManager(tsv, newFakeVStreamer(), newMMTable(), semaphore.NewWeighted(1))
 	mm.Open()
 	defer mm.Close()
 
@@ -311,14 +311,14 @@ func TestMessageManagerPostponeThrottle(t *testing.T) {
 	// Set the channel to verify call to Postpone.
 	ch := make(chan string)
 	tsv.SetChannel(ch)
-	tsv.postponeCount.Set(0)
+	tsv.postponeCount.Store(0)
 
 	mm.Add(&MessageRow{Row: []sqltypes.Value{sqltypes.NewVarBinary("1"), sqltypes.NULL}})
 	// Once we receive, mm will obtain the single semaphore and call postpone.
 	// Postpone will wait on the unbuffered ch.
 	<-r1.ch
 
-	// Set up a second subsriber, add a message.
+	// Set up a second subscriber, add a message.
 	r2 := newTestReceiver(1)
 	mm.Subscribe(context.Background(), r2.rcv)
 	<-r2.ch
@@ -329,7 +329,7 @@ func TestMessageManagerPostponeThrottle(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	// postponeCount should be 1. Verify for two iterations.
-	if got, want := tsv.postponeCount.Get(), int64(1); got != want {
+	if got, want := tsv.postponeCount.Load(), int64(1); got != want {
 		t.Errorf("tsv.postponeCount: %d, want %d", got, want)
 	}
 
@@ -340,7 +340,7 @@ func TestMessageManagerPostponeThrottle(t *testing.T) {
 		runtime.Gosched()
 		time.Sleep(10 * time.Millisecond)
 	}
-	if got, want := tsv.postponeCount.Get(), int64(1); got != want {
+	if got, want := tsv.postponeCount.Load(), int64(1); got != want {
 		t.Errorf("tsv.postponeCount: %d, want %d", got, want)
 	}
 	<-ch
@@ -348,7 +348,7 @@ func TestMessageManagerPostponeThrottle(t *testing.T) {
 
 func TestMessageManagerSendError(t *testing.T) {
 	tsv := newFakeTabletServer()
-	mm := newMessageManager(tsv, newFakeVStreamer(), newMMTable(), sync2.NewSemaphore(1, 0))
+	mm := newMessageManager(tsv, newFakeVStreamer(), newMMTable(), semaphore.NewWeighted(1))
 	mm.Open()
 	defer mm.Close()
 	ctx := context.Background()
@@ -377,7 +377,7 @@ func TestMessageManagerSendError(t *testing.T) {
 }
 
 func TestMessageManagerFieldSendError(t *testing.T) {
-	mm := newMessageManager(newFakeTabletServer(), newFakeVStreamer(), newMMTable(), sync2.NewSemaphore(1, 0))
+	mm := newMessageManager(newFakeTabletServer(), newFakeVStreamer(), newMMTable(), semaphore.NewWeighted(1))
 	mm.Open()
 	defer mm.Close()
 	ctx := context.Background()
@@ -397,7 +397,7 @@ func TestMessageManagerFieldSendError(t *testing.T) {
 func TestMessageManagerBatchSend(t *testing.T) {
 	ti := newMMTable()
 	ti.MessageInfo.BatchSize = 2
-	mm := newMessageManager(newFakeTabletServer(), newFakeVStreamer(), ti, sync2.NewSemaphore(1, 0))
+	mm := newMessageManager(newFakeTabletServer(), newFakeVStreamer(), ti, semaphore.NewWeighted(1))
 	mm.Open()
 	defer mm.Close()
 
@@ -415,7 +415,7 @@ func TestMessageManagerBatchSend(t *testing.T) {
 			sqltypes.NULL,
 		}},
 	}
-	if got := <-r1.ch; !reflect.DeepEqual(got, want) {
+	if got := <-r1.ch; !got.Equal(want) {
 		t.Errorf("Received: %v, want %v", got, row1)
 	}
 	mm.mu.Lock()
@@ -432,7 +432,7 @@ func TestMessageManagerBatchSend(t *testing.T) {
 			sqltypes.NULL,
 		}},
 	}
-	if got := <-r1.ch; !reflect.DeepEqual(got, want) {
+	if got := <-r1.ch; !got.Equal(want) {
 		t.Errorf("Received: %+v, want %+v", got, row1)
 	}
 }
@@ -467,7 +467,7 @@ func TestMessageManagerStreamerSimple(t *testing.T) {
 	}, {
 		Type: binlogdatapb.VEventType_COMMIT,
 	}}})
-	mm := newMessageManager(newFakeTabletServer(), fvs, newMMTable(), sync2.NewSemaphore(1, 0))
+	mm := newMessageManager(newFakeTabletServer(), fvs, newMMTable(), semaphore.NewWeighted(1))
 	mm.Open()
 	defer mm.Close()
 
@@ -481,7 +481,7 @@ func TestMessageManagerStreamerSimple(t *testing.T) {
 			sqltypes.NewVarBinary("1"),
 		}},
 	}
-	if got := <-r1.ch; !reflect.DeepEqual(got, want) {
+	if got := <-r1.ch; !got.Equal(want) {
 		t.Errorf("Received: %v, want %v", got, want)
 	}
 }
@@ -492,7 +492,7 @@ func TestMessageManagerStreamerAndPoller(t *testing.T) {
 		Fields: testDBFields,
 		Gtid:   "MySQL56/33333333-3333-3333-3333-333333333333:1-100",
 	}})
-	mm := newMessageManager(newFakeTabletServer(), fvs, newMMTable(), sync2.NewSemaphore(1, 0))
+	mm := newMessageManager(newFakeTabletServer(), fvs, newMMTable(), semaphore.NewWeighted(1))
 	mm.Open()
 	defer mm.Close()
 
@@ -503,9 +503,7 @@ func TestMessageManagerStreamerAndPoller(t *testing.T) {
 	for {
 		runtime.Gosched()
 		time.Sleep(10 * time.Millisecond)
-		mm.streamMu.Lock()
-		pos := mm.lastPollPosition
-		mm.streamMu.Unlock()
+		pos := mm.getLastPollPosition()
 		if pos != nil {
 			break
 		}
@@ -571,7 +569,7 @@ func TestMessageManagerStreamerAndPoller(t *testing.T) {
 			sqltypes.NewVarBinary("3"),
 		}},
 	}
-	if got := <-r1.ch; !reflect.DeepEqual(got, want) {
+	if got := <-r1.ch; !got.Equal(want) {
 		t.Errorf("Received: %v, want %v", got, want)
 	}
 }
@@ -591,7 +589,7 @@ func TestMessageManagerPoller(t *testing.T) {
 			newMMRow(3),
 		},
 	}})
-	mm := newMessageManager(newFakeTabletServer(), fvs, ti, sync2.NewSemaphore(1, 0))
+	mm := newMessageManager(newFakeTabletServer(), fvs, ti, semaphore.NewWeighted(1))
 	mm.Open()
 	defer mm.Close()
 
@@ -647,7 +645,7 @@ func TestMessagesPending1(t *testing.T) {
 	ti.MessageInfo.CacheSize = 2
 	ti.MessageInfo.PollInterval = 30 * time.Second
 	fvs := newFakeVStreamer()
-	mm := newMessageManager(newFakeTabletServer(), fvs, ti, sync2.NewSemaphore(1, 0))
+	mm := newMessageManager(newFakeTabletServer(), fvs, ti, semaphore.NewWeighted(1))
 	mm.Open()
 	defer mm.Close()
 
@@ -696,7 +694,7 @@ func TestMessagesPending2(t *testing.T) {
 	}, {
 		Rows: []*querypb.Row{newMMRow(1)},
 	}})
-	mm := newMessageManager(newFakeTabletServer(), fvs, ti, sync2.NewSemaphore(1, 0))
+	mm := newMessageManager(newFakeTabletServer(), fvs, ti, semaphore.NewWeighted(1))
 	mm.Open()
 	defer mm.Close()
 
@@ -724,7 +722,7 @@ func TestMessageManagerPurge(t *testing.T) {
 
 	ti := newMMTable()
 	ti.MessageInfo.PollInterval = 1 * time.Millisecond
-	mm := newMessageManager(tsv, newFakeVStreamer(), ti, sync2.NewSemaphore(1, 0))
+	mm := newMessageManager(tsv, newFakeVStreamer(), ti, semaphore.NewWeighted(1))
 	mm.Open()
 	defer mm.Close()
 	// Ensure Purge got called.
@@ -734,7 +732,7 @@ func TestMessageManagerPurge(t *testing.T) {
 }
 
 func TestMMGenerate(t *testing.T) {
-	mm := newMessageManager(newFakeTabletServer(), newFakeVStreamer(), newMMTable(), sync2.NewSemaphore(1, 0))
+	mm := newMessageManager(newFakeTabletServer(), newFakeVStreamer(), newMMTable(), semaphore.NewWeighted(1))
 	mm.Open()
 	defer mm.Close()
 	query, bv := mm.GenerateAckQuery([]string{"1", "2"})
@@ -743,13 +741,13 @@ func TestMMGenerate(t *testing.T) {
 		t.Errorf("GenerateAckQuery query: %s, want %s", query, wantQuery)
 	}
 	bvv, _ := sqltypes.BindVariableToValue(bv["time_acked"])
-	gotAcked, _ := evalengine.ToInt64(bvv)
+	gotAcked, _ := bvv.ToCastInt64()
 	wantAcked := time.Now().UnixNano()
 	if wantAcked-gotAcked > 10e9 {
 		t.Errorf("gotAcked: %d, should be with 10s of %d", gotAcked, wantAcked)
 	}
 	gotids := bv["ids"]
-	wantids := sqltypes.TestBindVariable([]interface{}{[]byte{'1'}, []byte{'2'}})
+	wantids := sqltypes.TestBindVariable([]any{[]byte{'1'}, []byte{'2'}})
 	utils.MustMatch(t, wantids, gotids, "did not match")
 
 	query, bv = mm.GeneratePostponeQuery([]string{"1", "2"})
@@ -790,11 +788,11 @@ func TestMMGenerate(t *testing.T) {
 }
 
 func TestMMGenerateWithBackoff(t *testing.T) {
-	mm := newMessageManager(newFakeTabletServer(), newFakeVStreamer(), newMMTableWithBackoff(), sync2.NewSemaphore(1, 0))
+	mm := newMessageManager(newFakeTabletServer(), newFakeVStreamer(), newMMTableWithBackoff(), semaphore.NewWeighted(1))
 	mm.Open()
 	defer mm.Close()
 
-	wantids := sqltypes.TestBindVariable([]interface{}{[]byte{'1'}, []byte{'2'}})
+	wantids := sqltypes.TestBindVariable([]any{[]byte{'1'}, []byte{'2'}})
 
 	query, bv := mm.GeneratePostponeQuery([]string{"1", "2"})
 	wantQuery := "update foo set time_next = :time_now + :wait_time + IF(FLOOR((:min_backoff<<ifnull(epoch, 0)) * :jitter) < :min_backoff, :min_backoff, IF(FLOOR((:min_backoff<<ifnull(epoch, 0)) * :jitter) > :max_backoff, :max_backoff, FLOOR((:min_backoff<<ifnull(epoch, 0)) * :jitter))), epoch = ifnull(epoch, 0)+1 where id in ::ids and time_acked is null"
@@ -826,17 +824,17 @@ func TestMMGenerateWithBackoff(t *testing.T) {
 
 type fakeTabletServer struct {
 	tabletenv.Env
-	postponeCount sync2.AtomicInt64
-	purgeCount    sync2.AtomicInt64
+	postponeCount atomic.Int64
+	purgeCount    atomic.Int64
 
 	mu sync.Mutex
 	ch chan string
 }
 
 func newFakeTabletServer() *fakeTabletServer {
-	config := tabletenv.NewDefaultConfig()
+	cfg := tabletenv.NewDefaultConfig()
 	return &fakeTabletServer{
-		Env: tabletenv.NewEnv(config, "MessagerTest"),
+		Env: tabletenv.NewEnv(vtenv.NewTestEnv(), cfg, "MessagerTest"),
 	}
 }
 
@@ -871,7 +869,7 @@ func (fts *fakeTabletServer) PurgeMessages(ctx context.Context, target *querypb.
 }
 
 type fakeVStreamer struct {
-	streamInvocations sync2.AtomicInt64
+	streamInvocations atomic.Int64
 	mu                sync.Mutex
 	streamerResponse  [][]*binlogdatapb.VEvent
 	pollerResponse    []*binlogdatapb.VStreamResultsResponse
@@ -891,7 +889,8 @@ func (fv *fakeVStreamer) setPollerResponse(pr []*binlogdatapb.VStreamResultsResp
 	fv.pollerResponse = pr
 }
 
-func (fv *fakeVStreamer) Stream(ctx context.Context, startPos string, tablePKs []*binlogdatapb.TableLastPK, filter *binlogdatapb.Filter, send func([]*binlogdatapb.VEvent) error) error {
+func (fv *fakeVStreamer) Stream(ctx context.Context, startPos string, tablePKs []*binlogdatapb.TableLastPK,
+	filter *binlogdatapb.Filter, throttlerApp throttlerapp.Name, send func([]*binlogdatapb.VEvent) error, options *binlogdatapb.VStreamOptions) error {
 	fv.streamInvocations.Add(1)
 	for {
 		fv.mu.Lock()

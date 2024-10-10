@@ -33,6 +33,7 @@ import (
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/test/endtoend/cluster"
+	"vitess.io/vitess/go/test/endtoend/utils"
 	"vitess.io/vitess/go/vt/log"
 )
 
@@ -51,52 +52,48 @@ var (
 	hostname        = "localhost"
 	keyspaceName    = "ks"
 	shardName       = "0"
-	dbName          = "vt_ks"
-	mysqlUsers      = []string{"vt_dba", "vt_app", "vt_appdebug", "vt_repl", "vt_filtered"}
-	mysqlPassword   = "password"
+	mysqlPassword   = "VtDbaPass"
 	vtgateUser      = "vtgate_user"
 	vtgatePassword  = "password123"
 	commonTabletArg = []string{
-		"-vreplication_healthcheck_topology_refresh", "1s",
-		"-vreplication_healthcheck_retry_delay", "1s",
-		"-vreplication_retry_delay", "1s",
-		"-degraded_threshold", "5s",
-		"-lock_tables_timeout", "5s",
-		"-watch_replication_stream",
+		"--vreplication_retry_delay", "1s",
+		"--degraded_threshold", "5s",
+		"--lock_tables_timeout", "5s",
+		"--watch_replication_stream",
 		// Frequently reload schema, generating some tablet traffic,
 		//   so we can speed up token refresh
-		"-queryserver-config-schema-reload-time", "5",
-		"-serving_state_grace_period", "1s"}
+		"--queryserver-config-schema-reload-time", "5s",
+		"--serving_state_grace_period", "1s"}
 	vaultTabletArg = []string{
-		"-db-credentials-server", "vault",
-		"-db-credentials-vault-timeout", "3s",
-		"-db-credentials-vault-path", "kv/prod/dbcreds",
+		"--db-credentials-server", "vault",
+		"--db-credentials-vault-timeout", "3s",
+		"--db-credentials-vault-path", "kv/prod/dbcreds",
 		// This is overriden by our env VAULT_ADDR
-		"-db-credentials-vault-addr", "https://127.0.0.1:8200",
+		"--db-credentials-vault-addr", "https://127.0.0.1:8200",
 		// This is overriden by our env VAULT_CACERT
-		"-db-credentials-vault-tls-ca", "/path/to/ca.pem",
+		"--db-credentials-vault-tls-ca", "/path/to/ca.pem",
 		// This is provided by our env VAULT_ROLEID
-		//"-db-credentials-vault-roleid", "34644576-9ffc-8bb5-d046-4a0e41194e15",
+		//"--db-credentials-vault-roleid", "34644576-9ffc-8bb5-d046-4a0e41194e15",
 		// Contents of this file provided by our env VAULT_SECRETID
-		//"-db-credentials-vault-secretidfile", "/path/to/file/containing/secret_id",
+		//"--db-credentials-vault-secretidfile", "/path/to/file/containing/secret_id",
 		// Make this small, so we can get a renewal
-		"-db-credentials-vault-ttl", "21s"}
+		"--db-credentials-vault-ttl", "21s"}
 	vaultVTGateArg = []string{
-		"-mysql_auth_server_impl", "vault",
-		"-mysql_auth_vault_timeout", "3s",
-		"-mysql_auth_vault_path", "kv/prod/vtgatecreds",
+		"--mysql_auth_server_impl", "vault",
+		"--mysql_auth_vault_timeout", "3s",
+		"--mysql_auth_vault_path", "kv/prod/vtgatecreds",
 		// This is overriden by our env VAULT_ADDR
-		"-mysql_auth_vault_addr", "https://127.0.0.1:8200",
+		"--mysql_auth_vault_addr", "https://127.0.0.1:8200",
 		// This is overriden by our env VAULT_CACERT
-		"-mysql_auth_vault_tls_ca", "/path/to/ca.pem",
+		"--mysql_auth_vault_tls_ca", "/path/to/ca.pem",
 		// This is provided by our env VAULT_ROLEID
-		//"-mysql_auth_vault_roleid", "34644576-9ffc-8bb5-d046-4a0e41194e15",
+		//"--mysql_auth_vault_roleid", "34644576-9ffc-8bb5-d046-4a0e41194e15",
 		// Contents of this file provided by our env VAULT_SECRETID
-		//"-mysql_auth_vault_role_secretidfile", "/path/to/file/containing/secret_id",
+		//"--mysql_auth_vault_role_secretidfile", "/path/to/file/containing/secret_id",
 		// Make this small, so we can get a renewal
-		"-mysql_auth_vault_ttl", "21s"}
+		"--mysql_auth_vault_ttl", "21s"}
 	mysqlctlArg = []string{
-		"-db_dba_password", mysqlPassword}
+		"--db_dba_password", mysqlPassword}
 	vttabletLogFileName = "vttablet.INFO"
 	tokenRenewalString  = "Vault client status: token renewed"
 )
@@ -154,8 +151,8 @@ func TestVaultAuth(t *testing.T) {
 	require.True(t, bytes.Contains(logContents, []byte(tokenRenewalString)))
 }
 
-func startVaultServer(t *testing.T) *VaultServer {
-	vs := &VaultServer{
+func startVaultServer(t *testing.T) *Server {
+	vs := &Server{
 		address: hostname,
 		port1:   clusterInstance.GetAndReservePort(),
 		port2:   clusterInstance.GetAndReservePort(),
@@ -167,7 +164,7 @@ func startVaultServer(t *testing.T) *VaultServer {
 }
 
 // Setup everything we need in the Vault server
-func setupVaultServer(t *testing.T, vs *VaultServer) (string, string) {
+func setupVaultServer(t *testing.T, vs *Server) (string, string) {
 	// The setup script uses these environment variables
 	//   We also reuse VAULT_ADDR and VAULT_CACERT later on
 	os.Setenv("VAULT", vs.execPath)
@@ -214,11 +211,11 @@ func setupVaultServer(t *testing.T, vs *VaultServer) (string, string) {
 }
 
 // Setup cluster object and start topo
-//   We need this before vault, because we re-use the port reservation code
+//
+//	We need this before vault, because we re-use the port reservation code
 func initializeClusterEarly(t *testing.T) {
 	clusterInstance = cluster.NewCluster(cell, hostname)
 
-	clusterInstance.VtctldExtraArgs = append(clusterInstance.VtctldExtraArgs, "-durability_policy=semi_sync")
 	// Start topo server
 	err := clusterInstance.StartTopo()
 	require.NoError(t, err)
@@ -247,11 +244,25 @@ func initializeClusterLate(t *testing.T) {
 
 	err := clusterInstance.SetupCluster(keyspace, []cluster.Shard{*shard})
 	require.NoError(t, err)
+	vtctldClientProcess := cluster.VtctldClientProcessInstance("localhost", clusterInstance.VtctldProcess.GrpcPort, clusterInstance.TmpDirectory)
+	out, err := vtctldClientProcess.ExecuteCommandWithOutput("SetKeyspaceDurabilityPolicy", keyspaceName, "--durability-policy=semi_sync")
+	require.NoError(t, err, out)
+
+	initDb, _ := os.ReadFile(path.Join(os.Getenv("VTROOT"), "/config/init_db.sql"))
+	sql := string(initDb)
+	// The original init_db.sql does not have any passwords. Here we update the init file with passwords
+	sql, err = utils.GetInitDBSQL(sql, cluster.GetPasswordUpdateSQL(clusterInstance), "")
+	require.NoError(t, err, "expected to load init_db file")
+	newInitDBFile := path.Join(clusterInstance.TmpDirectory, "init_db_with_passwords.sql")
+	err = os.WriteFile(newInitDBFile, []byte(sql), 0660)
+	require.NoError(t, err, "expected to load init_db file")
 
 	// Start MySQL
 	var mysqlCtlProcessList []*exec.Cmd
 	for _, shard := range clusterInstance.Keyspaces[0].Shards {
 		for _, tablet := range shard.Vttablets {
+			tablet.MysqlctlProcess.InitDBFile = newInitDBFile
+			tablet.VttabletProcess.DbPassword = mysqlPassword
 			proc, err := tablet.MysqlctlProcess.StartProcess()
 			require.NoError(t, err)
 			mysqlCtlProcessList = append(mysqlCtlProcessList, proc)
@@ -265,22 +276,6 @@ func initializeClusterLate(t *testing.T) {
 	}
 
 	for _, tablet := range []*cluster.Vttablet{primary, replica} {
-		for _, user := range mysqlUsers {
-			query := fmt.Sprintf("ALTER USER '%s'@'%s' IDENTIFIED BY '%s';", user, hostname, mysqlPassword)
-			_, err = tablet.VttabletProcess.QueryTablet(query, keyspace.Name, false)
-			// Reset after the first ALTER, or we lock ourselves out.
-			tablet.VttabletProcess.DbPassword = mysqlPassword
-			if err != nil {
-				query = fmt.Sprintf("ALTER USER '%s'@'%%' IDENTIFIED BY '%s';", user, mysqlPassword)
-				_, err = tablet.VttabletProcess.QueryTablet(query, keyspace.Name, false)
-				require.NoError(t, err)
-			}
-		}
-		query := fmt.Sprintf("create database %s;", dbName)
-		_, err = tablet.VttabletProcess.QueryTablet(query, keyspace.Name, false)
-		require.NoError(t, err)
-
-		tablet.VttabletProcess.EnableSemiSync = true
 		err = tablet.VttabletProcess.Setup()
 		require.NoError(t, err)
 
@@ -288,7 +283,10 @@ func initializeClusterLate(t *testing.T) {
 		tablet.MysqlctlProcess.ExtraArgs = append(tablet.MysqlctlProcess.ExtraArgs, mysqlctlArg...)
 	}
 
-	err = clusterInstance.VtctlclientProcess.InitShardPrimary(keyspaceName, shard.Name, cell, primary.TabletUID)
+	err = clusterInstance.VtctldClientProcess.InitShardPrimary(keyspaceName, shard.Name, cell, primary.TabletUID)
+	require.NoError(t, err)
+
+	err = clusterInstance.StartVTOrc(keyspaceName)
 	require.NoError(t, err)
 
 	// Start vtgate

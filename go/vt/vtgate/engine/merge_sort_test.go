@@ -17,8 +17,11 @@ limitations under the License.
 package engine
 
 import (
+	"context"
 	"errors"
 	"testing"
+
+	"vitess.io/vitess/go/vt/vtgate/evalengine"
 
 	"vitess.io/vitess/go/mysql/collations"
 	"vitess.io/vitess/go/test/utils"
@@ -57,7 +60,7 @@ func TestMergeSortNormal(t *testing.T) {
 			"8|h",
 		),
 	}}
-	orderBy := []OrderByParams{{
+	orderBy := []evalengine.OrderByParams{{
 		WeightStringCol: -1,
 		Col:             0,
 	}}
@@ -115,7 +118,7 @@ func TestMergeSortWeightString(t *testing.T) {
 			"8|h",
 		),
 	}}
-	orderBy := []OrderByParams{{
+	orderBy := []evalengine.OrderByParams{{
 		WeightStringCol: 0,
 		Col:             1,
 	}}
@@ -176,10 +179,10 @@ func TestMergeSortCollation(t *testing.T) {
 		),
 	}}
 
-	collationID, _ := collations.Local().LookupID("utf8mb4_hu_0900_ai_ci")
-	orderBy := []OrderByParams{{
-		Col:         0,
-		CollationID: collationID,
+	collationID, _ := collations.MySQL8().LookupID("utf8mb4_hu_0900_ai_ci")
+	orderBy := []evalengine.OrderByParams{{
+		Col:  0,
+		Type: evalengine.NewType(sqltypes.VarChar, collationID),
 	}}
 
 	var results []*sqltypes.Result
@@ -237,7 +240,7 @@ func TestMergeSortDescending(t *testing.T) {
 			"4|d",
 		),
 	}}
-	orderBy := []OrderByParams{{
+	orderBy := []evalengine.OrderByParams{{
 		WeightStringCol: -1,
 		Col:             0,
 		Desc:            true,
@@ -288,7 +291,7 @@ func TestMergeSortEmptyResults(t *testing.T) {
 	}, {
 		results: sqltypes.MakeTestStreamingResults(idColFields),
 	}}
-	orderBy := []OrderByParams{{
+	orderBy := []evalengine.OrderByParams{{
 		WeightStringCol: -1,
 		Col:             0,
 	}}
@@ -316,7 +319,7 @@ func TestMergeSortEmptyResults(t *testing.T) {
 // TestMergeSortResultFailures tests failures at various
 // stages of result return.
 func TestMergeSortResultFailures(t *testing.T) {
-	orderBy := []OrderByParams{{
+	orderBy := []evalengine.OrderByParams{{
 		WeightStringCol: -1,
 		Col:             0,
 	}}
@@ -362,13 +365,13 @@ func TestMergeSortDataFailures(t *testing.T) {
 			"2.1|b",
 		),
 	}}
-	orderBy := []OrderByParams{{
+	orderBy := []evalengine.OrderByParams{{
 		WeightStringCol: -1,
 		Col:             0,
 	}}
 
 	err := testMergeSort(shardResults, orderBy, func(qr *sqltypes.Result) error { return nil })
-	want := `strconv.ParseInt: parsing "2.1": invalid syntax`
+	want := `unparsed tail left after parsing int64 from "2.1": ".1"`
 	require.EqualError(t, err, want)
 
 	// Create a new VCursor because the previous MergeSort will still
@@ -384,11 +387,11 @@ func TestMergeSortDataFailures(t *testing.T) {
 		),
 	}}
 	err = testMergeSort(shardResults, orderBy, func(qr *sqltypes.Result) error { return nil })
-	want = `strconv.ParseInt: parsing "1.1": invalid syntax`
+	want = `unparsed tail left after parsing int64 from "1.1": ".1"`
 	require.EqualError(t, err, want)
 }
 
-func testMergeSort(shardResults []*shardResult, orderBy []OrderByParams, callback func(qr *sqltypes.Result) error) error {
+func testMergeSort(shardResults []*shardResult, orderBy []evalengine.OrderByParams, callback func(qr *sqltypes.Result) error) error {
 	prims := make([]StreamExecutor, 0, len(shardResults))
 	for _, sr := range shardResults {
 		prims = append(prims, sr)
@@ -397,7 +400,7 @@ func testMergeSort(shardResults []*shardResult, orderBy []OrderByParams, callbac
 		Primitives: prims,
 		OrderBy:    orderBy,
 	}
-	return ms.TryStreamExecute(&noopVCursor{}, nil, true, callback)
+	return ms.TryStreamExecute(context.Background(), &noopVCursor{}, nil, true, callback)
 }
 
 type shardResult struct {
@@ -408,7 +411,7 @@ type shardResult struct {
 	sendErr error
 }
 
-func (sr *shardResult) StreamExecute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
+func (sr *shardResult) StreamExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
 	for _, r := range sr.results {
 		if err := callback(r); err != nil {
 			return err

@@ -18,30 +18,34 @@ package vindexes
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
-
-	"vitess.io/vitess/go/vt/vtgate/evalengine"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
 )
 
 var (
-	_ SingleColumn = (*Numeric)(nil)
-	_ Reversible   = (*Numeric)(nil)
-	_ Hashing      = (*Numeric)(nil)
+	_ SingleColumn    = (*Numeric)(nil)
+	_ Reversible      = (*Numeric)(nil)
+	_ Hashing         = (*Numeric)(nil)
+	_ ParamValidating = (*Numeric)(nil)
 )
 
 // Numeric defines a bit-pattern mapping of a uint64 to the KeyspaceId.
 // It's Unique and Reversible.
 type Numeric struct {
-	name string
+	name          string
+	unknownParams []string
 }
 
-// NewNumeric creates a Numeric vindex.
-func NewNumeric(name string, _ map[string]string) (Vindex, error) {
-	return &Numeric{name: name}, nil
+// newNumeric creates a Numeric vindex.
+func newNumeric(name string, m map[string]string) (Vindex, error) {
+	return &Numeric{
+		name:          name,
+		unknownParams: FindUnknownParams(m, nil),
+	}, nil
 }
 
 // String returns the name of the vindex.
@@ -65,7 +69,7 @@ func (*Numeric) NeedsVCursor() bool {
 }
 
 // Verify returns true if ids and ksids match.
-func (vind *Numeric) Verify(_ VCursor, ids []sqltypes.Value, ksids [][]byte) ([]bool, error) {
+func (vind *Numeric) Verify(ctx context.Context, vcursor VCursor, ids []sqltypes.Value, ksids [][]byte) ([]bool, error) {
 	out := make([]bool, 0, len(ids))
 	for i, id := range ids {
 		ksid, err := vind.Hash(id)
@@ -78,7 +82,7 @@ func (vind *Numeric) Verify(_ VCursor, ids []sqltypes.Value, ksids [][]byte) ([]
 }
 
 // Map can map ids to key.Destination objects.
-func (vind *Numeric) Map(_ VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
+func (vind *Numeric) Map(ctx context.Context, vcursor VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
 	out := make([]key.Destination, 0, len(ids))
 	for _, id := range ids {
 		ksid, err := vind.Hash(id)
@@ -104,8 +108,13 @@ func (*Numeric) ReverseMap(_ VCursor, ksids [][]byte) ([]sqltypes.Value, error) 
 	return reverseIds, nil
 }
 
+// UnknownParams implements the ParamValidating interface.
+func (vind *Numeric) UnknownParams() []string {
+	return vind.unknownParams
+}
+
 func (*Numeric) Hash(id sqltypes.Value) ([]byte, error) {
-	num, err := evalengine.ToUint64(id)
+	num, err := id.ToCastUint64()
 	if err != nil {
 		return nil, err
 	}
@@ -115,5 +124,5 @@ func (*Numeric) Hash(id sqltypes.Value) ([]byte, error) {
 }
 
 func init() {
-	Register("numeric", NewNumeric)
+	Register("numeric", newNumeric)
 }

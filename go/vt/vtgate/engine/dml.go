@@ -17,7 +17,10 @@ limitations under the License.
 package engine
 
 import (
+	"context"
 	"fmt"
+	"sort"
+	"strings"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
@@ -33,6 +36,8 @@ import (
 
 // DML contains the common elements between Update and Delete plans
 type DML struct {
+	txNeeded
+
 	// Query specifies the query to be executed.
 	Query string
 
@@ -42,8 +47,11 @@ type DML struct {
 	// KsidLength is number of columns that represents KsidVindex
 	KsidLength int
 
-	// Table specifies the table for the update.
-	Table *vindexes.Table
+	// TableNames are the name of the tables involved in the query.
+	TableNames []string
+
+	// Vindexes are the column vindexes modified by this DML.
+	Vindexes []*vindexes.ColumnVindex
 
 	// OwnedVindexQuery is used for updating changes in lookup vindexes.
 	OwnedVindexQuery string
@@ -55,10 +63,10 @@ type DML struct {
 	// QueryTimeout contains the optional timeout (in milliseconds) to apply to this query
 	QueryTimeout int
 
+	PreventAutoCommit bool
+
 	// RoutingParameters parameters required for query routing.
 	*RoutingParameters
-
-	txNeeded
 }
 
 // NewDML returns and empty initialized DML struct.
@@ -66,15 +74,16 @@ func NewDML() *DML {
 	return &DML{RoutingParameters: &RoutingParameters{}}
 }
 
-func (dml *DML) execUnsharded(vcursor VCursor, bindVars map[string]*querypb.BindVariable, rss []*srvtopo.ResolvedShard) (*sqltypes.Result, error) {
-	return execShard(vcursor, dml.Query, bindVars, rss[0], true, true /* canAutocommit */)
+func (dml *DML) execUnsharded(ctx context.Context, primitive Primitive, vcursor VCursor, bindVars map[string]*querypb.BindVariable, rss []*srvtopo.ResolvedShard) (*sqltypes.Result, error) {
+	return execShard(ctx, primitive, vcursor, dml.Query, bindVars, rss[0], true /* rollbackOnError */, !dml.PreventAutoCommit /* canAutocommit */)
 }
 
-func (dml *DML) execMultiDestination(vcursor VCursor, bindVars map[string]*querypb.BindVariable, rss []*srvtopo.ResolvedShard, dmlSpecialFunc func(VCursor, map[string]*querypb.BindVariable, []*srvtopo.ResolvedShard) error) (*sqltypes.Result, error) {
+func (dml *DML) execMultiDestination(ctx context.Context, primitive Primitive, vcursor VCursor, bindVars map[string]*querypb.BindVariable, rss []*srvtopo.ResolvedShard, dmlSpecialFunc func(context.Context, VCursor,
+	map[string]*querypb.BindVariable, []*srvtopo.ResolvedShard) error, bvs []map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
 	if len(rss) == 0 {
 		return &sqltypes.Result{}, nil
 	}
-	err := dmlSpecialFunc(vcursor, bindVars, rss)
+	err := dmlSpecialFunc(ctx, vcursor, bindVars, rss)
 	if err != nil {
 		return nil, err
 	}
@@ -82,10 +91,34 @@ func (dml *DML) execMultiDestination(vcursor VCursor, bindVars map[string]*query
 	for i := range rss {
 		queries[i] = &querypb.BoundQuery{
 			Sql:           dml.Query,
-			BindVariables: bindVars,
+			BindVariables: bvs[i],
 		}
 	}
-	return execMultiShard(vcursor, rss, queries, dml.MultiShardAutocommit)
+	return execMultiShard(ctx, primitive, vcursor, rss, queries, dml.MultiShardAutocommit)
+}
+
+// RouteType returns a description of the query routing type used by the primitive
+func (dml *DML) RouteType() string {
+	return dml.Opcode.String()
+}
+
+// GetKeyspaceName specifies the Keyspace that this primitive routes to.
+func (dml *DML) GetKeyspaceName() string {
+	return dml.Keyspace.Name
+}
+
+// GetTableName specifies the table that this primitive routes to.
+func (dml *DML) GetTableName() string {
+	sort.Strings(dml.TableNames)
+	var tableNames []string
+	var previousTbl string
+	for _, name := range dml.TableNames {
+		if name != previousTbl {
+			tableNames = append(tableNames, name)
+			previousTbl = name
+		}
+	}
+	return strings.Join(tableNames, ", ")
 }
 
 func allowOnlyPrimary(rss ...*srvtopo.ResolvedShard) error {
@@ -97,20 +130,20 @@ func allowOnlyPrimary(rss ...*srvtopo.ResolvedShard) error {
 	return nil
 }
 
-func execMultiShard(vcursor VCursor, rss []*srvtopo.ResolvedShard, queries []*querypb.BoundQuery, multiShardAutoCommit bool) (*sqltypes.Result, error) {
+func execMultiShard(ctx context.Context, primitive Primitive, vcursor VCursor, rss []*srvtopo.ResolvedShard, queries []*querypb.BoundQuery, multiShardAutoCommit bool) (*sqltypes.Result, error) {
 	autocommit := (len(rss) == 1 || multiShardAutoCommit) && vcursor.AutocommitApproval()
-	result, errs := vcursor.ExecuteMultiShard(rss, queries, true /* rollbackOnError */, autocommit)
+	result, errs := vcursor.ExecuteMultiShard(ctx, primitive, rss, queries, true /* rollbackOnError */, autocommit)
 	return result, vterrors.Aggregate(errs)
 }
 
-func resolveKeyspaceID(vcursor VCursor, vindex vindexes.Vindex, vindexKey []sqltypes.Value) ([]byte, error) {
+func resolveKeyspaceID(ctx context.Context, vcursor VCursor, vindex vindexes.Vindex, vindexKey []sqltypes.Value) ([]byte, error) {
 	var destinations []key.Destination
 	var err error
 	switch vdx := vindex.(type) {
 	case vindexes.MultiColumn:
-		destinations, err = vdx.Map(vcursor, [][]sqltypes.Value{vindexKey})
+		destinations, err = vdx.Map(ctx, vcursor, [][]sqltypes.Value{vindexKey})
 	case vindexes.SingleColumn:
-		destinations, err = vdx.Map(vcursor, vindexKey)
+		destinations, err = vdx.Map(ctx, vcursor, vindexKey)
 	}
 
 	if err != nil {

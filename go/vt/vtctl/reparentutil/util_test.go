@@ -22,17 +22,18 @@ import (
 	"testing"
 	"time"
 
-	"vitess.io/vitess/go/vt/vterrors"
-
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/stretchr/testify/assert"
+	"vitess.io/vitess/go/mysql/replication"
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/test/utils"
 	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/vtctl/grpcvtctldserver/testutil"
+	"vitess.io/vitess/go/vt/vtctl/reparentutil/promotionrule"
+	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vttablet/tmclient"
 
 	replicationdatapb "vitess.io/vitess/go/vt/proto/replicationdata"
@@ -60,33 +61,39 @@ func (fake *chooseNewPrimaryTestTMClient) ReplicationStatus(ctx context.Context,
 	return nil, assert.AnError
 }
 
-func TestChooseNewPrimary(t *testing.T) {
+func TestElectNewPrimary(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
 	logger := logutil.NewMemoryLogger()
 	tests := []struct {
-		name              string
-		tmc               *chooseNewPrimaryTestTMClient
-		shardInfo         *topo.ShardInfo
-		tabletMap         map[string]*topo.TabletInfo
-		avoidPrimaryAlias *topodatapb.TabletAlias
-		expected          *topodatapb.TabletAlias
-		shouldErr         bool
+		name                    string
+		tmc                     *chooseNewPrimaryTestTMClient
+		shardInfo               *topo.ShardInfo
+		tabletMap               map[string]*topo.TabletInfo
+		innodbBufferPoolData    map[string]int
+		newPrimaryAlias         *topodatapb.TabletAlias
+		avoidPrimaryAlias       *topodatapb.TabletAlias
+		tolerableReplLag        time.Duration
+		allowCrossCellPromotion bool
+		expected                *topodatapb.TabletAlias
+		errContains             []string
 	}{
 		{
 			name: "found a replica",
 			tmc: &chooseNewPrimaryTestTMClient{
-				// zone1-101 is behind zone1-102
+				// zone1-101 is behind zone1-102 and zone1-102 has a tolerable replication lag
 				replicationStatuses: map[string]*replicationdatapb.Status{
 					"zone1-0000000101": {
 						Position: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1",
 					},
 					"zone1-0000000102": {
-						Position: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5",
+						Position:              "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5",
+						ReplicationLagSeconds: 20,
 					},
 				},
 			},
+			tolerableReplLag: 50 * time.Second,
 			shardInfo: topo.NewShardInfo("testkeyspace", "-", &topodatapb.Shard{
 				PrimaryAlias: &topodatapb.TabletAlias{
 					Cell: "zone1",
@@ -130,7 +137,282 @@ func TestChooseNewPrimary(t *testing.T) {
 				Cell: "zone1",
 				Uid:  102,
 			},
-			shouldErr: false,
+			errContains: nil,
+		},
+		{
+			name:             "new primary alias provided - no tolerable replication lag",
+			tolerableReplLag: 0,
+			shardInfo: topo.NewShardInfo("testkeyspace", "-", &topodatapb.Shard{
+				PrimaryAlias: &topodatapb.TabletAlias{
+					Cell: "zone1",
+					Uid:  100,
+				},
+			}, nil),
+			tabletMap: map[string]*topo.TabletInfo{
+				"primary": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  100,
+						},
+						Type: topodatapb.TabletType_PRIMARY,
+					},
+				},
+				"replica1": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  101,
+						},
+						Type: topodatapb.TabletType_REPLICA,
+					},
+				},
+			},
+			newPrimaryAlias: &topodatapb.TabletAlias{
+				Cell: "zone1",
+				Uid:  101,
+			},
+			expected: &topodatapb.TabletAlias{
+				Cell: "zone1",
+				Uid:  101,
+			},
+			errContains: nil,
+		},
+		{
+			name: "new primary alias provided - with tolerable replication lag",
+			tmc: &chooseNewPrimaryTestTMClient{
+				// zone1-102 has a tolerable replication lag
+				replicationStatuses: map[string]*replicationdatapb.Status{
+					"zone1-0000000102": {
+						Position:              "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5",
+						ReplicationLagSeconds: 20,
+					},
+				},
+			},
+			tolerableReplLag: 50 * time.Second,
+			shardInfo: topo.NewShardInfo("testkeyspace", "-", &topodatapb.Shard{
+				PrimaryAlias: &topodatapb.TabletAlias{
+					Cell: "zone1",
+					Uid:  100,
+				},
+			}, nil),
+			tabletMap: map[string]*topo.TabletInfo{
+				"primary": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  100,
+						},
+						Type: topodatapb.TabletType_PRIMARY,
+					},
+				},
+				"replica1": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  101,
+						},
+						Type: topodatapb.TabletType_REPLICA,
+					},
+				},
+				"replica2": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  102,
+						},
+						Type: topodatapb.TabletType_REPLICA,
+					},
+				},
+			},
+			newPrimaryAlias: &topodatapb.TabletAlias{
+				Cell: "zone1",
+				Uid:  102,
+			},
+			expected: &topodatapb.TabletAlias{
+				Cell: "zone1",
+				Uid:  102,
+			},
+			errContains: nil,
+		},
+		{
+			name: "new primary alias provided - with intolerable replication lag",
+			tmc: &chooseNewPrimaryTestTMClient{
+				// zone1-102 has an intolerable replication lag
+				replicationStatuses: map[string]*replicationdatapb.Status{
+					"zone1-0000000102": {
+						Position:              "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5",
+						ReplicationLagSeconds: 100,
+					},
+				},
+			},
+			tolerableReplLag: 50 * time.Second,
+			shardInfo: topo.NewShardInfo("testkeyspace", "-", &topodatapb.Shard{
+				PrimaryAlias: &topodatapb.TabletAlias{
+					Cell: "zone1",
+					Uid:  100,
+				},
+			}, nil),
+			tabletMap: map[string]*topo.TabletInfo{
+				"primary": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  100,
+						},
+						Type: topodatapb.TabletType_PRIMARY,
+					},
+				},
+				"replica1": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  101,
+						},
+						Type: topodatapb.TabletType_REPLICA,
+					},
+				},
+				"replica2": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  102,
+						},
+						Type: topodatapb.TabletType_REPLICA,
+					},
+				},
+			},
+			newPrimaryAlias: &topodatapb.TabletAlias{
+				Cell: "zone1",
+				Uid:  102,
+			},
+			expected: nil,
+			errContains: []string{
+				`cannot find a tablet to reparent to`,
+				`zone1-0000000100 does not match the new primary alias provided`,
+				`zone1-0000000101 does not match the new primary alias provided`,
+				`zone1-0000000102 has 1m40s replication lag which is more than the tolerable amount`,
+			},
+		},
+		{
+			name: "found a replica ignoring replica lag",
+			tmc: &chooseNewPrimaryTestTMClient{
+				// zone1-101 is behind zone1-102 and we don't care about the replication lag
+				replicationStatuses: map[string]*replicationdatapb.Status{
+					"zone1-0000000101": {
+						Position: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1",
+					},
+					"zone1-0000000102": {
+						Position:              "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5",
+						ReplicationLagSeconds: 230,
+					},
+				},
+			},
+			tolerableReplLag: 0,
+			shardInfo: topo.NewShardInfo("testkeyspace", "-", &topodatapb.Shard{
+				PrimaryAlias: &topodatapb.TabletAlias{
+					Cell: "zone1",
+					Uid:  100,
+				},
+			}, nil),
+			tabletMap: map[string]*topo.TabletInfo{
+				"primary": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  100,
+						},
+						Type: topodatapb.TabletType_PRIMARY,
+					},
+				},
+				"replica1": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  101,
+						},
+						Type: topodatapb.TabletType_REPLICA,
+					},
+				},
+				"replica2": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  102,
+						},
+						Type: topodatapb.TabletType_REPLICA,
+					},
+				},
+			},
+			avoidPrimaryAlias: &topodatapb.TabletAlias{
+				Cell: "zone1",
+				Uid:  0,
+			},
+			expected: &topodatapb.TabletAlias{
+				Cell: "zone1",
+				Uid:  102,
+			},
+			errContains: nil,
+		},
+		{
+			name: "found a replica - ignore one with replication lag",
+			tmc: &chooseNewPrimaryTestTMClient{
+				// zone1-101 is behind zone1-102
+				replicationStatuses: map[string]*replicationdatapb.Status{
+					"zone1-0000000101": {
+						Position: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1",
+					},
+					"zone1-0000000102": {
+						Position:              "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5",
+						ReplicationLagSeconds: 232,
+					},
+				},
+			},
+			tolerableReplLag: 50 * time.Second,
+			shardInfo: topo.NewShardInfo("testkeyspace", "-", &topodatapb.Shard{
+				PrimaryAlias: &topodatapb.TabletAlias{
+					Cell: "zone1",
+					Uid:  100,
+				},
+			}, nil),
+			tabletMap: map[string]*topo.TabletInfo{
+				"primary": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  100,
+						},
+						Type: topodatapb.TabletType_PRIMARY,
+					},
+				},
+				"replica1": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  101,
+						},
+						Type: topodatapb.TabletType_REPLICA,
+					},
+				},
+				"replica2": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  102,
+						},
+						Type: topodatapb.TabletType_REPLICA,
+					},
+				},
+			},
+			avoidPrimaryAlias: &topodatapb.TabletAlias{
+				Cell: "zone1",
+				Uid:  0,
+			},
+			expected: &topodatapb.TabletAlias{
+				Cell: "zone1",
+				Uid:  101,
+			},
+			errContains: nil,
 		},
 		{
 			name: "found a replica - more advanced relay log position",
@@ -190,7 +472,69 @@ func TestChooseNewPrimary(t *testing.T) {
 				Cell: "zone1",
 				Uid:  102,
 			},
-			shouldErr: false,
+			errContains: nil,
+		},
+		{
+			name: "found a replica - more advanced innodb buffer pool",
+			tmc: &chooseNewPrimaryTestTMClient{
+				replicationStatuses: map[string]*replicationdatapb.Status{
+					"zone1-0000000101": {
+						Position: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-2",
+					},
+					"zone1-0000000102": {
+						Position:         "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1",
+						RelayLogPosition: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-2",
+					},
+				},
+			},
+			innodbBufferPoolData: map[string]int{
+				"zone1-0000000101": 200,
+				"zone1-0000000102": 100,
+			},
+			shardInfo: topo.NewShardInfo("testkeyspace", "-", &topodatapb.Shard{
+				PrimaryAlias: &topodatapb.TabletAlias{
+					Cell: "zone1",
+					Uid:  100,
+				},
+			}, nil),
+			tabletMap: map[string]*topo.TabletInfo{
+				"primary": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  100,
+						},
+						Type: topodatapb.TabletType_PRIMARY,
+					},
+				},
+				"replica1": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  101,
+						},
+						Type: topodatapb.TabletType_REPLICA,
+					},
+				},
+				"replica2": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  102,
+						},
+						Type: topodatapb.TabletType_REPLICA,
+					},
+				},
+			},
+			avoidPrimaryAlias: &topodatapb.TabletAlias{
+				Cell: "zone1",
+				Uid:  0,
+			},
+			expected: &topodatapb.TabletAlias{
+				Cell: "zone1",
+				Uid:  101,
+			},
+			errContains: nil,
 		},
 		{
 			name: "no active primary in shard",
@@ -230,7 +574,7 @@ func TestChooseNewPrimary(t *testing.T) {
 				Cell: "zone1",
 				Uid:  101,
 			},
-			shouldErr: false,
+			errContains: nil,
 		},
 		{
 			name: "avoid primary alias is nil",
@@ -272,7 +616,7 @@ func TestChooseNewPrimary(t *testing.T) {
 				Cell: "zone1",
 				Uid:  101,
 			},
-			shouldErr: false,
+			errContains: nil,
 		}, {
 			name: "avoid primary alias and shard primary are nil",
 			tmc: &chooseNewPrimaryTestTMClient{
@@ -311,7 +655,7 @@ func TestChooseNewPrimary(t *testing.T) {
 				Cell: "zone1",
 				Uid:  101,
 			},
-			shouldErr: false,
+			errContains: nil,
 		},
 		{
 			name: "no replicas in primary cell",
@@ -365,8 +709,71 @@ func TestChooseNewPrimary(t *testing.T) {
 				Cell: "zone1",
 				Uid:  0,
 			},
-			expected:  nil,
-			shouldErr: false,
+			expected: nil,
+			errContains: []string{
+				`cannot find a tablet to reparent to`,
+				`zone2-0000000200 is not a replica`,
+				`zone1-0000000101 is not in the same cell as the previous primary`,
+				`zone1-0000000102 is not in the same cell as the previous primary`,
+			},
+		},
+		{
+			name: "no replicas in primary cell but cross cell allowed",
+			tmc: &chooseNewPrimaryTestTMClient{
+				// zone1-101 is behind zone1-102
+				replicationStatuses: map[string]*replicationdatapb.Status{
+					"zone1-0000000101": {
+						Position: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1",
+					},
+					"zone1-0000000102": {
+						Position: "MySQL56/3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5",
+					},
+				},
+			},
+			allowCrossCellPromotion: true,
+			shardInfo: topo.NewShardInfo("testkeyspace", "-", &topodatapb.Shard{
+				PrimaryAlias: &topodatapb.TabletAlias{
+					Cell: "zone2",
+					Uid:  200,
+				},
+			}, nil),
+			tabletMap: map[string]*topo.TabletInfo{
+				"primary": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone2",
+							Uid:  200,
+						},
+						Type: topodatapb.TabletType_PRIMARY,
+					},
+				},
+				"replica1": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  101,
+						},
+						Type: topodatapb.TabletType_REPLICA,
+					},
+				},
+				"replica2": {
+					Tablet: &topodatapb.Tablet{
+						Alias: &topodatapb.TabletAlias{
+							Cell: "zone1",
+							Uid:  102,
+						},
+						Type: topodatapb.TabletType_REPLICA,
+					},
+				},
+			},
+			avoidPrimaryAlias: &topodatapb.TabletAlias{
+				Cell: "zone1",
+				Uid:  0,
+			},
+			expected: &topodatapb.TabletAlias{
+				Cell: "zone1",
+				Uid:  102,
+			},
 		},
 		{
 			name: "only available tablet is AvoidPrimary",
@@ -402,8 +809,11 @@ func TestChooseNewPrimary(t *testing.T) {
 				Cell: "zone1",
 				Uid:  101,
 			},
-			expected:  nil,
-			shouldErr: false,
+			expected: nil,
+			errContains: []string{
+				`cannot find a tablet to reparent to
+zone1-0000000101 matches the primary alias to avoid`,
+			},
 		},
 		{
 			name: "no replicas in shard",
@@ -429,20 +839,33 @@ func TestChooseNewPrimary(t *testing.T) {
 				Cell: "zone1",
 				Uid:  0,
 			},
-			expected:  nil,
-			shouldErr: false,
+			expected: nil,
+			errContains: []string{
+				`cannot find a tablet to reparent to
+zone1-0000000100 is not a replica`,
+			},
 		},
 	}
 
+	durability, err := GetDurabilityPolicy("none")
+	require.NoError(t, err)
 	for _, tt := range tests {
-		tt := tt
-
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			actual, err := ChooseNewPrimary(ctx, tt.tmc, tt.shardInfo, tt.tabletMap, tt.avoidPrimaryAlias, time.Millisecond*50, logger)
-			if tt.shouldErr {
-				assert.Error(t, err)
+			options := &PlannedReparentOptions{
+				NewPrimaryAlias:         tt.newPrimaryAlias,
+				AvoidPrimaryAlias:       tt.avoidPrimaryAlias,
+				TolerableReplLag:        tt.tolerableReplLag,
+				durability:              durability,
+				AllowCrossCellPromotion: tt.allowCrossCellPromotion,
+				WaitReplicasTimeout:     time.Millisecond * 50,
+			}
+			actual, err := ElectNewPrimary(ctx, tt.tmc, tt.shardInfo, tt.tabletMap, tt.innodbBufferPoolData, options, logger)
+			if len(tt.errContains) > 0 {
+				for _, errC := range tt.errContains {
+					assert.ErrorContains(t, err, errC)
+				}
 				return
 			}
 
@@ -462,6 +885,7 @@ func TestFindPositionForTablet(t *testing.T) {
 		tmc              *testutil.TabletManagerClient
 		tablet           *topodatapb.Tablet
 		expectedPosition string
+		expectedLag      time.Duration
 		expectedErr      string
 	}{
 		{
@@ -473,7 +897,8 @@ func TestFindPositionForTablet(t *testing.T) {
 				}{
 					"zone1-0000000100": {
 						Position: &replicationdatapb.Status{
-							Position: "MySQL56/3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5",
+							Position:              "MySQL56/3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5",
+							ReplicationLagSeconds: 201,
 						},
 					},
 				},
@@ -484,6 +909,7 @@ func TestFindPositionForTablet(t *testing.T) {
 					Uid:  100,
 				},
 			},
+			expectedLag:      201 * time.Second,
 			expectedPosition: "MySQL56/3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5",
 		}, {
 			name: "no replication status",
@@ -503,6 +929,7 @@ func TestFindPositionForTablet(t *testing.T) {
 					Uid:  100,
 				},
 			},
+			expectedLag:      0,
 			expectedPosition: "",
 		}, {
 			name: "relay log",
@@ -513,8 +940,9 @@ func TestFindPositionForTablet(t *testing.T) {
 				}{
 					"zone1-0000000100": {
 						Position: &replicationdatapb.Status{
-							Position:         "unused",
-							RelayLogPosition: "MySQL56/3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5",
+							Position:              "unused",
+							RelayLogPosition:      "MySQL56/3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5",
+							ReplicationLagSeconds: 291,
 						},
 					},
 				},
@@ -525,6 +953,7 @@ func TestFindPositionForTablet(t *testing.T) {
 					Uid:  100,
 				},
 			},
+			expectedLag:      291 * time.Second,
 			expectedPosition: "MySQL56/3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5",
 		}, {
 			name: "error in parsing position",
@@ -552,14 +981,15 @@ func TestFindPositionForTablet(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			pos, err := findPositionForTablet(ctx, test.tablet, logger, test.tmc, 10*time.Second)
+			pos, lag, err := findPositionAndLagForTablet(ctx, test.tablet, logger, test.tmc, 10*time.Second)
 			if test.expectedErr != "" {
 				require.EqualError(t, err, test.expectedErr)
 				return
 			}
 			require.NoError(t, err)
-			posString := mysql.EncodePosition(pos)
+			posString := replication.EncodePosition(pos)
 			require.Equal(t, test.expectedPosition, posString)
+			require.Equal(t, test.expectedLag, lag)
 		})
 	}
 }
@@ -723,8 +1153,6 @@ func TestFindCurrentPrimary(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
-
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -735,41 +1163,41 @@ func TestFindCurrentPrimary(t *testing.T) {
 }
 
 func TestGetValidCandidatesAndPositionsAsList(t *testing.T) {
-	sid1 := mysql.SID{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
-	mysqlGTID1 := mysql.Mysql56GTID{
+	sid1 := replication.SID{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+	mysqlGTID1 := replication.Mysql56GTID{
 		Server:   sid1,
 		Sequence: 9,
 	}
-	mysqlGTID2 := mysql.Mysql56GTID{
+	mysqlGTID2 := replication.Mysql56GTID{
 		Server:   sid1,
 		Sequence: 10,
 	}
-	mysqlGTID3 := mysql.Mysql56GTID{
+	mysqlGTID3 := replication.Mysql56GTID{
 		Server:   sid1,
 		Sequence: 11,
 	}
 
-	positionMostAdvanced := mysql.Position{GTIDSet: mysql.Mysql56GTIDSet{}}
+	positionMostAdvanced := replication.Position{GTIDSet: replication.Mysql56GTIDSet{}}
 	positionMostAdvanced.GTIDSet = positionMostAdvanced.GTIDSet.AddGTID(mysqlGTID1)
 	positionMostAdvanced.GTIDSet = positionMostAdvanced.GTIDSet.AddGTID(mysqlGTID2)
 	positionMostAdvanced.GTIDSet = positionMostAdvanced.GTIDSet.AddGTID(mysqlGTID3)
 
-	positionIntermediate1 := mysql.Position{GTIDSet: mysql.Mysql56GTIDSet{}}
+	positionIntermediate1 := replication.Position{GTIDSet: replication.Mysql56GTIDSet{}}
 	positionIntermediate1.GTIDSet = positionIntermediate1.GTIDSet.AddGTID(mysqlGTID1)
 
-	positionIntermediate2 := mysql.Position{GTIDSet: mysql.Mysql56GTIDSet{}}
+	positionIntermediate2 := replication.Position{GTIDSet: replication.Mysql56GTIDSet{}}
 	positionIntermediate2.GTIDSet = positionIntermediate2.GTIDSet.AddGTID(mysqlGTID1)
 	positionIntermediate2.GTIDSet = positionIntermediate2.GTIDSet.AddGTID(mysqlGTID2)
 
 	tests := []struct {
 		name            string
-		validCandidates map[string]mysql.Position
+		validCandidates map[string]replication.Position
 		tabletMap       map[string]*topo.TabletInfo
 		tabletRes       []*topodatapb.Tablet
 	}{
 		{
 			name: "test conversion",
-			validCandidates: map[string]mysql.Position{
+			validCandidates: map[string]replication.Position{
 				"zone1-0000000100": positionMostAdvanced,
 				"zone1-0000000101": positionIntermediate1,
 				"zone1-0000000102": positionIntermediate2,
@@ -967,13 +1395,13 @@ func TestWaitForCatchUp(t *testing.T) {
 func TestRestrictValidCandidates(t *testing.T) {
 	tests := []struct {
 		name            string
-		validCandidates map[string]mysql.Position
+		validCandidates map[string]replication.Position
 		tabletMap       map[string]*topo.TabletInfo
-		result          map[string]mysql.Position
+		result          map[string]replication.Position
 	}{
 		{
 			name: "remove invalid tablets",
-			validCandidates: map[string]mysql.Position{
+			validCandidates: map[string]replication.Position{
 				"zone1-0000000100": {},
 				"zone1-0000000101": {},
 				"zone1-0000000102": {},
@@ -1037,7 +1465,7 @@ func TestRestrictValidCandidates(t *testing.T) {
 					},
 				},
 			},
-			result: map[string]mysql.Position{
+			result: map[string]replication.Position{
 				"zone1-0000000100": {},
 				"zone1-0000000101": {},
 				"zone1-0000000104": {},
@@ -1050,6 +1478,270 @@ func TestRestrictValidCandidates(t *testing.T) {
 			res, err := restrictValidCandidates(test.validCandidates, test.tabletMap)
 			assert.NoError(t, err)
 			assert.Equal(t, res, test.result)
+		})
+	}
+}
+
+func Test_findCandidate(t *testing.T) {
+	tests := []struct {
+		name               string
+		intermediateSource *topodatapb.Tablet
+		possibleCandidates []*topodatapb.Tablet
+		candidate          *topodatapb.Tablet
+	}{
+		{
+			name:      "empty possible candidates list",
+			candidate: nil,
+		}, {
+			name: "intermediate source in possible candidates list",
+			intermediateSource: &topodatapb.Tablet{
+				Alias: &topodatapb.TabletAlias{
+					Cell: "zone1",
+					Uid:  103,
+				},
+			},
+			possibleCandidates: []*topodatapb.Tablet{
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  101,
+					},
+				}, {
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  103,
+					},
+				}, {
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  102,
+					},
+				},
+			},
+			candidate: &topodatapb.Tablet{
+				Alias: &topodatapb.TabletAlias{
+					Cell: "zone1",
+					Uid:  103,
+				},
+			},
+		}, {
+			name: "intermediate source not in possible candidates list",
+			intermediateSource: &topodatapb.Tablet{
+				Alias: &topodatapb.TabletAlias{
+					Cell: "zone1",
+					Uid:  103,
+				},
+			},
+			possibleCandidates: []*topodatapb.Tablet{
+				{
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  101,
+					},
+				}, {
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  104,
+					},
+				}, {
+					Alias: &topodatapb.TabletAlias{
+						Cell: "zone1",
+						Uid:  102,
+					},
+				},
+			},
+			candidate: &topodatapb.Tablet{
+				Alias: &topodatapb.TabletAlias{
+					Cell: "zone1",
+					Uid:  101,
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res := findCandidate(tt.intermediateSource, tt.possibleCandidates)
+			if tt.candidate == nil {
+				require.Nil(t, res)
+			} else {
+				require.NotNil(t, res)
+				require.Equal(t, topoproto.TabletAliasString(tt.candidate.Alias), topoproto.TabletAliasString(res.Alias))
+			}
+		})
+	}
+}
+
+func Test_getTabletsWithPromotionRules(t *testing.T) {
+	var (
+		primaryTablet = &topodatapb.Tablet{
+			Alias: &topodatapb.TabletAlias{
+				Cell: "zone-1",
+				Uid:  1,
+			},
+			Type: topodatapb.TabletType_PRIMARY,
+		}
+		replicaTablet = &topodatapb.Tablet{
+			Alias: &topodatapb.TabletAlias{
+				Cell: "zone-1",
+				Uid:  2,
+			},
+			Type: topodatapb.TabletType_REPLICA,
+		}
+		rdonlyTablet = &topodatapb.Tablet{
+			Alias: &topodatapb.TabletAlias{
+				Cell: "zone-1",
+				Uid:  3,
+			},
+			Type: topodatapb.TabletType_RDONLY,
+		}
+		replicaCrossCellTablet = &topodatapb.Tablet{
+			Alias: &topodatapb.TabletAlias{
+				Cell: "zone-2",
+				Uid:  2,
+			},
+			Type: topodatapb.TabletType_REPLICA,
+		}
+		rdonlyCrossCellTablet = &topodatapb.Tablet{
+			Alias: &topodatapb.TabletAlias{
+				Cell: "zone-2",
+				Uid:  3,
+			},
+			Type: topodatapb.TabletType_RDONLY,
+		}
+	)
+	allTablets := []*topodatapb.Tablet{primaryTablet, replicaTablet, rdonlyTablet, replicaCrossCellTablet, rdonlyCrossCellTablet}
+	tests := []struct {
+		name            string
+		tablets         []*topodatapb.Tablet
+		rule            promotionrule.CandidatePromotionRule
+		filteredTablets []*topodatapb.Tablet
+	}{
+		{
+			name:            "filter candidates with Neutral promotion rule",
+			tablets:         allTablets,
+			rule:            promotionrule.Neutral,
+			filteredTablets: []*topodatapb.Tablet{primaryTablet, replicaTablet, replicaCrossCellTablet},
+		},
+		{
+			name:            "filter candidates with MustNot promotion rule",
+			tablets:         allTablets,
+			rule:            promotionrule.MustNot,
+			filteredTablets: []*topodatapb.Tablet{rdonlyTablet, rdonlyCrossCellTablet},
+		},
+		{
+			name:            "filter candidates with Must promotion rule",
+			tablets:         allTablets,
+			rule:            promotionrule.Must,
+			filteredTablets: nil,
+		},
+	}
+	durability, _ := GetDurabilityPolicy("none")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res := getTabletsWithPromotionRules(durability, tt.tablets, tt.rule)
+			require.EqualValues(t, tt.filteredTablets, res)
+		})
+	}
+}
+
+func TestGetBackupCandidates(t *testing.T) {
+	var (
+		primaryTablet = &topo.TabletInfo{
+			Tablet: &topodatapb.Tablet{
+				Alias: &topodatapb.TabletAlias{
+					Cell: "zone1",
+					Uid:  1,
+				},
+				Type: topodatapb.TabletType_PRIMARY,
+			},
+		}
+		replicaTablet = &topo.TabletInfo{
+			Tablet: &topodatapb.Tablet{
+				Alias: &topodatapb.TabletAlias{
+					Cell: "zone1",
+					Uid:  2,
+				},
+				Type: topodatapb.TabletType_REPLICA,
+			},
+		}
+		rdonlyTablet = &topo.TabletInfo{
+			Tablet: &topodatapb.Tablet{
+				Alias: &topodatapb.TabletAlias{
+					Cell: "zone1",
+					Uid:  3,
+				},
+				Type: topodatapb.TabletType_RDONLY,
+			},
+		}
+		spareTablet = &topo.TabletInfo{
+			Tablet: &topodatapb.Tablet{
+				Alias: &topodatapb.TabletAlias{
+					Cell: "zone1",
+					Uid:  4,
+				},
+				Type: topodatapb.TabletType_SPARE,
+			},
+		}
+	)
+	tests := []struct {
+		name     string
+		in       []*topo.TabletInfo
+		expected []*topo.TabletInfo
+		status   []*replicationdatapb.Status
+	}{
+		{
+			name:     "one primary tablet with status",
+			in:       []*topo.TabletInfo{primaryTablet},
+			expected: []*topo.TabletInfo{primaryTablet},
+			status:   []*replicationdatapb.Status{{}},
+		},
+		{
+			name:     "one primary tablet with no status",
+			in:       []*topo.TabletInfo{primaryTablet},
+			expected: []*topo.TabletInfo{primaryTablet},
+			status:   []*replicationdatapb.Status{nil},
+		},
+		{
+			name:     "4 tablets with no status",
+			in:       []*topo.TabletInfo{primaryTablet, replicaTablet, rdonlyTablet, spareTablet},
+			expected: []*topo.TabletInfo{primaryTablet},
+			status:   []*replicationdatapb.Status{nil, nil, nil, nil},
+		},
+		{
+			name:     "4 tablets with full status",
+			in:       []*topo.TabletInfo{primaryTablet, replicaTablet, rdonlyTablet, spareTablet},
+			expected: []*topo.TabletInfo{primaryTablet, replicaTablet, rdonlyTablet, spareTablet},
+			status:   []*replicationdatapb.Status{{}, {}, {}, {}},
+		},
+		{
+			name:     "4 tablets with no primaryTablet status",
+			in:       []*topo.TabletInfo{primaryTablet, replicaTablet, rdonlyTablet, spareTablet},
+			expected: []*topo.TabletInfo{primaryTablet, replicaTablet, rdonlyTablet, spareTablet},
+			status:   []*replicationdatapb.Status{nil, {}, {}, {}},
+		},
+		{
+			name:     "4 tablets with no replicaTablet status",
+			in:       []*topo.TabletInfo{primaryTablet, replicaTablet, rdonlyTablet, spareTablet},
+			expected: []*topo.TabletInfo{primaryTablet, rdonlyTablet, spareTablet},
+			status:   []*replicationdatapb.Status{{}, nil, {}, {}},
+		},
+		{
+			name:     "4 tablets with no rdonlyTablet status",
+			in:       []*topo.TabletInfo{primaryTablet, replicaTablet, rdonlyTablet, spareTablet},
+			expected: []*topo.TabletInfo{primaryTablet, replicaTablet, spareTablet},
+			status:   []*replicationdatapb.Status{{}, {}, nil, {}},
+		},
+		{
+			name:     "4 tablets with no spareTablet status",
+			in:       []*topo.TabletInfo{primaryTablet, replicaTablet, rdonlyTablet, spareTablet},
+			expected: []*topo.TabletInfo{primaryTablet, replicaTablet, rdonlyTablet},
+			status:   []*replicationdatapb.Status{{}, {}, {}, nil},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res := GetBackupCandidates(tt.in, tt.status)
+			require.EqualValues(t, tt.expected, res)
 		})
 	}
 }

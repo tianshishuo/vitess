@@ -20,12 +20,14 @@ import (
 	"context"
 	"sync"
 
+	"golang.org/x/sync/semaphore"
+
 	"vitess.io/vitess/go/sqltypes"
-	"vitess.io/vitess/go/sync2"
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/schema"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/throttle/throttlerapp"
 
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 	querypb "vitess.io/vitess/go/vt/proto/query"
@@ -43,7 +45,8 @@ type TabletService interface {
 // VStreamer defines  the functions of VStreamer
 // that the messager needs.
 type VStreamer interface {
-	Stream(ctx context.Context, startPos string, tablePKs []*binlogdatapb.TableLastPK, filter *binlogdatapb.Filter, send func([]*binlogdatapb.VEvent) error) error
+	Stream(ctx context.Context, startPos string, tablePKs []*binlogdatapb.TableLastPK, filter *binlogdatapb.Filter,
+		throttlerApp throttlerapp.Name, send func([]*binlogdatapb.VEvent) error, options *binlogdatapb.VStreamOptions) error
 	StreamResults(ctx context.Context, query string, send func(*binlogdatapb.VStreamResultsResponse) error) error
 }
 
@@ -56,7 +59,7 @@ type Engine struct {
 	tsv          TabletService
 	se           *schema.Engine
 	vs           VStreamer
-	postponeSema *sync2.Semaphore
+	postponeSema *semaphore.Weighted
 }
 
 // NewEngine creates a new Engine.
@@ -65,7 +68,7 @@ func NewEngine(tsv TabletService, se *schema.Engine, vs VStreamer) *Engine {
 		tsv:          tsv,
 		se:           se,
 		vs:           vs,
-		postponeSema: sync2.NewSemaphore(tsv.Config().MessagePostponeParallelism, 0),
+		postponeSema: semaphore.NewWeighted(int64(tsv.Config().MessagePostponeParallelism)),
 		managers:     make(map[string]*messageManager),
 	}
 }
@@ -82,18 +85,23 @@ func (me *Engine) Open() {
 	log.Info("Messager: opening")
 	// Unlock before invoking RegisterNotifier because it
 	// obtains the same lock.
-	me.se.RegisterNotifier("messages", me.schemaChanged)
+	me.se.RegisterNotifier("messages", me.schemaChanged, true)
 }
 
 // Close closes the Engine service.
 func (me *Engine) Close() {
+	log.Infof("messager Engine - started execution of Close. Acquiring mu lock")
 	me.mu.Lock()
+	log.Infof("messager Engine - acquired mu lock")
 	defer me.mu.Unlock()
 	if !me.isOpen {
+		log.Infof("messager Engine is not open")
 		return
 	}
 	me.isOpen = false
+	log.Infof("messager Engine - unregistering notifiers")
 	me.se.UnregisterNotifier("messages")
+	log.Infof("messager Engine - closing all managers")
 	for _, mm := range me.managers {
 		mm.Close()
 	}
@@ -131,10 +139,11 @@ func (me *Engine) Subscribe(ctx context.Context, name string, send func(*sqltype
 	return mm.Subscribe(ctx, send), nil
 }
 
-func (me *Engine) schemaChanged(tables map[string]*schema.Table, created, altered, dropped []string) {
+func (me *Engine) schemaChanged(tables map[string]*schema.Table, created, altered, dropped []*schema.Table, _ bool) {
 	me.mu.Lock()
 	defer me.mu.Unlock()
-	for _, name := range append(dropped, altered...) {
+	for _, table := range append(dropped, altered...) {
+		name := table.Name.String()
 		mm := me.managers[name]
 		if mm == nil {
 			continue
@@ -144,8 +153,8 @@ func (me *Engine) schemaChanged(tables map[string]*schema.Table, created, altere
 		delete(me.managers, name)
 	}
 
-	for _, name := range append(created, altered...) {
-		t := tables[name]
+	for _, t := range append(created, altered...) {
+		name := t.Name.String()
 		if t.Type != schema.Message {
 			continue
 		}

@@ -18,7 +18,6 @@ package vault
 
 import (
 	"crypto/subtle"
-	"flag"
 	"fmt"
 	"net"
 	"os"
@@ -31,19 +30,8 @@ import (
 	vaultapi "github.com/aquarapid/vaultlib"
 
 	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/mysql/sqlerror"
 	"vitess.io/vitess/go/vt/log"
-)
-
-var (
-	vaultAddr             = flag.String("mysql_auth_vault_addr", "", "URL to Vault server")
-	vaultTimeout          = flag.Duration("mysql_auth_vault_timeout", 10*time.Second, "Timeout for vault API operations")
-	vaultCACert           = flag.String("mysql_auth_vault_tls_ca", "", "Path to CA PEM for validating Vault server certificate")
-	vaultPath             = flag.String("mysql_auth_vault_path", "", "Vault path to vtgate credentials JSON blob, e.g.: secret/data/prod/vtgatecreds")
-	vaultCacheTTL         = flag.Duration("mysql_auth_vault_ttl", 30*time.Minute, "How long to cache vtgate credentials from the Vault server")
-	vaultTokenFile        = flag.String("mysql_auth_vault_tokenfile", "", "Path to file containing Vault auth token; token can also be passed using VAULT_TOKEN environment variable")
-	vaultRoleID           = flag.String("mysql_auth_vault_roleid", "", "Vault AppRole id; can also be passed using VAULT_ROLEID environment variable")
-	vaultRoleSecretIDFile = flag.String("mysql_auth_vault_role_secretidfile", "", "Path to file containing Vault AppRole secret_id; can also be passed using VAULT_SECRETID environment variable")
-	vaultRoleMountPoint   = flag.String("mysql_auth_vault_role_mountpoint", "approle", "Vault AppRole mountpoint; can also be passed using VAULT_MOUNTPOINT environment variable")
 )
 
 // AuthServerVault implements AuthServer with a config loaded from Vault.
@@ -51,7 +39,7 @@ type AuthServerVault struct {
 	methods []mysql.AuthMethod
 	mu      sync.Mutex
 	// users, passwords and user data
-	// We use the same JSON format as for -mysql_auth_server_static
+	// We use the same JSON format as for --mysql_auth_server_static
 	// Acts as a cache for the in-Vault data
 	entries                map[string][]*mysql.AuthServerStaticEntry
 	vaultCacheExpireTicker *time.Ticker
@@ -63,17 +51,17 @@ type AuthServerVault struct {
 }
 
 // InitAuthServerVault - entrypoint for initialization of Vault AuthServer implementation
-func InitAuthServerVault() {
+func InitAuthServerVault(vaultAddr string, vaultTimeout time.Duration, vaultCACert, vaultPath string, vaultCacheTTL time.Duration, vaultTokenFile, vaultRoleID, vaultRoleSecretIDFile, vaultRoleMountPoint string) {
 	// Check critical parameters.
-	if *vaultAddr == "" {
-		log.Infof("Not configuring AuthServerVault, as -mysql_auth_vault_addr is empty.")
+	if vaultAddr == "" {
+		log.Infof("Not configuring AuthServerVault, as --mysql_auth_vault_addr is empty.")
 		return
 	}
-	if *vaultPath == "" {
-		log.Exitf("If using Vault auth server, -mysql_auth_vault_path is required.")
+	if vaultPath == "" {
+		log.Exitf("If using Vault auth server, --mysql_auth_vault_path is required.")
 	}
 
-	registerAuthServerVault(*vaultAddr, *vaultTimeout, *vaultCACert, *vaultPath, *vaultCacheTTL, *vaultTokenFile, *vaultRoleID, *vaultRoleSecretIDFile, *vaultRoleMountPoint)
+	registerAuthServerVault(vaultAddr, vaultTimeout, vaultCACert, vaultPath, vaultCacheTTL, vaultTokenFile, vaultRoleID, vaultRoleSecretIDFile, vaultRoleMountPoint)
 }
 
 func registerAuthServerVault(addr string, timeout time.Duration, caCertPath string, path string, ttl time.Duration, tokenFilePath string, roleID string, secretIDPath string, roleMountPoint string) {
@@ -88,11 +76,11 @@ func newAuthServerVault(addr string, timeout time.Duration, caCertPath string, p
 	// Validate more parameters
 	token, err := readFromFile(tokenFilePath)
 	if err != nil {
-		return nil, fmt.Errorf("No Vault token in provided filename for -mysql_auth_vault_tokenfile")
+		return nil, fmt.Errorf("No Vault token in provided filename for --mysql_auth_vault_tokenfile")
 	}
 	secretID, err := readFromFile(secretIDPath)
 	if err != nil {
-		return nil, fmt.Errorf("No Vault secret_id in provided filename for -mysql_auth_vault_role_secretidfile")
+		return nil, fmt.Errorf("No Vault secret_id in provided filename for --mysql_auth_vault_role_secretidfile")
 	}
 
 	config := vaultapi.NewConfig()
@@ -171,14 +159,14 @@ func (a *AuthServerVault) UserEntryWithHash(conn *mysql.Conn, salt []byte, user 
 	a.mu.Unlock()
 
 	if !ok {
-		return &mysql.StaticUserData{}, mysql.NewSQLError(mysql.ERAccessDeniedError, mysql.SSAccessDeniedError, "Access denied for user '%v'", user)
+		return &mysql.StaticUserData{}, sqlerror.NewSQLErrorf(sqlerror.ERAccessDeniedError, sqlerror.SSAccessDeniedError, "Access denied for user '%v'", user)
 	}
 
 	for _, entry := range userEntries {
 		if entry.MysqlNativePassword != "" {
 			hash, err := mysql.DecodeMysqlNativePasswordHex(entry.MysqlNativePassword)
 			if err != nil {
-				return &mysql.StaticUserData{Username: entry.UserData, Groups: entry.Groups}, mysql.NewSQLError(mysql.ERAccessDeniedError, mysql.SSAccessDeniedError, "Access denied for user '%v'", user)
+				return &mysql.StaticUserData{Username: entry.UserData, Groups: entry.Groups}, sqlerror.NewSQLErrorf(sqlerror.ERAccessDeniedError, sqlerror.SSAccessDeniedError, "Access denied for user '%v'", user)
 			}
 			isPass := mysql.VerifyHashedMysqlNativePassword(authResponse, salt, hash)
 			if mysql.MatchSourceHost(remoteAddr, entry.SourceHost) && isPass {
@@ -192,7 +180,7 @@ func (a *AuthServerVault) UserEntryWithHash(conn *mysql.Conn, salt []byte, user 
 			}
 		}
 	}
-	return &mysql.StaticUserData{}, mysql.NewSQLError(mysql.ERAccessDeniedError, mysql.SSAccessDeniedError, "Access denied for user '%v'", user)
+	return &mysql.StaticUserData{}, sqlerror.NewSQLErrorf(sqlerror.ERAccessDeniedError, sqlerror.SSAccessDeniedError, "Access denied for user '%v'", user)
 }
 
 func (a *AuthServerVault) setTTLTicker(ttl time.Duration) {
@@ -271,7 +259,8 @@ func (a *AuthServerVault) close() {
 }
 
 // We ignore most errors here, to allow us to retry cleanly
-//   or ignore the cases where the input is not passed by file, but via env
+//
+//	or ignore the cases where the input is not passed by file, but via env
 func readFromFile(filePath string) (string, error) {
 	if filePath == "" {
 		return "", nil

@@ -17,11 +17,10 @@ limitations under the License.
 package wrangler
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"time"
-
-	"context"
 
 	"vitess.io/vitess/go/vt/grpcclient"
 	"vitess.io/vitess/go/vt/topo"
@@ -41,7 +40,7 @@ const (
 // on a Shard.
 func (wr *Wrangler) SetSourceShards(ctx context.Context, keyspace, shard string, sources []*topodatapb.TabletAlias, tables []string) error {
 	// Read the source tablets.
-	sourceTablets, err := wr.ts.GetTabletMap(ctx, sources)
+	sourceTablets, err := wr.ts.GetTabletMap(ctx, sources, nil)
 	if err != nil {
 		return err
 	}
@@ -55,7 +54,7 @@ func (wr *Wrangler) SetSourceShards(ctx context.Context, keyspace, shard string,
 	for i, alias := range sources {
 		ti := sourceTablets[topoproto.TabletAliasString(alias)]
 		sourceShards[i] = &topodatapb.Shard_SourceShard{
-			Uid:      uint32(i),
+			Uid:      int32(i),
 			Keyspace: ti.Keyspace,
 			Shard:    ti.Shard,
 			KeyRange: ti.KeyRange,
@@ -102,7 +101,7 @@ func (wr *Wrangler) WaitForFilteredReplication(ctx context.Context, keyspace, sh
 		return fmt.Errorf("failed to run explicit healthcheck on tablet: %v err: %v", tabletInfo, err)
 	}
 
-	conn, err := tabletconn.GetDialer()(tabletInfo.Tablet, grpcclient.FailFast(false))
+	conn, err := tabletconn.GetDialer()(ctx, tabletInfo.Tablet, grpcclient.FailFast(false))
 	if err != nil {
 		return fmt.Errorf("cannot connect to tablet %v: %v", alias, err)
 	}

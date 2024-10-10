@@ -2,17 +2,24 @@ package wrangler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
+	"vitess.io/vitess/go/mysql/sqlerror"
 	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/discovery"
 	"vitess.io/vitess/go/vt/log"
-	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/topotools"
 	"vitess.io/vitess/go/vt/vtctl/workflow"
-	"vitess.io/vitess/go/vt/vtgate/evalengine"
+	vdiff2 "vitess.io/vitess/go/vt/vttablet/tabletmanager/vdiff"
 
+	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
+	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
@@ -48,18 +55,34 @@ type VReplicationWorkflowParams struct {
 	Timeout                           time.Duration
 	Direction                         workflow.TrafficSwitchDirection
 	MaxAllowedTransactionLagSeconds   int64
+	OnDDL                             string
 
-	// MoveTables specific
-	SourceKeyspace, Tables  string
-	AllTables, RenameTables bool
+	// MoveTables/Migrate specific
+	SourceKeyspace, Tables    string
+	AllTables, RenameTables   bool
+	SourceTimeZone            string
+	DropForeignKeys           bool
+	InitializeTargetSequences bool
+	AtomicCopy                bool
 
 	// Reshard specific
 	SourceShards, TargetShards []string
 	SkipSchemaCopy             bool
 	AutoStart, StopAfterCopy   bool
 
+	// MoveTables/Migrate and Reshard specific
+	DeferSecondaryKeys bool
+
 	// Migrate specific
 	ExternalCluster string
+
+	// MoveTables only
+	NoRoutingRules bool
+
+	// Only these shards will be expected to participate in the workflow. Expects user to know what they are doing
+	// and provide the correct set of shards associated with the workflow. This is for reducing latency for workflows
+	// that only use a small set of shards in a keyspace with a large number of shards.
+	ShardSubset []string
 }
 
 // VReplicationWorkflow stores various internal objects for a workflow
@@ -84,6 +107,7 @@ func (vrw *VReplicationWorkflow) String() string {
 func (wr *Wrangler) NewVReplicationWorkflow(ctx context.Context, workflowType VReplicationWorkflowType,
 	params *VReplicationWorkflowParams) (*VReplicationWorkflow, error) {
 
+	wr.WorkflowParams = params
 	log.Infof("NewVReplicationWorkflow with params %+v", params)
 	vrw := &VReplicationWorkflow{wr: wr, ctx: ctx, params: params, workflowType: workflowType}
 	ts, ws, err := wr.getWorkflowState(ctx, params.TargetKeyspace, params.Workflow)
@@ -91,7 +115,7 @@ func (wr *Wrangler) NewVReplicationWorkflow(ctx context.Context, workflowType VR
 		return nil, err
 	}
 	log.Infof("Workflow state is %+v", ws)
-	if ts != nil { //Other than on create we need to get SourceKeyspace from the workflow
+	if ts != nil { // Other than on create we need to get SourceKeyspace from the workflow
 		vrw.params.TargetKeyspace = ts.targetKeyspace
 		vrw.params.Workflow = ts.workflow
 		vrw.params.SourceKeyspace = ts.sourceKeyspace
@@ -137,32 +161,51 @@ func (vrw *VReplicationWorkflow) stateAsString(ws *workflow.State) string {
 	if !vrw.Exists() {
 		stateInfo = append(stateInfo, WorkflowStateNotCreated)
 	} else {
-		if len(ws.RdonlyCellsNotSwitched) == 0 && len(ws.ReplicaCellsNotSwitched) == 0 && len(ws.ReplicaCellsSwitched) > 0 {
-			s = "All Reads Switched"
-		} else if len(ws.RdonlyCellsSwitched) == 0 && len(ws.ReplicaCellsSwitched) == 0 {
-			s = "Reads Not Switched"
-		} else {
-			stateInfo = append(stateInfo, "Reads partially switched")
-			if len(ws.ReplicaCellsNotSwitched) == 0 {
-				s += "All Replica Reads Switched"
-			} else if len(ws.ReplicaCellsSwitched) == 0 {
-				s += "Replica not switched"
+		if !ws.IsPartialMigration { // shard level traffic switching is all or nothing
+			if len(ws.RdonlyCellsNotSwitched) == 0 && len(ws.ReplicaCellsNotSwitched) == 0 && len(ws.ReplicaCellsSwitched) > 0 {
+				s = "All Reads Switched"
+			} else if len(ws.RdonlyCellsSwitched) == 0 && len(ws.ReplicaCellsSwitched) == 0 {
+				s = "Reads Not Switched"
 			} else {
-				s += "Replica switched in cells: " + strings.Join(ws.ReplicaCellsSwitched, ",")
+				stateInfo = append(stateInfo, "Reads partially switched")
+				if len(ws.ReplicaCellsNotSwitched) == 0 {
+					s += "All Replica Reads Switched"
+				} else if len(ws.ReplicaCellsSwitched) == 0 {
+					s += "Replica not switched"
+				} else {
+					s += "Replica switched in cells: " + strings.Join(ws.ReplicaCellsSwitched, ",")
+				}
+				stateInfo = append(stateInfo, s)
+				s = ""
+				if len(ws.RdonlyCellsNotSwitched) == 0 {
+					s += "All Rdonly Reads Switched"
+				} else if len(ws.RdonlyCellsSwitched) == 0 {
+					s += "Rdonly not switched"
+				} else {
+					s += "Rdonly switched in cells: " + strings.Join(ws.RdonlyCellsSwitched, ",")
+				}
 			}
 			stateInfo = append(stateInfo, s)
-			s = ""
-			if len(ws.RdonlyCellsNotSwitched) == 0 {
-				s += "All Rdonly Reads Switched"
-			} else if len(ws.RdonlyCellsSwitched) == 0 {
-				s += "Rdonly not switched"
-			} else {
-				s += "Rdonly switched in cells: " + strings.Join(ws.RdonlyCellsSwitched, ",")
-			}
 		}
-		stateInfo = append(stateInfo, s)
 		if ws.WritesSwitched {
 			stateInfo = append(stateInfo, "Writes Switched")
+		} else if ws.IsPartialMigration {
+			// For partial migrations, the traffic switching is all or nothing
+			// at the shard level, so reads are effectively switched on the
+			// shard when writes are switched.
+			if len(ws.ShardsAlreadySwitched) > 0 && len(ws.ShardsNotYetSwitched) > 0 {
+				sort.Strings(ws.ShardsAlreadySwitched)
+				stateInfo = append(stateInfo, fmt.Sprintf("Reads partially switched, for shards: %s", strings.Join(ws.ShardsAlreadySwitched, ",")))
+				stateInfo = append(stateInfo, fmt.Sprintf("Writes partially switched, for shards: %s", strings.Join(ws.ShardsAlreadySwitched, ",")))
+			} else {
+				if len(ws.ShardsAlreadySwitched) == 0 {
+					stateInfo = append(stateInfo, "Reads Not Switched")
+					stateInfo = append(stateInfo, "Writes Not Switched")
+				} else {
+					stateInfo = append(stateInfo, "All Reads Switched")
+					stateInfo = append(stateInfo, "All Writes Switched")
+				}
+			}
 		} else {
 			stateInfo = append(stateInfo, "Writes Not Switched")
 		}
@@ -204,12 +247,12 @@ func (vrw *VReplicationWorkflow) Create(ctx context.Context) error {
 // WorkflowError has per stream errors if present in a workflow
 type WorkflowError struct {
 	Tablet      string
-	ID          int64
+	ID          int32
 	Description string
 }
 
 // NewWorkflowError returns a new WorkflowError object
-func NewWorkflowError(tablet string, id int64, description string) *WorkflowError {
+func NewWorkflowError(tablet string, id int32, description string) *WorkflowError {
 	wfErr := &WorkflowError{
 		Tablet:      tablet,
 		ID:          id,
@@ -218,12 +261,19 @@ func NewWorkflowError(tablet string, id int64, description string) *WorkflowErro
 	return wfErr
 }
 
+func (vrw *VReplicationWorkflow) IsPartialMigration() bool {
+	if vrw.ws == nil {
+		return false
+	}
+	return vrw.ws.IsPartialMigration
+}
+
 // GetStreamCount returns a count of total streams and of streams that have started processing
-func (vrw *VReplicationWorkflow) GetStreamCount() (int64, int64, []*WorkflowError, error) {
+func (vrw *VReplicationWorkflow) GetStreamCount(shards []string) (int64, int64, []*WorkflowError, error) {
 	var err error
 	var workflowErrors []*WorkflowError
 	var total, started int64
-	res, err := vrw.wr.ShowWorkflow(vrw.ctx, vrw.params.Workflow, vrw.params.TargetKeyspace)
+	res, err := vrw.wr.ShowWorkflow(vrw.ctx, vrw.params.Workflow, vrw.params.TargetKeyspace, shards)
 	if err != nil {
 		return 0, 0, nil, err
 	}
@@ -238,7 +288,7 @@ func (vrw *VReplicationWorkflow) GetStreamCount() (int64, int64, []*WorkflowErro
 			if st.Pos == "" {
 				continue
 			}
-			if st.State == "Running" || st.State == "Copying" {
+			if st.State == binlogdatapb.VReplicationWorkflowState_Running.String() || st.State == binlogdatapb.VReplicationWorkflowState_Copying.String() {
 				started++
 			}
 		}
@@ -330,7 +380,7 @@ func (vrw *VReplicationWorkflow) Complete() (*[]string, error) {
 	}
 
 	if !ws.WritesSwitched || len(ws.ReplicaCellsNotSwitched) > 0 || len(ws.RdonlyCellsNotSwitched) > 0 {
-		return nil, fmt.Errorf(ErrWorkflowNotFullySwitched)
+		return nil, errors.New(ErrWorkflowNotFullySwitched)
 	}
 	var renameTable workflow.TableRemovalType
 	if vrw.params.RenameTables {
@@ -355,7 +405,7 @@ func (vrw *VReplicationWorkflow) Cancel() error {
 	}
 
 	if ws.WritesSwitched || len(ws.ReplicaCellsSwitched) > 0 || len(ws.RdonlyCellsSwitched) > 0 {
-		return fmt.Errorf(ErrWorkflowPartiallySwitched)
+		return errors.New(ErrWorkflowPartiallySwitched)
 	}
 	if _, err := vrw.wr.DropTargets(vrw.ctx, vrw.ws.TargetKeyspace, vrw.ws.Workflow, vrw.params.KeepData, vrw.params.KeepRoutingRules, false); err != nil {
 		return err
@@ -375,25 +425,18 @@ func (vrw *VReplicationWorkflow) getCellsAsArray() []string {
 	return nil
 }
 
-func (vrw *VReplicationWorkflow) getTabletTypes() []topodatapb.TabletType {
-	tabletTypesArr := strings.Split(vrw.params.TabletTypes, ",")
-	var tabletTypes []topodatapb.TabletType
-	for _, tabletType := range tabletTypesArr {
-		servedType, _ := topoproto.ParseTabletType(tabletType)
-		tabletTypes = append(tabletTypes, servedType)
-	}
-	return tabletTypes
-}
-
 func (vrw *VReplicationWorkflow) parseTabletTypes() (hasReplica, hasRdonly, hasPrimary bool, err error) {
-	tabletTypesArr := strings.Split(vrw.params.TabletTypes, ",")
-	for _, tabletType := range tabletTypesArr {
-		switch strings.ToLower(tabletType) {
-		case "replica":
+	tabletTypes, _, err := discovery.ParseTabletTypesAndOrder(vrw.params.TabletTypes)
+	if err != nil {
+		return false, false, false, err
+	}
+	for _, tabletType := range tabletTypes {
+		switch tabletType {
+		case topodatapb.TabletType_REPLICA:
 			hasReplica = true
-		case "rdonly":
+		case topodatapb.TabletType_RDONLY:
 			hasRdonly = true
-		case "primary", "master":
+		case topodatapb.TabletType_PRIMARY:
 			hasPrimary = true
 		default:
 			return false, false, false, fmt.Errorf("invalid tablet type passed %s", tabletType)
@@ -410,26 +453,32 @@ func (vrw *VReplicationWorkflow) initMoveTables() error {
 	log.Infof("In VReplicationWorkflow.initMoveTables() for %+v", vrw)
 	return vrw.wr.MoveTables(vrw.ctx, vrw.params.Workflow, vrw.params.SourceKeyspace, vrw.params.TargetKeyspace,
 		vrw.params.Tables, vrw.params.Cells, vrw.params.TabletTypes, vrw.params.AllTables, vrw.params.ExcludeTables,
-		vrw.params.AutoStart, vrw.params.StopAfterCopy, vrw.params.ExternalCluster)
+		vrw.params.AutoStart, vrw.params.StopAfterCopy, vrw.params.ExternalCluster, vrw.params.DropForeignKeys,
+		vrw.params.DeferSecondaryKeys, vrw.params.SourceTimeZone, vrw.params.OnDDL, vrw.params.SourceShards,
+		vrw.params.NoRoutingRules, vrw.params.AtomicCopy)
 }
 
 func (vrw *VReplicationWorkflow) initReshard() error {
 	log.Infof("In VReplicationWorkflow.initReshard() for %+v", vrw)
 	return vrw.wr.Reshard(vrw.ctx, vrw.params.TargetKeyspace, vrw.params.Workflow, vrw.params.SourceShards,
-		vrw.params.TargetShards, vrw.params.SkipSchemaCopy, vrw.params.Cells, vrw.params.TabletTypes, vrw.params.AutoStart, vrw.params.StopAfterCopy)
+		vrw.params.TargetShards, vrw.params.SkipSchemaCopy, vrw.params.Cells, vrw.params.TabletTypes,
+		vrw.params.OnDDL, vrw.params.AutoStart, vrw.params.StopAfterCopy, vrw.params.DeferSecondaryKeys)
 }
 
 func (vrw *VReplicationWorkflow) switchReads() (*[]string, error) {
 	log.Infof("In VReplicationWorkflow.switchReads() for %+v", vrw)
-	var tabletTypes []topodatapb.TabletType
-	for _, tt := range vrw.getTabletTypes() {
+	fullTabletTypes, _, err := discovery.ParseTabletTypesAndOrder(vrw.params.TabletTypes)
+	if err != nil {
+		return nil, err
+	}
+	var nonPrimaryTabletTypes []topodatapb.TabletType
+	for _, tt := range fullTabletTypes {
 		if tt != topodatapb.TabletType_PRIMARY {
-			tabletTypes = append(tabletTypes, tt)
+			nonPrimaryTabletTypes = append(nonPrimaryTabletTypes, tt)
 		}
 	}
 	var dryRunResults *[]string
-	var err error
-	dryRunResults, err = vrw.wr.SwitchReads(vrw.ctx, vrw.params.TargetKeyspace, vrw.params.Workflow, tabletTypes,
+	dryRunResults, err = vrw.wr.SwitchReads(vrw.ctx, vrw.params.TargetKeyspace, vrw.params.Workflow, nonPrimaryTabletTypes,
 		vrw.getCellsAsArray(), vrw.params.Direction, vrw.params.DryRun)
 	if err != nil {
 		return nil, err
@@ -450,7 +499,8 @@ func (vrw *VReplicationWorkflow) switchWrites() (*[]string, error) {
 		log.Infof("In VReplicationWorkflow.switchWrites(reverse) for %+v", vrw)
 	}
 	journalID, dryRunResults, err = vrw.wr.SwitchWrites(vrw.ctx, vrw.params.TargetKeyspace, vrw.params.Workflow, vrw.params.Timeout,
-		false, vrw.params.Direction == workflow.DirectionBackward, vrw.params.EnableReverseReplication, vrw.params.DryRun)
+		false, vrw.params.Direction == workflow.DirectionBackward, vrw.params.EnableReverseReplication, vrw.params.DryRun,
+		vrw.params.InitializeTargetSequences)
 	if err != nil {
 		return nil, err
 	}
@@ -472,10 +522,11 @@ type TableCopyProgress struct {
 type CopyProgress map[string]*TableCopyProgress
 
 const (
-	cannotSwitchError          = "workflow has errors"
-	cannotSwitchCopyIncomplete = "copy is still in progress"
-	cannotSwitchHighLag        = "replication lag %ds is higher than allowed lag %ds"
-	cannotSwitchFrozen         = "workflow is frozen"
+	cannotSwitchError               = "workflow has errors"
+	cannotSwitchCopyIncomplete      = "copy is still in progress"
+	cannotSwitchHighLag             = "replication lag %ds is higher than allowed lag %ds"
+	cannotSwitchFailedTabletRefresh = "could not refresh all of the tablets involved in the operation:\n%s"
+	cannotSwitchFrozen              = "workflow is frozen"
 )
 
 func (vrw *VReplicationWorkflow) canSwitch(keyspace, workflowName string) (reason string, err error) {
@@ -489,7 +540,7 @@ func (vrw *VReplicationWorkflow) canSwitch(keyspace, workflowName string) (reaso
 		return "", nil
 	}
 	log.Infof("state:%s, direction %d, switched %t", vrw.CachedState(), vrw.params.Direction, ws.WritesSwitched)
-	result, err := vrw.wr.getStreams(vrw.ctx, workflowName, keyspace)
+	result, err := vrw.wr.getStreams(vrw.ctx, workflowName, keyspace, vrw.params.ShardSubset)
 	if err != nil {
 		return "", err
 	}
@@ -497,9 +548,9 @@ func (vrw *VReplicationWorkflow) canSwitch(keyspace, workflowName string) (reaso
 		statuses := result.ShardStatuses[ksShard].PrimaryReplicationStatuses
 		for _, st := range statuses {
 			switch st.State {
-			case "Copying":
+			case binlogdatapb.VReplicationWorkflowState_Copying.String():
 				return cannotSwitchCopyIncomplete, nil
-			case "Error":
+			case binlogdatapb.VReplicationWorkflowState_Error.String():
 				return cannotSwitchError, nil
 			}
 		}
@@ -510,13 +561,40 @@ func (vrw *VReplicationWorkflow) canSwitch(keyspace, workflowName string) (reaso
 	if result.MaxVReplicationTransactionLag > vrw.params.MaxAllowedTransactionLagSeconds {
 		return fmt.Sprintf(cannotSwitchHighLag, result.MaxVReplicationTransactionLag, vrw.params.MaxAllowedTransactionLagSeconds), nil
 	}
+
+	// Ensure that the tablets on both sides are in good shape as we make this same call in the process
+	// and an error will cause us to backout
+	refreshErrors := strings.Builder{}
+	var m sync.Mutex
+	var wg sync.WaitGroup
+	rtbsCtx, cancel := context.WithTimeout(vrw.ctx, shardTabletRefreshTimeout)
+	defer cancel()
+	refreshTablets := func(shards []*topo.ShardInfo, stype string) {
+		defer wg.Done()
+		for _, si := range shards {
+			if partial, partialDetails, err := topotools.RefreshTabletsByShard(rtbsCtx, vrw.wr.ts, vrw.wr.tmc, si, nil, vrw.wr.Logger()); err != nil || partial {
+				m.Lock()
+				refreshErrors.WriteString(fmt.Sprintf("failed to successfully refresh all tablets in the %s/%s %s shard (%v):\n  %v\n",
+					si.Keyspace(), si.ShardName(), stype, err, partialDetails))
+				m.Unlock()
+			}
+		}
+	}
+	wg.Add(1)
+	go refreshTablets(vrw.ts.SourceShards(), "source")
+	wg.Add(1)
+	go refreshTablets(vrw.ts.TargetShards(), "target")
+	wg.Wait()
+	if refreshErrors.Len() > 0 {
+		return fmt.Sprintf(cannotSwitchFailedTabletRefresh, refreshErrors.String()), nil
+	}
 	return "", nil
 }
 
 // GetCopyProgress returns the progress of all tables being copied in the workflow
 func (vrw *VReplicationWorkflow) GetCopyProgress() (*CopyProgress, error) {
 	ctx := context.Background()
-	getTablesQuery := "select table_name from _vt.copy_state cs, _vt.vreplication vr where vr.id = cs.vrepl_id and vr.id = %d"
+	getTablesQuery := "select distinct table_name from _vt.copy_state cs, _vt.vreplication vr where vr.id = cs.vrepl_id and vr.id = %d"
 	getRowCountQuery := "select table_name, table_rows, data_length from information_schema.tables where table_schema = %s and table_name in (%s)"
 	tables := make(map[string]bool)
 	const MaxRows = 1000
@@ -524,7 +602,10 @@ func (vrw *VReplicationWorkflow) GetCopyProgress() (*CopyProgress, error) {
 	for _, target := range vrw.ts.targets {
 		for id, bls := range target.Sources {
 			query := fmt.Sprintf(getTablesQuery, id)
-			p3qr, err := vrw.wr.tmc.ExecuteFetchAsDba(ctx, target.GetPrimary().Tablet, true, []byte(query), MaxRows, false, false)
+			p3qr, err := vrw.wr.tmc.ExecuteFetchAsDba(ctx, target.GetPrimary().Tablet, true, &tabletmanagerdatapb.ExecuteFetchAsDbaRequest{
+				Query:   []byte(query),
+				MaxRows: MaxRows,
+			})
 			if err != nil {
 				return nil, err
 			}
@@ -568,18 +649,21 @@ func (vrw *VReplicationWorkflow) GetCopyProgress() (*CopyProgress, error) {
 	}
 
 	var getTableMetrics = func(tablet *topodatapb.Tablet, query string, rowCounts *map[string]int64, tableSizes *map[string]int64) error {
-		p3qr, err := vrw.wr.tmc.ExecuteFetchAsDba(ctx, tablet, true, []byte(query), len(tables), false, false)
+		p3qr, err := vrw.wr.tmc.ExecuteFetchAsDba(ctx, tablet, true, &tabletmanagerdatapb.ExecuteFetchAsDbaRequest{
+			Query:   []byte(query),
+			MaxRows: uint64(len(tables)),
+		})
 		if err != nil {
 			return err
 		}
 		qr := sqltypes.Proto3ToResult(p3qr)
 		for i := 0; i < len(qr.Rows); i++ {
 			table := qr.Rows[i][0].ToString()
-			rowCount, err := evalengine.ToInt64(qr.Rows[i][1])
+			rowCount, err := qr.Rows[i][1].ToCastInt64()
 			if err != nil {
 				return err
 			}
-			tableSize, err := evalengine.ToInt64(qr.Rows[i][2])
+			tableSize, err := qr.Rows[i][2].ToCastInt64()
 			if err != nil {
 				return err
 			}
@@ -636,6 +720,74 @@ func (vrw *VReplicationWorkflow) GetCopyProgress() (*CopyProgress, error) {
 		}
 	}
 	return &copyProgress, nil
+}
+
+// endregion
+
+// region Workflow related utility functions
+
+// deleteWorkflowVDiffData cleans up any potential VDiff related data associated
+// with the workflow on the given tablet.
+func (wr *Wrangler) deleteWorkflowVDiffData(ctx context.Context, tablet *topodatapb.Tablet, workflow string) {
+	if _, err := wr.tmc.VDiff(ctx, tablet, &tabletmanagerdatapb.VDiffRequest{
+		Keyspace:  tablet.Keyspace,
+		Workflow:  workflow,
+		Action:    string(vdiff2.DeleteAction),
+		ActionArg: vdiff2.AllActionArg,
+	}); err != nil {
+		log.Errorf("Error deleting vdiff data for %s.%s workflow: %v", tablet.Keyspace, workflow, err)
+	}
+}
+
+// optimizeCopyStateTable rebuilds the copy_state table to ensure the on-disk
+// structures are minimal and optimized and resets the auto-inc value for
+// subsequent inserts.
+// This helps to ensure that the size, storage, and performance related factors
+// for the table remain optimal over time and that we don't ever exhaust the
+// available auto-inc values for the table.
+// Note: it's not critical that this executes successfully any given time, it's
+// only important that we try to do this periodically so that things stay in an
+// optimal state over long periods of time. For this reason, the work is done
+// asynchronously in the background on the given tablet and any failures are
+// logged as warnings. Because it's done in the background we use the AllPrivs
+// account to be sure that we don't execute the writes if READ_ONLY is set on
+// the MySQL instance.
+func (wr *Wrangler) optimizeCopyStateTable(tablet *topodatapb.Tablet) {
+	if wr.sem != nil {
+		if !wr.sem.TryAcquire(1) {
+			log.Warningf("Deferring work to optimize the copy_state table on %q due to hitting the maximum concurrent background job limit.",
+				tablet.Alias.String())
+			return
+		}
+	}
+	go func() {
+		defer func() {
+			if wr.sem != nil {
+				wr.sem.Release(1)
+			}
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer cancel()
+		sqlOptimizeTable := "optimize table _vt.copy_state"
+		if _, err := wr.tmc.ExecuteFetchAsAllPrivs(ctx, tablet, &tabletmanagerdatapb.ExecuteFetchAsAllPrivsRequest{
+			Query:   []byte(sqlOptimizeTable),
+			MaxRows: uint64(100), // always produces 1+rows with notes and status
+		}); err != nil {
+			if sqlErr, ok := err.(*sqlerror.SQLError); ok && sqlErr.Num == sqlerror.ERNoSuchTable { // the table may not exist
+				return
+			}
+			log.Warningf("Failed to optimize the copy_state table on %q: %v", tablet.Alias.String(), err)
+		}
+		// This will automatically set the value to 1 or the current max value in the table, whichever is greater
+		sqlResetAutoInc := "alter table _vt.copy_state auto_increment = 1"
+		if _, err := wr.tmc.ExecuteFetchAsAllPrivs(ctx, tablet, &tabletmanagerdatapb.ExecuteFetchAsAllPrivsRequest{
+			Query:   []byte(sqlResetAutoInc),
+			MaxRows: uint64(0),
+		}); err != nil {
+			log.Warningf("Failed to reset the auto_increment value for the copy_state table on %q: %v",
+				tablet.Alias.String(), err)
+		}
+	}()
 }
 
 // endregion

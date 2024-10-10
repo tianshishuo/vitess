@@ -23,10 +23,8 @@ package keyspacewatches
 import (
 	"database/sql"
 	"fmt"
-	"math/rand"
 	"os"
 	"testing"
-	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
@@ -48,7 +46,7 @@ var (
 		PRIMARY KEY (id)
 	) Engine=InnoDB;`
 	vschemaDDL      = "alter vschema create vindex test_vdx using hash"
-	vschemaDDLError = fmt.Sprintf("Error 1105: cannot perform Update on keyspaces/%s/VSchema as the topology server connection is read-only",
+	vschemaDDLError = fmt.Sprintf("Error 1105 (HY000): cannot perform Update on keyspaces/%s/VSchema as the topology server connection is read-only",
 		keyspaceUnshardedName)
 )
 
@@ -98,8 +96,8 @@ func createCluster(extraVTGateArgs []string) (*cluster.LocalProcessCluster, int)
 	}
 
 	vtGateArgs := []string{
-		"-mysql_auth_server_static_file", clusterInstance.TmpDirectory + "/" + mysqlAuthServerStatic,
-		"-keyspaces_to_watch", keyspaceUnshardedName,
+		"--mysql_auth_server_static_file", clusterInstance.TmpDirectory + "/" + mysqlAuthServerStatic,
+		"--keyspaces_to_watch", keyspaceUnshardedName,
 	}
 
 	if extraVTGateArgs != nil {
@@ -115,7 +113,6 @@ func createCluster(extraVTGateArgs []string) (*cluster.LocalProcessCluster, int)
 		Host: clusterInstance.Hostname,
 		Port: clusterInstance.VtgateMySQLPort,
 	}
-	rand.Seed(time.Now().UnixNano())
 	return clusterInstance, 0
 }
 
@@ -147,7 +144,7 @@ func TestVSchemaDDLWithKeyspacesToWatch(t *testing.T) {
 	defer cluster.PanicHandler(t)
 
 	extraVTGateArgs := []string{
-		"-vschema_ddl_authorized_users", "%",
+		"--vschema_ddl_authorized_users", "%",
 	}
 	clusterInstance, exitCode := createCluster(extraVTGateArgs)
 	defer clusterInstance.Teardown()

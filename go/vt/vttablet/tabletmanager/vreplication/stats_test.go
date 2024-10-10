@@ -18,16 +18,19 @@ package vreplication
 
 import (
 	"bytes"
-	"html/template"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/safehtml/template"
 	"github.com/stretchr/testify/require"
 
-	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/mysql/replication"
+	"vitess.io/vitess/go/stats"
 	"vitess.io/vitess/go/vt/binlog/binlogplayer"
-	"vitess.io/vitess/go/vt/proto/binlogdata"
+
+	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 var wantOut = `
@@ -72,23 +75,24 @@ VReplication state: Open</br>
 `
 
 func TestStatusHtml(t *testing.T) {
-	pos, err := mysql.DecodePosition("MariaDB/1-2-3")
+	pos, err := replication.DecodePosition("MariaDB/1-2-3")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	blpStats := binlogplayer.NewStats()
+	defer blpStats.Stop()
 	blpStats.SetLastPosition(pos)
-	blpStats.ReplicationLagSeconds.Set(2)
+	blpStats.ReplicationLagSeconds.Store(2)
 	blpStats.History.Add(&binlogplayer.StatsHistoryRecord{Time: time.Now(), Message: "Test Message1"})
 	blpStats.History.Add(&binlogplayer.StatsHistoryRecord{Time: time.Now(), Message: "Test Message2"})
 
 	testStats := &vrStats{}
 	testStats.isOpen = true
-	testStats.controllers = map[int]*controller{
+	testStats.controllers = map[int32]*controller{
 		1: {
 			id: 1,
-			source: &binlogdata.BinlogSource{
+			source: &binlogdatapb.BinlogSource{
 				Keyspace: "ks",
 				Shard:    "0",
 			},
@@ -98,7 +102,7 @@ func TestStatusHtml(t *testing.T) {
 		},
 		2: {
 			id: 2,
-			source: &binlogdata.BinlogSource{
+			source: &binlogdatapb.BinlogSource{
 				Keyspace: "ks",
 				Shard:    "1",
 			},
@@ -107,13 +111,19 @@ func TestStatusHtml(t *testing.T) {
 			done:     make(chan struct{}),
 		},
 	}
-	testStats.controllers[1].sourceTablet.Set("src1")
-	testStats.controllers[2].sourceTablet.Set("src2")
+	testStats.controllers[1].sourceTablet.Store(&topodatapb.TabletAlias{
+		Cell: "zone1",
+		Uid:  01,
+	})
+	testStats.controllers[2].sourceTablet.Store(&topodatapb.TabletAlias{
+		Cell: "zone1",
+		Uid:  02,
+	})
 	close(testStats.controllers[2].done)
 
 	tpl := template.Must(template.New("test").Parse(vreplicationTemplate))
 	buf := bytes.NewBuffer(nil)
-	tpl.Execute(buf, testStats.status())
+	require.NoError(t, tpl.Execute(buf, testStats.status()))
 	if strings.Contains(buf.String(), wantOut) {
 		t.Errorf("output: %v, want %v", buf, wantOut)
 	}
@@ -121,13 +131,15 @@ func TestStatusHtml(t *testing.T) {
 
 func TestVReplicationStats(t *testing.T) {
 	blpStats := binlogplayer.NewStats()
-
-	testStats := &vrStats{}
+	defer blpStats.Stop()
+	testStats := &vrStats{
+		ThrottledCount: stats.NewCounter("", ""),
+	}
 	testStats.isOpen = true
-	testStats.controllers = map[int]*controller{
+	testStats.controllers = map[int32]*controller{
 		1: {
 			id: 1,
-			source: &binlogdata.BinlogSource{
+			source: &binlogdatapb.BinlogSource{
 				Keyspace: "ks",
 				Shard:    "0",
 			},
@@ -135,7 +147,10 @@ func TestVReplicationStats(t *testing.T) {
 			done:     make(chan struct{}),
 		},
 	}
-	testStats.controllers[1].sourceTablet.Set("src1")
+	testStats.controllers[1].sourceTablet.Store(&topodatapb.TabletAlias{
+		Cell: "zone1",
+		Uid:  01,
+	})
 
 	sleepTime := 1 * time.Millisecond
 	record := func(phase string) {
@@ -156,10 +171,37 @@ func TestVReplicationStats(t *testing.T) {
 	require.Equal(t, int64(11), testStats.status().Controllers[0].QueryCounts["replicate"])
 	require.Equal(t, int64(23), testStats.status().Controllers[0].QueryCounts["fastforward"])
 
+	blpStats.BulkQueryCount.Add("insert", 101)
+	blpStats.BulkQueryCount.Add("delete", 203)
+	require.Equal(t, int64(101), testStats.status().Controllers[0].BulkQueryCounts["insert"])
+	require.Equal(t, int64(203), testStats.status().Controllers[0].BulkQueryCounts["delete"])
+
+	blpStats.TrxQueryBatchCount.Add("without_commit", 10)
+	blpStats.TrxQueryBatchCount.Add("with_commit", 2193)
+	require.Equal(t, int64(10), testStats.status().Controllers[0].TrxQueryBatchCounts["without_commit"])
+	require.Equal(t, int64(2193), testStats.status().Controllers[0].TrxQueryBatchCounts["with_commit"])
+
 	blpStats.CopyLoopCount.Add(100)
 	blpStats.CopyRowCount.Add(200)
 	require.Equal(t, int64(100), testStats.status().Controllers[0].CopyLoopCount)
 	require.Equal(t, int64(200), testStats.status().Controllers[0].CopyRowCount)
+
+	testStats.ThrottledCount.Add(99)
+	require.Equal(t, int64(99), testStats.ThrottledCount.Get())
+
+	blpStats.ThrottledCounts.Add([]string{"tablet", "vcopier"}, 10)
+	blpStats.ThrottledCounts.Add([]string{"tablet", "vplayer"}, 80)
+	require.Equal(t, int64(10), testStats.controllers[1].blpStats.ThrottledCounts.Counts()["tablet.vcopier"])
+	require.Equal(t, int64(80), testStats.controllers[1].blpStats.ThrottledCounts.Counts()["tablet.vplayer"])
+
+	blpStats.DDLEventActions.Add(binlogdatapb.OnDDLAction_IGNORE.String(), 4)
+	blpStats.DDLEventActions.Add(binlogdatapb.OnDDLAction_EXEC.String(), 3)
+	blpStats.DDLEventActions.Add(binlogdatapb.OnDDLAction_EXEC_IGNORE.String(), 2)
+	blpStats.DDLEventActions.Add(binlogdatapb.OnDDLAction_STOP.String(), 1)
+	require.Equal(t, int64(4), testStats.controllers[1].blpStats.DDLEventActions.Counts()[binlogdatapb.OnDDLAction_IGNORE.String()])
+	require.Equal(t, int64(3), testStats.controllers[1].blpStats.DDLEventActions.Counts()[binlogdatapb.OnDDLAction_EXEC.String()])
+	require.Equal(t, int64(2), testStats.controllers[1].blpStats.DDLEventActions.Counts()[binlogdatapb.OnDDLAction_EXEC_IGNORE.String()])
+	require.Equal(t, int64(1), testStats.controllers[1].blpStats.DDLEventActions.Counts()[binlogdatapb.OnDDLAction_STOP.String()])
 
 	var tm int64 = 1234567890
 	blpStats.RecordHeartbeat(tm)

@@ -23,10 +23,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"google.golang.org/protobuf/proto"
 
 	"vitess.io/vitess/go/test/utils"
-
 	logutilpb "vitess.io/vitess/go/vt/proto/logutil"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vtctldatapb "vitess.io/vitess/go/vt/proto/vtctldata"
@@ -35,13 +33,11 @@ import (
 // AssertEmergencyReparentShardResponsesEqual asserts that two
 // vtctldatapb.EmergencyReparentShardResponse objects are equal, ignoring their
 // respective Events field in the comparison.
-func AssertEmergencyReparentShardResponsesEqual(t *testing.T, expected *vtctldatapb.EmergencyReparentShardResponse, actual *vtctldatapb.EmergencyReparentShardResponse, msgAndArgs ...interface{}) {
+func AssertEmergencyReparentShardResponsesEqual(t *testing.T, expected *vtctldatapb.EmergencyReparentShardResponse, actual *vtctldatapb.EmergencyReparentShardResponse, msgAndArgs ...any) {
 	t.Helper()
-
-	expected = proto.Clone(expected).(*vtctldatapb.EmergencyReparentShardResponse)
+	expected = expected.CloneVT()
 	expected.Events = nil
-
-	actual = proto.Clone(actual).(*vtctldatapb.EmergencyReparentShardResponse)
+	actual = actual.CloneVT()
 	actual.Events = nil
 
 	utils.MustMatch(t, expected, actual)
@@ -104,11 +100,9 @@ func clearEvents(events []*logutilpb.Event, f func(*logutilpb.Event) *logutilpb.
 // respective Events field in the comparison.
 func AssertPlannedReparentShardResponsesEqual(t *testing.T, expected *vtctldatapb.PlannedReparentShardResponse, actual *vtctldatapb.PlannedReparentShardResponse) {
 	t.Helper()
-
-	expected = proto.Clone(expected).(*vtctldatapb.PlannedReparentShardResponse)
+	expected = expected.CloneVT()
 	expected.Events = nil
-
-	actual = proto.Clone(actual).(*vtctldatapb.PlannedReparentShardResponse)
+	actual = actual.CloneVT()
 	actual.Events = nil
 
 	utils.MustMatch(t, expected, actual)
@@ -127,7 +121,7 @@ func AssertSameTablets(t *testing.T, expected, actual []*topodatapb.Tablet) {
 // AssertKeyspacesEqual is a convenience function to assert that two
 // vtctldatapb.Keyspace objects are equal, after clearing out any reserved
 // proto XXX_ fields.
-func AssertKeyspacesEqual(t *testing.T, expected *vtctldatapb.Keyspace, actual *vtctldatapb.Keyspace, msgAndArgs ...interface{}) {
+func AssertKeyspacesEqual(t *testing.T, expected *vtctldatapb.Keyspace, actual *vtctldatapb.Keyspace, msgAndArgs ...any) {
 	t.Helper()
 	utils.MustMatch(t, expected, actual)
 }
@@ -140,7 +134,7 @@ func AssertKeyspacesEqual(t *testing.T, expected *vtctldatapb.Keyspace, actual *
 // protobuf type containing a slice of logutilpb.Event elements called Events,
 // which is the convention in protobuf types in the Vitess codebase, already
 // implements.
-func AssertLogutilEventsOccurred(t *testing.T, container interface{ GetEvents() []*logutilpb.Event }, msgAndArgs ...interface{}) {
+func AssertLogutilEventsOccurred(t *testing.T, container interface{ GetEvents() []*logutilpb.Event }, msgAndArgs ...any) {
 	t.Helper()
 
 	if container == nil {
@@ -160,7 +154,7 @@ func AssertLogutilEventsOccurred(t *testing.T, container interface{ GetEvents() 
 // protobuf type containing a slice of logutilpb.Event elements called Events,
 // which is the convention in protobuf types in the Vitess codebase, already
 // implements.
-func AssertNoLogutilEventsOccurred(t *testing.T, container interface{ GetEvents() []*logutilpb.Event }, msgAndArgs ...interface{}) {
+func AssertNoLogutilEventsOccurred(t *testing.T, container interface{ GetEvents() []*logutilpb.Event }, msgAndArgs ...any) {
 	t.Helper()
 
 	if container == nil {

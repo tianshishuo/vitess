@@ -20,11 +20,11 @@ limitations under the License.
 
 package mysqlctl
 
-type serverVersion struct {
+type ServerVersion struct {
 	Major, Minor, Patch int
 }
 
-func (v *serverVersion) atLeast(compare serverVersion) bool {
+func (v *ServerVersion) atLeast(compare ServerVersion) bool {
 	if v.Major > compare.Major {
 		return true
 	}
@@ -35,4 +35,8 @@ func (v *serverVersion) atLeast(compare serverVersion) bool {
 		return true
 	}
 	return false
+}
+
+func (v *ServerVersion) isSameRelease(compare ServerVersion) bool {
+	return v.Major == compare.Major && v.Minor == compare.Minor
 }

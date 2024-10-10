@@ -18,7 +18,7 @@ import { BrowserRouter as Router, Redirect, Route, Switch } from 'react-router-d
 
 import style from './App.module.scss';
 import { Tablets } from './routes/Tablets';
-import { Debug } from './routes/Debug';
+import { Settings } from './routes/Settings';
 import { NavRail } from './NavRail';
 import { Error404 } from './routes/Error404';
 import { Clusters } from './routes/Clusters';
@@ -36,6 +36,12 @@ import { Backups } from './routes/Backups';
 import { Shard } from './routes/shard/Shard';
 import { Vtctlds } from './routes/Vtctlds';
 import { SnackbarContainer } from './Snackbar';
+import { isReadOnlyMode } from '../util/env';
+import { CreateKeyspace } from './routes/createKeyspace/CreateKeyspace';
+import { Topology } from './routes/topology/Topology';
+import { ClusterTopology } from './routes/topology/ClusterTopology';
+import { CreateMoveTables } from './routes/createWorkflow/CreateMoveTables';
+import { Transactions } from './routes/Transactions';
 
 export const App = () => {
     return (
@@ -59,9 +65,15 @@ export const App = () => {
                             <Gates />
                         </Route>
 
-                        <Route path="/keyspaces">
+                        <Route exact path="/keyspaces">
                             <Keyspaces />
                         </Route>
+
+                        {!isReadOnlyMode() && (
+                            <Route exact path="/keyspaces/create">
+                                <CreateKeyspace />
+                            </Route>
+                        )}
 
                         <Route path="/keyspace/:clusterID/:keyspace/shard/:shard">
                             <Shard />
@@ -95,9 +107,15 @@ export const App = () => {
                             <VTExplain />
                         </Route>
 
-                        <Route path="/workflows">
+                        <Route exact path="/workflows">
                             <Workflows />
                         </Route>
+
+                        {!isReadOnlyMode() && (
+                            <Route exact path="/workflows/movetables/create">
+                                <CreateMoveTables />
+                            </Route>
+                        )}
 
                         <Route path="/workflow/:clusterID/:keyspace/:workflowName/stream/:tabletCell/:tabletUID/:streamID">
                             <Stream />
@@ -107,11 +125,23 @@ export const App = () => {
                             <Workflow />
                         </Route>
 
-                        <Route path="/debug">
-                            <Debug />
+                        <Route path="/transactions">
+                            <Transactions />
                         </Route>
 
-                        <Redirect exact from="/" to="/tablets" />
+                        <Route path="/topology/:clusterID">
+                            <ClusterTopology />
+                        </Route>
+
+                        <Route path="/topology">
+                            <Topology />
+                        </Route>
+
+                        <Route path="/settings">
+                            <Settings />
+                        </Route>
+
+                        <Redirect exact from="/" to="/schemas" />
 
                         <Route>
                             <Error404 />

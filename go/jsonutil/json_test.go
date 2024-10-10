@@ -18,12 +18,14 @@ package jsonutil
 
 import (
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestMarshalNoEscape(t *testing.T) {
 	cases := []struct {
 		name     string
-		v        interface{}
+		v        any
 		expected string
 	}{
 		{
@@ -53,9 +55,7 @@ func TestMarshalNoEscape(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			json, _ := MarshalNoEscape(c.v)
 			sjson := string(json[:len(json)-1])
-			if sjson != c.expected {
-				t.Errorf("expected: %v, got: %v", c.expected, sjson)
-			}
+			assert.Equal(t, c.expected, sjson)
 		})
 	}
 }
@@ -63,7 +63,7 @@ func TestMarshalNoEscape(t *testing.T) {
 func TestMarshalIndentNoEscape(t *testing.T) {
 	cases := []struct {
 		name     string
-		v        interface{}
+		v        any
 		prefix   string
 		ident    string
 		expected string
@@ -97,9 +97,7 @@ func TestMarshalIndentNoEscape(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			json, _ := MarshalIndentNoEscape(c.v, c.prefix, c.ident)
 			sjson := string(json[:len(json)-1])
-			if sjson != c.expected {
-				t.Errorf("expected: %v, got: %v", c.expected, sjson)
-			}
+			assert.Equal(t, c.expected, sjson)
 		})
 	}
 }

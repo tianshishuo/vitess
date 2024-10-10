@@ -16,7 +16,6 @@
 
 # this script migrates traffic for the rdonly and replica tablets
 
-source ./env.sh
+source ../common/env.sh
 
-vtctlclient SwitchReads -tablet_type=rdonly main.main2regions
-vtctlclient SwitchReads -tablet_type=replica main.main2regions
+vtctldclient reshard --workflow main2regions --target-keyspace main SwitchTraffic --tablet-types=rdonly,replica

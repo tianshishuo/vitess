@@ -29,25 +29,39 @@ package stats
 
 import (
 	"bytes"
+	"context"
 	"expvar"
-	"flag"
 	"fmt"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/spf13/pflag"
+
 	"vitess.io/vitess/go/vt/log"
 )
 
-var emitStats = flag.Bool("emit_stats", false, "If set, emit stats to push-based monitoring and stats backends")
-var statsEmitPeriod = flag.Duration("stats_emit_period", time.Duration(60*time.Second), "Interval between emitting stats to all registered backends")
-var statsBackend = flag.String("stats_backend", "", "The name of the registered push-based monitoring/stats backend to use")
-var combineDimensions = flag.String("stats_combine_dimensions", "", `List of dimensions to be combined into a single "all" value in exported stats vars`)
-var dropVariables = flag.String("stats_drop_variables", "", `Variables to be dropped from the list of exported variables.`)
+var (
+	emitStats         bool
+	statsEmitPeriod   = 60 * time.Second
+	statsBackend      string
+	statsBackendInit  = make(chan struct{})
+	combineDimensions string
+	dropVariables     string
+)
 
 // CommonTags is a comma-separated list of common tags for stats backends
-var CommonTags = flag.String("stats_common_tags", "", `Comma-separated list of common tags for the stats backend. It provides both label and values. Example: label1:value1,label2:value2`)
+var CommonTags []string
+
+func RegisterFlags(fs *pflag.FlagSet) {
+	fs.BoolVar(&emitStats, "emit_stats", emitStats, "If set, emit stats to push-based monitoring and stats backends")
+	fs.DurationVar(&statsEmitPeriod, "stats_emit_period", statsEmitPeriod, "Interval between emitting stats to all registered backends")
+	fs.StringVar(&statsBackend, "stats_backend", statsBackend, "The name of the registered push-based monitoring/stats backend to use")
+	fs.StringVar(&combineDimensions, "stats_combine_dimensions", combineDimensions, `List of dimensions to be combined into a single "all" value in exported stats vars`)
+	fs.StringVar(&dropVariables, "stats_drop_variables", dropVariables, `Variables to be dropped from the list of exported variables.`)
+	fs.StringSliceVar(&CommonTags, "stats_common_tags", CommonTags, `Comma-separated list of common tags for the stats backend. It provides both label and values. Example: label1:value1,label2:value2`)
+}
 
 // StatsAllStr is the consolidated name if a dimension gets combined.
 const StatsAllStr = "all"
@@ -109,6 +123,76 @@ func Publish(name string, v expvar.Var) {
 	publish(name, v)
 }
 
+func pushAll() error {
+	backend, ok := pushBackends[statsBackend]
+	if !ok {
+		return fmt.Errorf("no PushBackend registered with name %s", statsBackend)
+	}
+	return backend.PushAll()
+}
+
+func pushOne(name string, v Variable) error {
+	backend, ok := pushBackends[statsBackend]
+	if !ok {
+		return fmt.Errorf("no PushBackend registered with name %s", statsBackend)
+	}
+	return backend.PushOne(name, v)
+}
+
+// StringMapFuncWithMultiLabels is a multidimensional string map publisher.
+//
+// Map keys are compound names made with joining multiple strings with '.',
+// and are named by corresponding key labels.
+//
+// Map values are any string, and are named by the value label.
+//
+// Since the map is returned by the function, we assume it's in the right
+// format (meaning each key is of the form 'aaa.bbb.ccc' with as many elements
+// as there are in Labels).
+//
+// Backends which need to provide a numeric value can set a constant value of 1
+// (or whatever is appropriate for the backend) for each key-value pair present
+// in the map.
+type StringMapFuncWithMultiLabels struct {
+	StringMapFunc
+	help       string
+	keyLabels  []string
+	valueLabel string
+}
+
+// Help returns the descriptive help message.
+func (s StringMapFuncWithMultiLabels) Help() string {
+	return s.help
+}
+
+// KeyLabels returns the list of key labels.
+func (s StringMapFuncWithMultiLabels) KeyLabels() []string {
+	return s.keyLabels
+}
+
+// ValueLabel returns the value label.
+func (s StringMapFuncWithMultiLabels) ValueLabel() string {
+	return s.valueLabel
+}
+
+// NewStringMapFuncWithMultiLabels creates a new StringMapFuncWithMultiLabels,
+// mapping to the provided function. The key labels correspond with components
+// of map keys. The value label names the map values.
+func NewStringMapFuncWithMultiLabels(name, help string, keyLabels []string, valueLabel string, f func() map[string]string) *StringMapFuncWithMultiLabels {
+	t := &StringMapFuncWithMultiLabels{
+		StringMapFunc: StringMapFunc(f),
+		help:          help,
+		keyLabels:     keyLabels,
+		valueLabel:    valueLabel,
+	}
+
+	if name != "" {
+		publish(name, t)
+	}
+
+	return t
+}
+
 func publish(name string, v expvar.Var) {
 	defaultVarGroup.publish(name, v)
 }
@@ -117,13 +201,27 @@ func publish(name string, v expvar.Var) {
 // to be pushed to it. It's used to support push-based metrics backends, as expvar
 // by default only supports pull-based ones.
 type PushBackend interface {
-	// PushAll pushes all stats from expvar to the backend
+	// PushAll pushes all stats from expvar to the backend.
 	PushAll() error
+	// PushOne pushes a single stat from expvar to the backend.
+	PushOne(name string, v Variable) error
 }
 
 var pushBackends = make(map[string]PushBackend)
 var pushBackendsLock sync.Mutex
 var once sync.Once
+
+func AwaitBackend(ctx context.Context) error {
+	if statsBackend == "" {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-statsBackendInit:
+		return nil
+	}
+}
 
 // RegisterPushBackend allows modules to register PushBackend implementations.
 // Should be called on init().
@@ -134,10 +232,13 @@ func RegisterPushBackend(name string, backend PushBackend) {
 		log.Fatalf("PushBackend %s already exists; can't register the same name multiple times", name)
 	}
 	pushBackends[name] = backend
-	if *emitStats {
+	if name == statsBackend {
+		close(statsBackendInit)
+	}
+	if emitStats {
 		// Start a single goroutine to emit stats periodically
 		once.Do(func() {
-			go emitToBackend(statsEmitPeriod)
+			go emitToBackend(&statsEmitPeriod)
 		})
 	}
 }
@@ -148,15 +249,9 @@ func emitToBackend(emitPeriod *time.Duration) {
 	ticker := time.NewTicker(*emitPeriod)
 	defer ticker.Stop()
 	for range ticker.C {
-		backend, ok := pushBackends[*statsBackend]
-		if !ok {
-			log.Errorf("No PushBackend registered with name %s", *statsBackend)
-			return
-		}
-		err := backend.PushAll()
-		if err != nil {
+		if err := pushAll(); err != nil {
 			// TODO(aaijazi): This might cause log spam...
-			log.Warningf("Pushing stats to backend %v failed: %v", *statsBackend, err)
+			log.Warningf("Pushing stats to backend %v failed: %v", statsBackend, err)
 		}
 	}
 }
@@ -272,7 +367,7 @@ func IsDimensionCombined(name string) bool {
 	defer varsMu.Unlock()
 
 	if combinedDimensions == nil {
-		dims := strings.Split(*combineDimensions, ",")
+		dims := strings.Split(combineDimensions, ",")
 		combinedDimensions = make(map[string]bool, len(dims))
 		for _, dim := range dims {
 			if dim == "" {
@@ -309,7 +404,7 @@ func isVarDropped(name string) bool {
 	defer varsMu.Unlock()
 
 	if droppedVars == nil {
-		dims := strings.Split(*dropVariables, ",")
+		dims := strings.Split(dropVariables, ",")
 		droppedVars = make(map[string]bool, len(dims))
 		for _, dim := range dims {
 			if dim == "" {
@@ -324,10 +419,9 @@ func isVarDropped(name string) bool {
 // ParseCommonTags parses a comma-separated string into map of tags
 // If you want to global service values like host, service name, git revision, etc,
 // this is the place to do it.
-func ParseCommonTags(s string) map[string]string {
-	inputs := strings.Split(s, ",")
+func ParseCommonTags(tagMapString []string) map[string]string {
 	tags := make(map[string]string)
-	for _, input := range inputs {
+	for _, input := range tagMapString {
 		if strings.Contains(input, ":") {
 			tag := strings.Split(input, ":")
 			tags[strings.TrimSpace(tag[0])] = strings.TrimSpace(tag[1])

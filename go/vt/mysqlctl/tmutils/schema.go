@@ -17,8 +17,6 @@ limitations under the License.
 package tmutils
 
 import (
-	"crypto/md5"
-	"encoding/hex"
 	"fmt"
 	"regexp"
 	"strings"
@@ -41,31 +39,6 @@ const (
 	// TableView indicates the table type is a view.
 	TableView = "VIEW"
 )
-
-// TableDefinitionGetColumn returns the index of a column inside a
-// TableDefinition.
-func TableDefinitionGetColumn(td *tabletmanagerdatapb.TableDefinition, name string) (index int, ok bool) {
-	lowered := strings.ToLower(name)
-	for i, n := range td.Columns {
-		if lowered == strings.ToLower(n) {
-			return i, true
-		}
-	}
-	return -1, false
-}
-
-// TableDefinitions is a list of TableDefinition, for sorting
-type TableDefinitions []*tabletmanagerdatapb.TableDefinition
-
-// Len returns TableDefinitions length.
-func (tds TableDefinitions) Len() int {
-	return len(tds)
-}
-
-// Swap used for sorting TableDefinitions.
-func (tds TableDefinitions) Swap(i, j int) {
-	tds[i], tds[j] = tds[j], tds[i]
-}
 
 // TableFilter is a filter for table names and types.
 type TableFilter struct {
@@ -119,7 +92,7 @@ func NewTableFilter(tables, excludeTables []string, includeViews bool) (*TableFi
 					return nil, fmt.Errorf("cannot compile regexp %v for excludeTable: %v", table, err)
 				}
 
-				f.excludeTableREs = append(f.tableREs, re)
+				f.excludeTableREs = append(f.excludeTableREs, re)
 			} else {
 				f.excludeTableNames = append(f.excludeTableNames, table)
 			}
@@ -179,7 +152,7 @@ func (f *TableFilter) Includes(tableName string, tableType string) bool {
 // (tables), no denied tables (excludeTables) and optionally
 // views (includeViews).
 func FilterTables(sd *tabletmanagerdatapb.SchemaDefinition, tables, excludeTables []string, includeViews bool) (*tabletmanagerdatapb.SchemaDefinition, error) {
-	copy := proto.Clone(sd).(*tabletmanagerdatapb.SchemaDefinition)
+	copy := sd.CloneVT()
 	copy.TableDefinitions = make([]*tabletmanagerdatapb.TableDefinition, 0, len(sd.TableDefinitions))
 
 	f, err := NewTableFilter(tables, excludeTables, includeViews)
@@ -192,25 +165,7 @@ func FilterTables(sd *tabletmanagerdatapb.SchemaDefinition, tables, excludeTable
 			copy.TableDefinitions = append(copy.TableDefinitions, table)
 		}
 	}
-
-	// Regenerate hash over tables because it may have changed.
-	if copy.Version != "" {
-		GenerateSchemaVersion(copy)
-	}
-
 	return copy, nil
-}
-
-// GenerateSchemaVersion return a unique schema version string based on
-// its TableDefinitions.
-func GenerateSchemaVersion(sd *tabletmanagerdatapb.SchemaDefinition) {
-	hasher := md5.New()
-	for _, td := range sd.TableDefinitions {
-		if _, err := hasher.Write([]byte(td.Schema)); err != nil {
-			panic(err) // extremely unlikely
-		}
-	}
-	sd.Version = hex.EncodeToString(hasher.Sum(nil))
 }
 
 // SchemaDefinitionGetTable returns TableDefinition for a given table name.
@@ -345,12 +300,13 @@ func DiffSchemaToArray(leftName string, left *tabletmanagerdatapb.SchemaDefiniti
 // SchemaChange contains all necessary information to apply a schema change.
 // It should not be sent over the wire, it's just a set of parameters.
 type SchemaChange struct {
-	SQL              string
-	Force            bool
-	AllowReplication bool
-	BeforeSchema     *tabletmanagerdatapb.SchemaDefinition
-	AfterSchema      *tabletmanagerdatapb.SchemaDefinition
-	SQLMode          string
+	SQL                     string
+	Force                   bool
+	AllowReplication        bool
+	BeforeSchema            *tabletmanagerdatapb.SchemaDefinition
+	AfterSchema             *tabletmanagerdatapb.SchemaDefinition
+	SQLMode                 string
+	DisableForeignKeyChecks bool
 }
 
 // Equal compares two SchemaChange objects.

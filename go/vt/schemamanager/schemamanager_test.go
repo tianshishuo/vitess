@@ -20,19 +20,25 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"vitess.io/vitess/go/vt/sqlparser"
 
 	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/mysqlctl/tmutils"
-	querypb "vitess.io/vitess/go/vt/proto/query"
-	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
-	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
 	"vitess.io/vitess/go/vt/topo/topoproto"
 	"vitess.io/vitess/go/vt/vttablet/faketmclient"
 	"vitess.io/vitess/go/vt/vttablet/tmclient"
+	"vitess.io/vitess/go/vt/vttablet/tmclienttest"
+
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 
 	// import the gRPC client implementation for tablet manager
 	_ "vitess.io/vitess/go/vt/vttablet/grpctmclient"
@@ -46,7 +52,7 @@ var (
 func init() {
 	// enforce we will use the right protocol (gRPC) (note the
 	// client is unused, but it is initialized, so it needs to exist)
-	*tmclient.TabletManagerProtocol = "grpc"
+	tmclienttest.SetProtocol("go.vt.schemamanager", "grpc")
 }
 
 func TestSchemaManagerControllerOpenFail(t *testing.T) {
@@ -55,10 +61,7 @@ func TestSchemaManagerControllerOpenFail(t *testing.T) {
 	ctx := context.Background()
 
 	_, err := Run(ctx, controller, newFakeExecutor(t))
-	if err != errControllerOpen {
-		t.Fatalf("controller.Open fail, should get error: %v, but get error: %v",
-			errControllerOpen, err)
-	}
+	require.ErrorIs(t, err, errControllerOpen)
 }
 
 func TestSchemaManagerControllerReadFail(t *testing.T) {
@@ -66,13 +69,8 @@ func TestSchemaManagerControllerReadFail(t *testing.T) {
 		[]string{"select * from test_db"}, false, true, false)
 	ctx := context.Background()
 	_, err := Run(ctx, controller, newFakeExecutor(t))
-	if err != errControllerRead {
-		t.Fatalf("controller.Read fail, should get error: %v, but get error: %v",
-			errControllerRead, err)
-	}
-	if !controller.onReadFailTriggered {
-		t.Fatalf("OnReadFail should be called")
-	}
+	require.ErrorIs(t, err, errControllerRead)
+	require.True(t, controller.onReadFailTriggered, "OnReadFail should be called")
 }
 
 func TestSchemaManagerValidationFail(t *testing.T) {
@@ -81,82 +79,56 @@ func TestSchemaManagerValidationFail(t *testing.T) {
 	ctx := context.Background()
 
 	_, err := Run(ctx, controller, newFakeExecutor(t))
-	if err == nil || !strings.Contains(err.Error(), "failed to parse sql") {
-		t.Fatalf("run schema change should fail due to executor.Validate fail, but got: %v", err)
-	}
+	require.ErrorContains(t, err, "failed to parse sql", "run schema change should fail due to executor.Validate fail")
 }
 
 func TestSchemaManagerExecutorOpenFail(t *testing.T) {
 	controller := newFakeController(
 		[]string{"create table test_table (pk int);"}, false, false, false)
 	controller.SetKeyspace("unknown_keyspace")
-	executor := NewTabletExecutor("TestSchemaManagerExecutorOpenFail", newFakeTopo(t), newFakeTabletManagerClient(), logutil.NewConsoleLogger(), testWaitReplicasTimeout)
+	executor := NewTabletExecutor("TestSchemaManagerExecutorOpenFail", newFakeTopo(t), newFakeTabletManagerClient(), logutil.NewConsoleLogger(), testWaitReplicasTimeout, 0, sqlparser.NewTestParser())
 	ctx := context.Background()
 
 	_, err := Run(ctx, controller, executor)
-	if err == nil || !strings.Contains(err.Error(), "unknown_keyspace") {
-		t.Fatalf("run schema change should fail due to executor.Open fail, but got: %v", err)
-	}
-}
-
-func TestSchemaManagerExecutorExecuteFail(t *testing.T) {
-	controller := newFakeController(
-		[]string{"create table test_table (pk int);"}, false, false, false)
-	executor := NewTabletExecutor("TestSchemaManagerExecutorExecuteFail", newFakeTopo(t), newFakeTabletManagerClient(), logutil.NewConsoleLogger(), testWaitReplicasTimeout)
-	ctx := context.Background()
-
-	_, err := Run(ctx, controller, executor)
-	if err == nil || !strings.Contains(err.Error(), "unknown database: vt_test_keyspace") {
-		t.Fatalf("run schema change should fail due to executor.Execute fail, but got: %v", err)
-	}
+	require.ErrorContains(t, err, "unknown_keyspace", "run schema change should fail due to executor.Open fail")
 }
 
 func TestSchemaManagerRun(t *testing.T) {
-	sql := "create table test_table (pk int)"
-	controller := newFakeController(
-		[]string{sql}, false, false, false)
-	fakeTmc := newFakeTabletManagerClient()
-	fakeTmc.AddSchemaChange(sql, &tabletmanagerdatapb.SchemaChangeResult{
-		BeforeSchema: &tabletmanagerdatapb.SchemaDefinition{},
-		AfterSchema: &tabletmanagerdatapb.SchemaDefinition{
-			DatabaseSchema: "CREATE DATABASE `{{.DatabaseName}}` /*!40100 DEFAULT CHARACTER SET utf8 */",
-			TableDefinitions: []*tabletmanagerdatapb.TableDefinition{
-				{
-					Name:   "test_table",
-					Schema: sql,
-					Type:   tmutils.TableBaseTable,
+	for _, batchSize := range []int{0, 1, 10} {
+		t.Run(fmt.Sprintf("batch-size=%d", batchSize), func(t *testing.T) {
+			sql := "create table test_table (pk int)"
+			controller := newFakeController(
+				[]string{sql}, false, false, false)
+			fakeTmc := newFakeTabletManagerClient()
+			fakeTmc.AddSchemaChange(sql, &tabletmanagerdatapb.SchemaChangeResult{
+				BeforeSchema: &tabletmanagerdatapb.SchemaDefinition{},
+				AfterSchema: &tabletmanagerdatapb.SchemaDefinition{
+					DatabaseSchema: "CREATE DATABASE `{{.DatabaseName}}` /*!40100 DEFAULT CHARACTER SET utf8 */",
+					TableDefinitions: []*tabletmanagerdatapb.TableDefinition{
+						{
+							Name:   "test_table",
+							Schema: sql,
+							Type:   tmutils.TableBaseTable,
+						},
+					},
 				},
-			},
-		},
-	})
+			})
 
-	fakeTmc.AddSchemaDefinition("vt_test_keyspace", &tabletmanagerdatapb.SchemaDefinition{})
-	executor := NewTabletExecutor("TestSchemaManagerRun", newFakeTopo(t), fakeTmc, logutil.NewConsoleLogger(), testWaitReplicasTimeout)
+			fakeTmc.AddSchemaDefinition("vt_test_keyspace", &tabletmanagerdatapb.SchemaDefinition{})
+			executor := NewTabletExecutor("TestSchemaManagerRun", newFakeTopo(t), fakeTmc, logutil.NewConsoleLogger(), testWaitReplicasTimeout, 0, sqlparser.NewTestParser())
 
-	ctx := context.Background()
-	resp, err := Run(ctx, controller, executor)
+			ctx := context.Background()
+			resp, err := Run(ctx, controller, executor)
 
-	if len(resp.UUIDs) > 0 {
-		t.Fatalf("response should contain an empty list of UUIDs, found %v", len(resp.UUIDs))
-	}
+			require.Lenf(t, resp.UUIDs, 0, "response should contain an empty list of UUIDs")
+			require.NoError(t, err)
 
-	if err != nil {
-		t.Fatalf("schema change should success but get error: %v", err)
-	}
-	if !controller.onReadSuccessTriggered {
-		t.Fatalf("OnReadSuccess should be called")
-	}
-	if controller.onReadFailTriggered {
-		t.Fatalf("OnReadFail should not be called")
-	}
-	if !controller.onValidationSuccessTriggered {
-		t.Fatalf("OnValidateSuccess should be called")
-	}
-	if controller.onValidationFailTriggered {
-		t.Fatalf("OnValidationFail should not be called")
-	}
-	if !controller.onExecutorCompleteTriggered {
-		t.Fatalf("OnExecutorComplete should be called")
+			require.True(t, controller.onReadSuccessTriggered, "OnReadSuccess should be called")
+			require.False(t, controller.onReadFailTriggered, "OnReadFail should not be called")
+			require.True(t, controller.onValidationSuccessTriggered, "OnValidateSuccess should be called")
+			require.False(t, controller.onValidationFailTriggered, "OnValidationFail should not be called")
+			require.True(t, controller.onExecutorCompleteTriggered, "OnExecutorComplete should be called")
+		})
 	}
 }
 
@@ -180,17 +152,61 @@ func TestSchemaManagerExecutorFail(t *testing.T) {
 
 	fakeTmc.AddSchemaDefinition("vt_test_keyspace", &tabletmanagerdatapb.SchemaDefinition{})
 	fakeTmc.EnableExecuteFetchAsDbaError = true
-	executor := NewTabletExecutor("TestSchemaManagerExecutorFail", newFakeTopo(t), fakeTmc, logutil.NewConsoleLogger(), testWaitReplicasTimeout)
+	executor := NewTabletExecutor("TestSchemaManagerExecutorFail", newFakeTopo(t), fakeTmc, logutil.NewConsoleLogger(), testWaitReplicasTimeout, 0, sqlparser.NewTestParser())
 
 	ctx := context.Background()
 	resp, err := Run(ctx, controller, executor)
-	if len(resp.UUIDs) > 0 {
-		t.Fatalf("response should contain an empty list of UUIDs, found %v", len(resp.UUIDs))
-	}
+	require.Lenf(t, resp.UUIDs, 0, "response should contain an empty list of UUIDs")
+	require.ErrorContains(t, err, "schema change failed", "schema change should fail")
+}
 
-	if err == nil || !strings.Contains(err.Error(), "schema change failed") {
-		t.Fatalf("schema change should fail, but got err: %v", err)
-	}
+func TestSchemaManagerExecutorBatchVsStrategyFail(t *testing.T) {
+	sql := "create table test_table (pk int)"
+	controller := newFakeController([]string{sql}, false, false, false)
+	fakeTmc := newFakeTabletManagerClient()
+
+	fakeTmc.AddSchemaDefinition("vt_test_keyspace", &tabletmanagerdatapb.SchemaDefinition{})
+	fakeTmc.EnableExecuteFetchAsDbaError = true
+	executor := NewTabletExecutor("TestSchemaManagerExecutorFail", newFakeTopo(t), fakeTmc, logutil.NewConsoleLogger(), testWaitReplicasTimeout, 10, sqlparser.NewTestParser())
+	executor.SetDDLStrategy("online")
+
+	ctx := context.Background()
+	_, err := Run(ctx, controller, executor)
+
+	assert.ErrorContains(t, err, "--batch-size requires 'direct'")
+}
+
+func TestSchemaManagerExecutorBatchVsQueriesFail(t *testing.T) {
+	sql := "alter table test_table force"
+	controller := newFakeController([]string{sql}, false, false, false)
+	fakeTmc := newFakeTabletManagerClient()
+
+	fakeTmc.AddSchemaDefinition("vt_test_keyspace", &tabletmanagerdatapb.SchemaDefinition{})
+	fakeTmc.EnableExecuteFetchAsDbaError = true
+	executor := NewTabletExecutor("TestSchemaManagerExecutorFail", newFakeTopo(t), fakeTmc, logutil.NewConsoleLogger(), testWaitReplicasTimeout, 10, sqlparser.NewTestParser())
+	executor.SetDDLStrategy("direct")
+
+	ctx := context.Background()
+	_, err := Run(ctx, controller, executor)
+
+	assert.ErrorContains(t, err, "--batch-size only allowed when all queries are CREATE")
+}
+
+func TestSchemaManagerExecutorBatchVsUUIDsFail(t *testing.T) {
+	sql := "create table test_table (pk int)"
+	controller := newFakeController([]string{sql}, false, false, false)
+	fakeTmc := newFakeTabletManagerClient()
+
+	fakeTmc.AddSchemaDefinition("vt_test_keyspace", &tabletmanagerdatapb.SchemaDefinition{})
+	fakeTmc.EnableExecuteFetchAsDbaError = true
+	executor := NewTabletExecutor("TestSchemaManagerExecutorFail", newFakeTopo(t), fakeTmc, logutil.NewConsoleLogger(), testWaitReplicasTimeout, 10, sqlparser.NewTestParser())
+	executor.SetDDLStrategy("direct")
+	executor.SetUUIDList([]string{"4e5dcf80_354b_11eb_82cd_f875a4d24e90"})
+
+	ctx := context.Background()
+	_, err := Run(ctx, controller, executor)
+
+	assert.ErrorContains(t, err, "--batch-size conflicts with --uuid-list")
 }
 
 func TestSchemaManagerRegisterControllerFactory(t *testing.T) {
@@ -199,23 +215,18 @@ func TestSchemaManagerRegisterControllerFactory(t *testing.T) {
 		"test_controller",
 		func(params map[string]string) (Controller, error) {
 			return newFakeController([]string{sql}, false, false, false), nil
-
 		})
 
 	_, err := GetControllerFactory("unknown")
-	if err == nil || !strings.Contains(err.Error(), "there is no data sourcer factory") {
-		t.Fatalf("controller factory is not registered, GetControllerFactory should return an error, but got: %v", err)
-	}
+	require.ErrorContains(t, err, "there is no data sourcer factory", "controller factory is not registered, GetControllerFactory should return an error")
+
 	_, err = GetControllerFactory("test_controller")
-	if err != nil {
-		t.Fatalf("GetControllerFactory should succeed, but get an error: %v", err)
-	}
+	require.NoError(t, err)
+
 	func() {
 		defer func() {
 			err := recover()
-			if err == nil {
-				t.Fatalf("RegisterControllerFactory should fail, it registers a registered ControllerFactory")
-			}
+			require.NotNil(t, err, "RegisterControllerFactory should fail, it registers a registered ControllerFactory")
 		}()
 		RegisterControllerFactory(
 			"test_controller",
@@ -227,7 +238,7 @@ func TestSchemaManagerRegisterControllerFactory(t *testing.T) {
 }
 
 func newFakeExecutor(t *testing.T) *TabletExecutor {
-	return NewTabletExecutor("newFakeExecutor", newFakeTopo(t), newFakeTabletManagerClient(), logutil.NewConsoleLogger(), testWaitReplicasTimeout)
+	return NewTabletExecutor("newFakeExecutor", newFakeTopo(t), newFakeTabletManagerClient(), logutil.NewConsoleLogger(), testWaitReplicasTimeout, 0, sqlparser.NewTestParser())
 }
 
 func newFakeTabletManagerClient() *fakeTabletManagerClient {
@@ -267,7 +278,7 @@ func (client *fakeTabletManagerClient) PreflightSchema(ctx context.Context, tabl
 	return result, nil
 }
 
-func (client *fakeTabletManagerClient) GetSchema(ctx context.Context, tablet *topodatapb.Tablet, tables, excludeTables []string, includeViews bool) (*tabletmanagerdatapb.SchemaDefinition, error) {
+func (client *fakeTabletManagerClient) GetSchema(ctx context.Context, tablet *topodatapb.Tablet, request *tabletmanagerdatapb.GetSchemaRequest) (*tabletmanagerdatapb.SchemaDefinition, error) {
 	result, ok := client.schemaDefinitions[topoproto.TabletDbName(tablet)]
 	if !ok {
 		return nil, fmt.Errorf("unknown database: %s", topoproto.TabletDbName(tablet))
@@ -275,11 +286,11 @@ func (client *fakeTabletManagerClient) GetSchema(ctx context.Context, tablet *to
 	return result, nil
 }
 
-func (client *fakeTabletManagerClient) ExecuteFetchAsDba(ctx context.Context, tablet *topodatapb.Tablet, usePool bool, query []byte, maxRows int, disableBinlogs, reloadSchema bool) (*querypb.QueryResult, error) {
+func (client *fakeTabletManagerClient) ExecuteFetchAsDba(ctx context.Context, tablet *topodatapb.Tablet, usePool bool, req *tabletmanagerdatapb.ExecuteFetchAsDbaRequest) (*querypb.QueryResult, error) {
 	if client.EnableExecuteFetchAsDbaError {
 		return nil, fmt.Errorf("ExecuteFetchAsDba occur an unknown error")
 	}
-	return client.TabletManagerClient.ExecuteFetchAsDba(ctx, tablet, usePool, query, maxRows, disableBinlogs, reloadSchema)
+	return client.TabletManagerClient.ExecuteFetchAsDba(ctx, tablet, usePool, req)
 }
 
 // newFakeTopo returns a topo with:
@@ -287,15 +298,16 @@ func (client *fakeTabletManagerClient) ExecuteFetchAsDba(ctx context.Context, ta
 // - 3 shards named '1', '2', '3'.
 // - A primary tablet for each shard.
 func newFakeTopo(t *testing.T) *topo.Server {
-	ts := memorytopo.NewServer("test_cell")
-	ctx := context.Background()
-	if err := ts.CreateKeyspace(ctx, "test_keyspace", &topodatapb.Keyspace{}); err != nil {
-		t.Fatalf("CreateKeyspace failed: %v", err)
-	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ts := memorytopo.NewServer(ctx, "test_cell")
+	err := ts.CreateKeyspace(ctx, "test_keyspace", &topodatapb.Keyspace{})
+	require.NoError(t, err)
+
 	for i, shard := range []string{"0", "1", "2"} {
-		if err := ts.CreateShard(ctx, "test_keyspace", shard); err != nil {
-			t.Fatalf("CreateShard(%v) failed: %v", shard, err)
-		}
+		err = ts.CreateShard(ctx, "test_keyspace", shard)
+		require.NoError(t, err)
+
 		tablet := &topodatapb.Tablet{
 			Alias: &topodatapb.TabletAlias{
 				Cell: "test_cell",
@@ -304,22 +316,23 @@ func newFakeTopo(t *testing.T) *topo.Server {
 			Keyspace: "test_keyspace",
 			Shard:    shard,
 		}
-		if err := ts.CreateTablet(ctx, tablet); err != nil {
-			t.Fatalf("CreateTablet failed: %v", err)
-		}
-		if _, err := ts.UpdateShardFields(ctx, "test_keyspace", shard, func(si *topo.ShardInfo) error {
+
+		err = ts.CreateTablet(ctx, tablet)
+		require.NoError(t, err)
+
+		_, err = ts.UpdateShardFields(ctx, "test_keyspace", shard, func(si *topo.ShardInfo) error {
 			si.Shard.PrimaryAlias = tablet.Alias
 			return nil
-		}); err != nil {
-			t.Fatalf("UpdateShardFields failed: %v", err)
-		}
+		})
+		require.NoError(t, err)
 	}
-	if err := ts.CreateKeyspace(ctx, "unsharded_keyspace", &topodatapb.Keyspace{}); err != nil {
-		t.Fatalf("CreateKeyspace failed: %v", err)
-	}
-	if err := ts.CreateShard(ctx, "unsharded_keyspace", "0"); err != nil {
-		t.Fatalf("CreateShard(%v) failed: %v", "0", err)
-	}
+
+	err = ts.CreateKeyspace(ctx, "unsharded_keyspace", &topodatapb.Keyspace{})
+	require.NoError(t, err)
+
+	err = ts.CreateShard(ctx, "unsharded_keyspace", "0")
+	require.NoError(t, err)
+
 	tablet := &topodatapb.Tablet{
 		Alias: &topodatapb.TabletAlias{
 			Cell: "test_cell",
@@ -328,15 +341,14 @@ func newFakeTopo(t *testing.T) *topo.Server {
 		Keyspace: "test_keyspace",
 		Shard:    "0",
 	}
-	if err := ts.CreateTablet(ctx, tablet); err != nil {
-		t.Fatalf("CreateTablet failed: %v", err)
-	}
-	if _, err := ts.UpdateShardFields(ctx, "unsharded_keyspace", "0", func(si *topo.ShardInfo) error {
+	err = ts.CreateTablet(ctx, tablet)
+	require.NoError(t, err)
+
+	_, err = ts.UpdateShardFields(ctx, "unsharded_keyspace", "0", func(si *topo.ShardInfo) error {
 		si.Shard.PrimaryAlias = tablet.Alias
 		return nil
-	}); err != nil {
-		t.Fatalf("UpdateShardFields failed: %v", err)
-	}
+	})
+	require.NoError(t, err)
 	return ts
 }
 

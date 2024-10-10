@@ -31,7 +31,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"path"
 	"strings"
@@ -40,15 +40,18 @@ import (
 	"testing"
 	"time"
 
-	"vitess.io/vitess/go/mysql"
-	"vitess.io/vitess/go/vt/log"
-	"vitess.io/vitess/go/vt/schema"
-
-	"vitess.io/vitess/go/test/endtoend/cluster"
-	"vitess.io/vitess/go/test/endtoend/onlineddl"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/mysql/sqlerror"
+	"vitess.io/vitess/go/test/endtoend/cluster"
+	"vitess.io/vitess/go/test/endtoend/onlineddl"
+	"vitess.io/vitess/go/test/endtoend/throttler"
+	"vitess.io/vitess/go/timer"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/schema"
+	vttablet "vitess.io/vitess/go/vt/vttablet/common"
 )
 
 type testcase struct {
@@ -64,10 +67,13 @@ type testcase struct {
 	expectAddedUniqueKeys int64
 	// expectRemovedUniqueKeys is the number of alleviated constraints
 	expectRemovedUniqueKeys int64
+	// autoIncInsert is a special case where we don't generate id values. It's a specific test case.
+	autoIncInsert bool
 }
 
 var (
 	clusterInstance      *cluster.LocalProcessCluster
+	primaryTablet        *cluster.Vttablet
 	vtParams             mysql.ConnParams
 	evaluatedMysqlParams *mysql.ConnParams
 
@@ -89,8 +95,8 @@ var (
 	}
 	createStatement = `
 		CREATE TABLE stress_test (
-			id bigint(20) not null,
-			id_negative bigint(20) not null,
+			id bigint not null,
+			id_negative bigint not null,
 			rand_text varchar(40) not null default '',
 			rand_num bigint unsigned not null,
 			nullable_num int default null,
@@ -107,6 +113,12 @@ var (
 			name:             "trivial PK",
 			prepareStatement: "",
 			alterStatement:   "engine=innodb",
+		},
+		{
+			name:             "autoinc PK",
+			prepareStatement: "modify id bigint not null auto_increment",
+			alterStatement:   "engine=innodb",
+			autoIncInsert:    true,
 		},
 		{
 			name:             "UK similar to PK, no PK",
@@ -127,73 +139,73 @@ var (
 		{
 			name:                    "negative UK, different PK",
 			prepareStatement:        "add unique key negative_uidx(id_negative)",
-			alterStatement:          "drop primary key, add primary key(rand_text(40))",
+			alterStatement:          "drop primary key, add primary key(rand_text)",
 			expectAddedUniqueKeys:   1,
 			expectRemovedUniqueKeys: 1,
 		},
 		{
 			name:                    "text UK, no PK",
-			prepareStatement:        "add unique key text_uidx(rand_text(40))",
+			prepareStatement:        "add unique key text_uidx(rand_text)",
 			alterStatement:          "drop primary key",
 			expectRemovedUniqueKeys: 1,
 		},
 		{
 			name:                    "text UK, different PK",
-			prepareStatement:        "add unique key text_uidx(rand_text(40))",
+			prepareStatement:        "add unique key text_uidx(rand_text)",
 			alterStatement:          "drop primary key, add primary key (id, id_negative)",
 			expectRemovedUniqueKeys: 1,
 		},
 		{
 			name:                    "compound UK 1 by text, no PK",
-			prepareStatement:        "add unique key compound_uidx(rand_text(40), id_negative)",
+			prepareStatement:        "add unique key compound_uidx(rand_text, id_negative)",
 			alterStatement:          "drop primary key",
 			expectRemovedUniqueKeys: 1,
 		},
 		{
 			name:                    "compound UK 2 by negative, no PK",
-			prepareStatement:        "add unique key compound_uidx(id_negative, rand_text(40))",
+			prepareStatement:        "add unique key compound_uidx(id_negative, rand_text)",
 			alterStatement:          "drop primary key",
 			expectRemovedUniqueKeys: 1,
 		},
 		{
 			name:                    "compound UK 3 by ascending int, no PK",
-			prepareStatement:        "add unique key compound_uidx(id, rand_num, rand_text(40))",
+			prepareStatement:        "add unique key compound_uidx(id, rand_num, rand_text)",
 			alterStatement:          "drop primary key",
 			expectRemovedUniqueKeys: 1,
 		},
 		{
 			name:                    "compound UK 4 by rand int, no PK",
-			prepareStatement:        "add unique key compound_uidx(rand_num, rand_text(40))",
+			prepareStatement:        "add unique key compound_uidx(rand_num, rand_text)",
 			alterStatement:          "drop primary key",
 			expectRemovedUniqueKeys: 1,
 		},
 		{
 			name:                    "compound UK 5 by rand int, different PK",
-			prepareStatement:        "add unique key compound_uidx(rand_num, rand_text(40))",
+			prepareStatement:        "add unique key compound_uidx(rand_num, rand_text)",
 			alterStatement:          "drop primary key, add primary key (id, id_negative)",
 			expectRemovedUniqueKeys: 1,
 		},
 		{
 			name:                    "multiple UK choices 1",
-			prepareStatement:        "add unique key compound_uidx(rand_num, rand_text(40)), add unique key negative_uidx(id_negative)",
+			prepareStatement:        "add unique key compound_uidx(rand_num, rand_text), add unique key negative_uidx(id_negative)",
 			alterStatement:          "drop primary key, add primary key(updates, id)",
 			expectRemovedUniqueKeys: 1,
 		},
 		{
 			name:                    "multiple UK choices 2",
-			prepareStatement:        "add unique key compound_uidx(rand_num, rand_text(40)), add unique key negative_uidx(id_negative)",
+			prepareStatement:        "add unique key compound_uidx(rand_num, rand_text), add unique key negative_uidx(id_negative)",
 			alterStatement:          "drop primary key, add primary key(id, id_negative)",
 			expectRemovedUniqueKeys: 1,
 		},
 		{
 			name:                    "multiple UK choices including nullable with PK",
-			prepareStatement:        "add unique key compound_uidx(rand_num, rand_text(40)), add unique key nullable_uidx(nullable_num, id_negative), add unique key negative_uidx(id_negative)",
+			prepareStatement:        "add unique key compound_uidx(rand_num, rand_text), add unique key nullable_uidx(nullable_num, id_negative), add unique key negative_uidx(id_negative)",
 			alterStatement:          "drop primary key, drop key negative_uidx, add primary key(id_negative)",
 			expectRemovedUniqueKeys: 1,
 		},
 		{
 			name:                    "multiple UK choices including nullable",
-			prepareStatement:        "add unique key compound_uidx(rand_num, rand_text(40)), add unique key nullable_uidx(nullable_num, id_negative), add unique key negative_uidx(id_negative)",
+			prepareStatement:        "add unique key compound_uidx(rand_num, rand_text), add unique key nullable_uidx(nullable_num, id_negative), add unique key negative_uidx(id_negative)",
 			alterStatement:          "drop primary key, add primary key(updates, id)",
 			expectRemovedUniqueKeys: 1,
 		},
@@ -231,14 +243,14 @@ var (
 		{
 			name:                    "different PRIMARY KEY, text",
 			prepareStatement:        "",
-			alterStatement:          "drop primary key, add primary key(rand_text(40))",
+			alterStatement:          "drop primary key, add primary key(rand_text)",
 			expectAddedUniqueKeys:   1,
 			expectRemovedUniqueKeys: 1,
 		},
 		{
 			name:                    "different PRIMARY KEY, rand",
 			prepareStatement:        "",
-			alterStatement:          "drop primary key, add primary key(rand_num, rand_text(40))",
+			alterStatement:          "drop primary key, add primary key(rand_num, rand_text)",
 			expectAddedUniqueKeys:   1,
 			expectRemovedUniqueKeys: 1,
 		},
@@ -251,42 +263,42 @@ var (
 		},
 		{
 			name:                    "different PRIMARY KEY, from text to int",
-			prepareStatement:        "drop primary key, add primary key(rand_text(40))",
+			prepareStatement:        "drop primary key, add primary key(rand_text)",
 			alterStatement:          "drop primary key, add primary key(id)",
 			expectAddedUniqueKeys:   1,
 			expectRemovedUniqueKeys: 1,
 		},
 		{
 			name:                    "different PRIMARY KEY, from text to rand",
-			prepareStatement:        "drop primary key, add primary key(rand_text(40))",
-			alterStatement:          "drop primary key, add primary key(rand_num, rand_text(40))",
+			prepareStatement:        "drop primary key, add primary key(rand_text)",
+			alterStatement:          "drop primary key, add primary key(rand_num, rand_text)",
 			expectRemovedUniqueKeys: 1,
 		},
 		{
 			name:                    "partially shared PRIMARY KEY 1",
 			prepareStatement:        "drop primary key, add primary key(id, id_negative)",
-			alterStatement:          "drop primary key, add primary key(id, rand_text(40))",
+			alterStatement:          "drop primary key, add primary key(id, rand_text)",
 			expectAddedUniqueKeys:   1,
 			expectRemovedUniqueKeys: 1,
 		},
 		{
 			name:                    "partially shared PRIMARY KEY 2",
 			prepareStatement:        "drop primary key, add primary key(id, id_negative)",
-			alterStatement:          "drop primary key, add primary key(id_negative, rand_text(40))",
+			alterStatement:          "drop primary key, add primary key(id_negative, rand_text)",
 			expectAddedUniqueKeys:   1,
 			expectRemovedUniqueKeys: 1,
 		},
 		{
 			name:                    "partially shared PRIMARY KEY 3",
 			prepareStatement:        "drop primary key, add primary key(id, id_negative)",
-			alterStatement:          "drop primary key, add primary key(rand_text(40), id)",
+			alterStatement:          "drop primary key, add primary key(rand_text, id)",
 			expectAddedUniqueKeys:   1,
 			expectRemovedUniqueKeys: 1,
 		},
 		{
 			name:                    "partially shared PRIMARY KEY 4",
 			prepareStatement:        "drop primary key, add primary key(id_negative, id)",
-			alterStatement:          "drop primary key, add primary key(rand_text(40), id)",
+			alterStatement:          "drop primary key, add primary key(rand_text, id)",
 			expectAddedUniqueKeys:   1,
 			expectRemovedUniqueKeys: 1,
 		},
@@ -300,7 +312,7 @@ var (
 		{
 			name:                    "no shared UK, multiple options",
 			prepareStatement:        "add unique key negative_uidx(id_negative)",
-			alterStatement:          "drop primary key, drop key negative_uidx, add primary key(rand_text(40)), add unique key negtext_uidx(id_negative, rand_text(40))",
+			alterStatement:          "drop primary key, drop key negative_uidx, add primary key(rand_text), add unique key negtext_uidx(id_negative, rand_text)",
 			expectAddedUniqueKeys:   1,
 			expectRemovedUniqueKeys: 2,
 		},
@@ -321,6 +333,9 @@ var (
 		alter table stress_test modify hint_col varchar(64) not null default '%s'
 	`
 
+	insertRowAutoIncStatement = `
+		INSERT IGNORE INTO stress_test (id, id_negative, rand_text, rand_num, op_order) VALUES (NULL, %d, concat(left(md5(%d), 8), '_', %d), floor(rand()*1000000), %d)
+	`
 	insertRowStatement = `
 		INSERT IGNORE INTO stress_test (id, id_negative, rand_text, rand_num, op_order) VALUES (%d, %d, concat(left(md5(%d), 8), '_', %d), floor(rand()*1000000), %d)
 	`
@@ -354,12 +369,17 @@ var (
 	truncateStatement = `
 		TRUNCATE TABLE stress_test
 	`
+	setSqlMode = `
+		set @@global.sql_mode='ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'
+	`
 )
 
 const (
 	maxTableRows                  = 4096
 	maxConcurrency                = 15
 	singleConnectionSleepInterval = 5 * time.Millisecond
+	periodicSleepPercent          = 10 // in the range (0,100). 10 means 10% sleep time throught the stress load.
+	waitForStatusTimeout          = 180 * time.Second
 )
 
 func resetOpOrder() {
@@ -375,17 +395,13 @@ func nextOpOrder() int64 {
 	return opOrder
 }
 
-func getTablet() *cluster.Vttablet {
-	return clusterInstance.Keyspaces[0].Shards[0].Vttablets[0]
-}
-
 func mysqlParams() *mysql.ConnParams {
 	if evaluatedMysqlParams != nil {
 		return evaluatedMysqlParams
 	}
 	evaluatedMysqlParams = &mysql.ConnParams{
 		Uname:      "vt_dba",
-		UnixSocket: path.Join(os.Getenv("VTDATAROOT"), fmt.Sprintf("/vt_%010d", getTablet().TabletUID), "/mysql.sock"),
+		UnixSocket: path.Join(os.Getenv("VTDATAROOT"), fmt.Sprintf("/vt_%010d", primaryTablet.TabletUID), "/mysql.sock"),
 		DbName:     fmt.Sprintf("vt_%s", keyspaceName),
 	}
 	return evaluatedMysqlParams
@@ -406,25 +422,26 @@ func TestMain(m *testing.M) {
 		}
 
 		clusterInstance.VtctldExtraArgs = []string{
-			"-schema_change_dir", schemaChangeDirectory,
-			"-schema_change_controller", "local",
-			"-schema_change_check_interval", "1",
-			"-online_ddl_check_interval", "3s",
+			"--schema_change_dir", schemaChangeDirectory,
+			"--schema_change_controller", "local",
+			"--schema_change_check_interval", "1s",
 		}
 
-		// -vstream_packet_size is set to a small value that ensures we get multiple stream iterations,
+		// --vstream_packet_size is set to a small value that ensures we get multiple stream iterations,
 		// thereby examining lastPK on vcopier side. We will be iterating tables using non-PK order throughout
 		// this test suite, and so the low setting ensures we hit the more interesting code paths.
 		clusterInstance.VtTabletExtraArgs = []string{
-			"-enable-lag-throttler",
-			"-throttle_threshold", "1s",
-			"-heartbeat_enable",
-			"-heartbeat_interval", "250ms",
-			"-migration_check_interval", "5s",
-			"-vstream_packet_size", "4096", // Keep this value small and below 10k to ensure multilple vstream iterations
+			"--heartbeat_interval", "250ms",
+			"--heartbeat_on_demand_duration", "5s",
+			"--migration_check_interval", "5s",
+			"--vstream_packet_size", "4096", // Keep this value small and below 10k to ensure multilple vstream iterations
+			"--watch_replication_stream",
+			// Test VPlayer batching mode.
+			fmt.Sprintf("--vreplication_experimental_flags=%d",
+				vttablet.VReplicationExperimentalFlagAllowNoBlobBinlogRowImage|vttablet.VReplicationExperimentalFlagOptimizeInserts|vttablet.VReplicationExperimentalFlagVPlayerBatching),
 		}
 		clusterInstance.VtGateExtraArgs = []string{
-			"-ddl_strategy", "online",
+			"--ddl_strategy", "online",
 		}
 
 		if err := clusterInstance.StartTopo(); err != nil {
@@ -442,8 +459,6 @@ func TestMain(m *testing.M) {
 		}
 
 		vtgateInstance := clusterInstance.NewVtgateInstance()
-		// set the gateway we want to use
-		vtgateInstance.GatewayImplementation = "tabletgateway"
 		// Start vtgate
 		if err := vtgateInstance.Setup(); err != nil {
 			return 1, err
@@ -466,11 +481,17 @@ func TestMain(m *testing.M) {
 
 }
 
-func TestSchemaChange(t *testing.T) {
+func TestVreplStressSchemaChanges(t *testing.T) {
 	defer cluster.PanicHandler(t)
 
 	shards = clusterInstance.Keyspaces[0].Shards
 	require.Equal(t, 1, len(shards))
+	require.Equal(t, 1, len(shards[0].Vttablets))
+	primaryTablet = shards[0].Vttablets[0]
+
+	_, err := primaryTablet.VttabletProcess.QueryTablet(setSqlMode, keyspaceName, true)
+	require.NoError(t, err)
+	throttler.EnableLagThrottlerAndWaitForStatus(t, clusterInstance)
 
 	for _, testcase := range testCases {
 		require.NotEmpty(t, testcase.name)
@@ -483,7 +504,7 @@ func TestSchemaChange(t *testing.T) {
 				}
 			})
 			t.Run("create schema", func(t *testing.T) {
-				assert.Equal(t, 1, len(clusterInstance.Keyspaces[0].Shards))
+				assert.Len(t, shards, 1)
 				testWithInitialSchema(t)
 			})
 			t.Run("prepare table", func(t *testing.T) {
@@ -498,7 +519,7 @@ func TestSchemaChange(t *testing.T) {
 			t.Run("migrate", func(t *testing.T) {
 				require.NotEmpty(t, testcase.alterStatement)
 
-				hintText := fmt.Sprintf("hint-after-alter-%d", rand.Int31n(int32(maxTableRows)))
+				hintText := fmt.Sprintf("hint-after-alter-%d", rand.Int32N(int32(maxTableRows)))
 				hintStatement := fmt.Sprintf(alterHintStatement, hintText)
 				fullStatement := fmt.Sprintf("%s, %s", hintStatement, testcase.alterStatement)
 
@@ -507,18 +528,20 @@ func TestSchemaChange(t *testing.T) {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					runMultipleConnections(ctx, t)
+					runMultipleConnections(ctx, t, testcase.autoIncInsert)
 				}()
 				uuid := testOnlineDDLStatement(t, fullStatement, onlineDDLStrategy, "vtgate", hintText)
 				expectStatus := schema.OnlineDDLStatusComplete
 				if testcase.expectFailure {
 					expectStatus = schema.OnlineDDLStatusFailed
 				}
+				status := onlineddl.WaitForMigrationStatus(t, &vtParams, shards, uuid, waitForStatusTimeout, expectStatus)
+				fmt.Printf("# Migration status (for debug purposes): <%s>\n", status)
 				onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, expectStatus)
 				cancel() // will cause runMultipleConnections() to terminate
 				wg.Wait()
 				if !testcase.expectFailure {
-					testCompareBeforeAfterTables(t)
+					testCompareBeforeAfterTables(t, testcase.autoIncInsert)
 				}
 
 				rs := onlineddl.ReadMigrations(t, &vtParams, uuid)
@@ -534,10 +557,10 @@ func TestSchemaChange(t *testing.T) {
 func testWithInitialSchema(t *testing.T) {
 	// Create the stress table
 	for _, statement := range cleanupStatements {
-		err := clusterInstance.VtctlclientProcess.ApplySchema(keyspaceName, statement)
+		err := clusterInstance.VtctldClientProcess.ApplySchema(keyspaceName, statement)
 		require.Nil(t, err)
 	}
-	err := clusterInstance.VtctlclientProcess.ApplySchema(keyspaceName, createStatement)
+	err := clusterInstance.VtctldClientProcess.ApplySchema(keyspaceName, createStatement)
 	require.Nil(t, err)
 
 	// Check if table is created
@@ -553,7 +576,7 @@ func testOnlineDDLStatement(t *testing.T, alterStatement string, ddlStrategy str
 		}
 	} else {
 		var err error
-		uuid, err = clusterInstance.VtctlclientProcess.ApplySchemaWithOutput(keyspaceName, alterStatement, cluster.VtctlClientParams{DDLStrategy: ddlStrategy})
+		uuid, err = clusterInstance.VtctldClientProcess.ApplySchemaWithOutput(keyspaceName, alterStatement, cluster.ApplySchemaParams{DDLStrategy: ddlStrategy})
 		assert.NoError(t, err)
 	}
 	uuid = strings.TrimSpace(uuid)
@@ -565,7 +588,7 @@ func testOnlineDDLStatement(t *testing.T, alterStatement string, ddlStrategy str
 
 	status := schema.OnlineDDLStatusComplete
 	if !strategySetting.Strategy.IsDirect() {
-		status = onlineddl.WaitForMigrationStatus(t, &vtParams, shards, uuid, 60*time.Second, schema.OnlineDDLStatusComplete, schema.OnlineDDLStatusFailed)
+		status = onlineddl.WaitForMigrationStatus(t, &vtParams, shards, uuid, waitForStatusTimeout, schema.OnlineDDLStatusComplete, schema.OnlineDDLStatusFailed)
 		fmt.Printf("# Migration status (for debug purposes): <%s>\n", status)
 	}
 
@@ -577,23 +600,38 @@ func testOnlineDDLStatement(t *testing.T, alterStatement string, ddlStrategy str
 
 // checkTable checks the number of tables in the first two shards.
 func checkTable(t *testing.T, showTableName string) {
-	for i := range clusterInstance.Keyspaces[0].Shards {
-		checkTablesCount(t, clusterInstance.Keyspaces[0].Shards[i].Vttablets[0], showTableName, 1)
+	for i := range shards {
+		checkTablesCount(t, shards[i].Vttablets[0], showTableName, 1)
 	}
 }
 
 // checkTablesCount checks the number of tables in the given tablet
 func checkTablesCount(t *testing.T, tablet *cluster.Vttablet, showTableName string, expectCount int) {
 	query := fmt.Sprintf(`show tables like '%%%s%%';`, showTableName)
-	queryResult, err := tablet.VttabletProcess.QueryTablet(query, keyspaceName, true)
-	require.Nil(t, err)
-	assert.Equal(t, expectCount, len(queryResult.Rows))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rowcount := 0
+	for {
+		queryResult, err := tablet.VttabletProcess.QueryTablet(query, keyspaceName, true)
+		require.Nil(t, err)
+		rowcount = len(queryResult.Rows)
+		if rowcount > 0 {
+			break
+		}
+
+		select {
+		case <-time.After(time.Second):
+		case <-ctx.Done():
+			break
+		}
+	}
+	assert.Equal(t, expectCount, rowcount)
 }
 
 // checkMigratedTables checks the CREATE STATEMENT of a table after migration
 func checkMigratedTable(t *testing.T, tableName, expectHint string) {
-	for i := range clusterInstance.Keyspaces[0].Shards {
-		createStatement := getCreateTableStatement(t, clusterInstance.Keyspaces[0].Shards[i].Vttablets[0], tableName)
+	for i := range shards {
+		createStatement := getCreateTableStatement(t, shards[i].Vttablets[0], tableName)
 		assert.Contains(t, createStatement, expectHint)
 	}
 }
@@ -609,9 +647,13 @@ func getCreateTableStatement(t *testing.T, tablet *cluster.Vttablet, tableName s
 	return statement
 }
 
-func generateInsert(t *testing.T, conn *mysql.Conn) error {
-	id := rand.Int31n(int32(maxTableRows))
+func generateInsert(t *testing.T, conn *mysql.Conn, autoIncInsert bool) error {
+	id := rand.Int32N(int32(maxTableRows))
 	query := fmt.Sprintf(insertRowStatement, id, -id, id, id, nextOpOrder())
+	if autoIncInsert {
+		id = rand.Int32()
+		query = fmt.Sprintf(insertRowAutoIncStatement, -id, id, id, nextOpOrder())
+	}
 	qr, err := conn.ExecuteFetch(query, 1000, true)
 	if err == nil && qr != nil {
 		assert.Less(t, qr.RowsAffected, uint64(2))
@@ -620,7 +662,7 @@ func generateInsert(t *testing.T, conn *mysql.Conn) error {
 }
 
 func generateUpdate(t *testing.T, conn *mysql.Conn) error {
-	id := rand.Int31n(int32(maxTableRows))
+	id := rand.Int32N(int32(maxTableRows))
 	query := fmt.Sprintf(updateRowStatement, nextOpOrder(), id)
 	qr, err := conn.ExecuteFetch(query, 1000, true)
 	if err == nil && qr != nil {
@@ -630,7 +672,7 @@ func generateUpdate(t *testing.T, conn *mysql.Conn) error {
 }
 
 func generateDelete(t *testing.T, conn *mysql.Conn) error {
-	id := rand.Int31n(int32(maxTableRows))
+	id := rand.Int32N(int32(maxTableRows))
 	query := fmt.Sprintf(deleteRowStatement, id)
 	qr, err := conn.ExecuteFetch(query, 1000, true)
 	if err == nil && qr != nil {
@@ -639,44 +681,64 @@ func generateDelete(t *testing.T, conn *mysql.Conn) error {
 	return err
 }
 
-func runSingleConnection(ctx context.Context, t *testing.T, done *int64) {
+func runSingleConnection(ctx context.Context, t *testing.T, autoIncInsert bool, done *int64) {
 	log.Infof("Running single connection")
 	conn, err := mysql.Connect(ctx, &vtParams)
 	require.Nil(t, err)
 	defer conn.Close()
 
-	_, err = conn.ExecuteFetch("set autocommit=1", 1000, true)
+	_, err = conn.ExecuteFetch("set autocommit=1", 1, false)
 	require.Nil(t, err)
-	_, err = conn.ExecuteFetch("set transaction isolation level read committed", 1000, true)
+	_, err = conn.ExecuteFetch("set transaction isolation level read committed", 1, false)
+	require.Nil(t, err)
+	_, err = conn.ExecuteFetch("set innodb_lock_wait_timeout=1", 1, false)
 	require.Nil(t, err)
 
+	periodicRest := timer.NewRateLimiter(time.Second)
+	defer periodicRest.Stop()
 	for {
 		if atomic.LoadInt64(done) == 1 {
 			log.Infof("Terminating single connection")
 			return
 		}
-		switch rand.Int31n(3) {
+		switch rand.Int32N(3) {
 		case 0:
-			err = generateInsert(t, conn)
+			err = generateInsert(t, conn, autoIncInsert)
 		case 1:
 			err = generateUpdate(t, conn)
 		case 2:
 			err = generateDelete(t, conn)
 		}
 		if err != nil {
-			if strings.Contains(err.Error(), "disallowed due to rule: enforce denied tables") {
-				err = nil
-			} else if strings.Contains(err.Error(), "doesn't exist") {
+			if strings.Contains(err.Error(), "doesn't exist") {
 				// Table renamed to _before, due to -vreplication-test-suite flag
 				err = nil
+			}
+			if sqlErr, ok := err.(*sqlerror.SQLError); ok {
+				switch sqlErr.Number() {
+				case sqlerror.ERLockDeadlock:
+					// That's fine. We create a lot of contention; some transactions will deadlock and
+					// rollback. It happens, and we can ignore those and keep on going.
+					err = nil
+				}
 			}
 		}
 		assert.Nil(t, err)
 		time.Sleep(singleConnectionSleepInterval)
+		// Most o fthe time, we want the load to be high, so as to create real stress and potentially
+		// expose bugs in vreplication (the objective of this test!).
+		// However, some platforms (GitHub CI) can suffocate from this load. We choose to keep the load
+		// high, when it runs, but then also take a periodic break and let the system recover.
+		// We prefer this over reducing the load in general. In our method here, we have full load 90% of
+		// the time, then relaxation 10% of the time.
+		periodicRest.Do(func() error {
+			time.Sleep(time.Second * periodicSleepPercent / 100)
+			return nil
+		})
 	}
 }
 
-func runMultipleConnections(ctx context.Context, t *testing.T) {
+func runMultipleConnections(ctx context.Context, t *testing.T, autoIncInsert bool) {
 	log.Infof("Running multiple connections")
 	var done int64
 	var wg sync.WaitGroup
@@ -684,7 +746,7 @@ func runMultipleConnections(ctx context.Context, t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			runSingleConnection(ctx, t, &done)
+			runSingleConnection(ctx, t, autoIncInsert, &done)
 		}()
 	}
 	<-ctx.Done()
@@ -709,7 +771,7 @@ func initTable(t *testing.T) {
 	require.Nil(t, err)
 
 	for i := 0; i < maxTableRows/2; i++ {
-		generateInsert(t, conn)
+		generateInsert(t, conn, false)
 	}
 	for i := 0; i < maxTableRows/4; i++ {
 		generateUpdate(t, conn)
@@ -733,7 +795,7 @@ func initTable(t *testing.T) {
 }
 
 // testCompareBeforeAfterTables validates that stress_test_before and stress_test_after contents are non empty and completely identical
-func testCompareBeforeAfterTables(t *testing.T) {
+func testCompareBeforeAfterTables(t *testing.T, autoIncInsert bool) {
 	var countBefore int64
 	{
 		// Validate after table is populated
@@ -743,8 +805,9 @@ func testCompareBeforeAfterTables(t *testing.T) {
 
 		countBefore = row.AsInt64("c", 0)
 		require.NotZero(t, countBefore)
-		require.Less(t, countBefore, int64(maxTableRows))
-
+		if !autoIncInsert {
+			require.Less(t, countBefore, int64(maxTableRows))
+		}
 		fmt.Printf("# count rows in table (before): %d\n", countBefore)
 	}
 	var countAfter int64
@@ -756,8 +819,9 @@ func testCompareBeforeAfterTables(t *testing.T) {
 
 		countAfter = row.AsInt64("c", 0)
 		require.NotZero(t, countAfter)
-		require.Less(t, countAfter, int64(maxTableRows))
-
+		if !autoIncInsert {
+			require.Less(t, countAfter, int64(maxTableRows))
+		}
 		fmt.Printf("# count rows in table (after): %d\n", countAfter)
 	}
 	{

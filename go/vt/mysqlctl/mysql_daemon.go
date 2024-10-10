@@ -18,12 +18,16 @@ package mysqlctl
 
 import (
 	"context"
+	"time"
 
 	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/mysql/replication"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/dbconnpool"
 	"vitess.io/vitess/go/vt/mysqlctl/tmutils"
+	"vitess.io/vitess/go/vt/proto/replicationdata"
 
+	mysqlctlpb "vitess.io/vitess/go/vt/proto/mysqlctl"
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
 )
@@ -32,44 +36,71 @@ import (
 type MysqlDaemon interface {
 	// methods related to mysql running or not
 	Start(ctx context.Context, cnf *Mycnf, mysqldArgs ...string) error
-	Shutdown(ctx context.Context, cnf *Mycnf, waitForMysqld bool) error
-	RunMysqlUpgrade() error
+	Shutdown(ctx context.Context, cnf *Mycnf, waitForMysqld bool, mysqlShutdownTimeout time.Duration) error
+	RunMysqlUpgrade(ctx context.Context) error
+	ApplyBinlogFile(ctx context.Context, req *mysqlctlpb.ApplyBinlogFileRequest) error
+	ReadBinlogFilesTimestamps(ctx context.Context, req *mysqlctlpb.ReadBinlogFilesTimestampsRequest) (*mysqlctlpb.ReadBinlogFilesTimestampsResponse, error)
 	ReinitConfig(ctx context.Context, cnf *Mycnf) error
 	Wait(ctx context.Context, cnf *Mycnf) error
+	WaitForDBAGrants(ctx context.Context, waitTime time.Duration) (err error)
 
 	// GetMysqlPort returns the current port mysql is listening on.
-	GetMysqlPort() (int32, error)
+	GetMysqlPort(ctx context.Context) (int32, error)
+
+	// GetServerID returns the servers ID.
+	GetServerID(ctx context.Context) (uint32, error)
+
+	// GetServerUUID returns the servers UUID
+	GetServerUUID(ctx context.Context) (string, error)
+
+	// GetGlobalStatusVars returns the server's global status variables asked for.
+	// An empty/nil variable name parameter slice means you want all of them.
+	GetGlobalStatusVars(ctx context.Context, variables []string) (map[string]string, error)
 
 	// replication related methods
-	StartReplication(hookExtraEnv map[string]string) error
-	RestartReplication(hookExtraEnv map[string]string) error
-	StartReplicationUntilAfter(ctx context.Context, pos mysql.Position) error
-	StopReplication(hookExtraEnv map[string]string) error
+	StartReplication(ctx context.Context, hookExtraEnv map[string]string) error
+	RestartReplication(ctx context.Context, hookExtraEnv map[string]string) error
+	StartReplicationUntilAfter(ctx context.Context, pos replication.Position) error
+	StopReplication(ctx context.Context, hookExtraEnv map[string]string) error
 	StopIOThread(ctx context.Context) error
-	ReplicationStatus() (mysql.ReplicationStatus, error)
-	PrimaryStatus(ctx context.Context) (mysql.PrimaryStatus, error)
-	SetSemiSyncEnabled(source, replica bool) error
-	SemiSyncEnabled() (source, replica bool)
-	SemiSyncReplicationStatus() (bool, error)
+	ReplicationStatus(ctx context.Context) (replication.ReplicationStatus, error)
+	PrimaryStatus(ctx context.Context) (replication.PrimaryStatus, error)
+	ReplicationConfiguration(ctx context.Context) (*replicationdata.Configuration, error)
+	GetGTIDPurged(ctx context.Context) (replication.Position, error)
+	SetSemiSyncEnabled(ctx context.Context, source, replica bool) error
+	SemiSyncEnabled(ctx context.Context) (source, replica bool)
+	SemiSyncExtensionLoaded(ctx context.Context) (mysql.SemiSyncType, error)
+	SemiSyncStatus(ctx context.Context) (source, replica bool)
+	SemiSyncClients(ctx context.Context) (count uint32)
+	SemiSyncSettings(ctx context.Context) (timeout uint64, numReplicas uint32)
+	SemiSyncReplicationStatus(ctx context.Context) (bool, error)
+	ResetReplicationParameters(ctx context.Context) error
+	GetBinlogInformation(ctx context.Context) (binlogFormat string, logEnabled bool, logReplicaUpdate bool, binlogRowImage string, err error)
+	GetGTIDMode(ctx context.Context) (gtidMode string, err error)
+	FlushBinaryLogs(ctx context.Context) (err error)
+	GetBinaryLogs(ctx context.Context) (binaryLogs []string, err error)
+	GetPreviousGTIDs(ctx context.Context, binlog string) (previousGtids string, err error)
 
 	// reparenting related methods
 	ResetReplication(ctx context.Context) error
-	PrimaryPosition() (mysql.Position, error)
-	IsReadOnly() (bool, error)
-	SetReadOnly(on bool) error
-	SetSuperReadOnly(on bool) error
-	SetReplicationPosition(ctx context.Context, pos mysql.Position) error
-	SetReplicationSource(ctx context.Context, host string, port int, stopReplicationBefore bool, startReplicationAfter bool) error
+	PrimaryPosition(ctx context.Context) (replication.Position, error)
+	IsReadOnly(ctx context.Context) (bool, error)
+	IsSuperReadOnly(ctx context.Context) (bool, error)
+	SetReadOnly(ctx context.Context, on bool) error
+	SetSuperReadOnly(ctx context.Context, on bool) (ResetSuperReadOnlyFunc, error)
+	SetReplicationPosition(ctx context.Context, pos replication.Position) error
+	SetReplicationSource(ctx context.Context, host string, port int32, heartbeatInterval float64, stopReplicationBefore bool, startReplicationAfter bool) error
 	WaitForReparentJournal(ctx context.Context, timeCreatedNS int64) error
 
-	WaitSourcePos(context.Context, mysql.Position) error
+	WaitSourcePos(context.Context, replication.Position) error
+	CatchupToGTID(context.Context, replication.Position) error
 
 	// Promote makes the current server the primary. It will not change
 	// the read_only state of the server.
-	Promote(map[string]string) (mysql.Position, error)
+	Promote(context.Context, map[string]string) (replication.Position, error)
 
 	// Schema related methods
-	GetSchema(ctx context.Context, dbName string, tables, excludeTables []string, includeViews bool) (*tabletmanagerdatapb.SchemaDefinition, error)
+	GetSchema(ctx context.Context, dbName string, request *tabletmanagerdatapb.GetSchemaRequest) (*tabletmanagerdatapb.SchemaDefinition, error)
 	GetColumns(ctx context.Context, dbName, table string) ([]*querypb.Field, []string, error)
 	GetPrimaryKeyColumns(ctx context.Context, dbName, table string) ([]string, error)
 	PreflightSchemaChange(ctx context.Context, dbName string, changes []string) ([]*tabletmanagerdatapb.SchemaChangeResult, error)
@@ -83,7 +114,16 @@ type MysqlDaemon interface {
 	GetAllPrivsConnection(ctx context.Context) (*dbconnpool.DBConnection, error)
 
 	// GetVersionString returns the database version as a string
-	GetVersionString() string
+	GetVersionString(ctx context.Context) (string, error)
+
+	// GetVersionComment returns the version comment
+	GetVersionComment(ctx context.Context) (string, error)
+
+	// HostMetrics returns some OS metrics
+	HostMetrics(ctx context.Context, cnf *Mycnf) (*mysqlctlpb.HostMetricsResponse, error)
+
+	// ExecuteSuperQuery executes a single query, no result
+	ExecuteSuperQuery(ctx context.Context, query string) error
 
 	// ExecuteSuperQueryList executes a list of queries, no result
 	ExecuteSuperQueryList(ctx context.Context, queryList []string) error
@@ -91,11 +131,12 @@ type MysqlDaemon interface {
 	// FetchSuperQuery executes one query, returns the result
 	FetchSuperQuery(ctx context.Context, query string) (*sqltypes.Result, error)
 
-	// EnableBinlogPlayback enables playback of binlog events
-	EnableBinlogPlayback() error
+	// AcquireGlobalReadLock acquires a global read lock and keeps the connection so
+	// as to release it with the function below.
+	AcquireGlobalReadLock(ctx context.Context) error
 
-	// DisableBinlogPlayback disable playback of binlog events
-	DisableBinlogPlayback() error
+	// ReleaseGlobalReadLock release a lock acquired with the connection from the above function.
+	ReleaseGlobalReadLock(ctx context.Context) error
 
 	// Close will close this instance of Mysqld. It will wait for all dba
 	// queries to be finished.

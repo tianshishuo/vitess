@@ -17,9 +17,8 @@ limitations under the License.
 package topo
 
 import (
-	"time"
-
 	"context"
+	"time"
 
 	"vitess.io/vitess/go/stats"
 	"vitess.io/vitess/go/vt/proto/vtrpc"
@@ -116,6 +115,19 @@ func (st *StatsConn) Get(ctx context.Context, filePath string) ([]byte, Version,
 	return bytes, version, err
 }
 
+// GetVersion is part of the Conn interface.
+func (st *StatsConn) GetVersion(ctx context.Context, filePath string, version int64) ([]byte, error) {
+	startTime := time.Now()
+	statsKey := []string{"GetVersion", st.cell}
+	defer topoStatsConnTimings.Record(statsKey, startTime)
+	bytes, err := st.conn.GetVersion(ctx, filePath, version)
+	if err != nil {
+		topoStatsConnErrors.Add(statsKey, int64(1))
+		return bytes, err
+	}
+	return bytes, err
+}
+
 // List is part of the Conn interface
 func (st *StatsConn) List(ctx context.Context, filePathPrefix string) ([]KVInfo, error) {
 	startTime := time.Now()
@@ -147,13 +159,52 @@ func (st *StatsConn) Delete(ctx context.Context, filePath string, version Versio
 
 // Lock is part of the Conn interface
 func (st *StatsConn) Lock(ctx context.Context, dirPath, contents string) (LockDescriptor, error) {
-	statsKey := []string{"Lock", st.cell}
+	return st.internalLock(ctx, dirPath, contents, Blocking, 0)
+}
+
+// LockWithTTL is part of the Conn interface
+func (st *StatsConn) LockWithTTL(ctx context.Context, dirPath, contents string, ttl time.Duration) (LockDescriptor, error) {
+	return st.internalLock(ctx, dirPath, contents, Blocking, ttl)
+}
+
+// LockName is part of the Conn interface
+func (st *StatsConn) LockName(ctx context.Context, dirPath, contents string) (LockDescriptor, error) {
+	return st.internalLock(ctx, dirPath, contents, Named, 0)
+}
+
+// TryLock is part of the topo.Conn interface. Its implementation is same as Lock
+func (st *StatsConn) TryLock(ctx context.Context, dirPath, contents string) (LockDescriptor, error) {
+	return st.internalLock(ctx, dirPath, contents, NonBlocking, 0)
+}
+
+// TryLock is part of the topo.Conn interface. Its implementation is same as Lock
+func (st *StatsConn) internalLock(ctx context.Context, dirPath, contents string, lockType LockType, ttl time.Duration) (LockDescriptor, error) {
+	statsKey := []string{"Lock", st.cell} // Also used for NonBlocking / TryLock
+	switch {
+	case lockType == Named:
+		statsKey[0] = "LockName"
+	case ttl != 0:
+		statsKey[0] = "LockWithTTL"
+	}
 	if st.readOnly {
 		return nil, vterrors.Errorf(vtrpc.Code_READ_ONLY, readOnlyErrorStrFormat, statsKey[0], dirPath)
 	}
 	startTime := time.Now()
 	defer topoStatsConnTimings.Record(statsKey, startTime)
-	res, err := st.conn.Lock(ctx, dirPath, contents)
+	var res LockDescriptor
+	var err error
+	switch lockType {
+	case NonBlocking:
+		res, err = st.conn.TryLock(ctx, dirPath, contents)
+	case Named:
+		res, err = st.conn.LockName(ctx, dirPath, contents)
+	default:
+		if ttl != 0 {
+			res, err = st.conn.LockWithTTL(ctx, dirPath, contents, ttl)
+		} else {
+			res, err = st.conn.Lock(ctx, dirPath, contents)
+		}
+	}
 	if err != nil {
 		topoStatsConnErrors.Add(statsKey, int64(1))
 		return res, err
@@ -162,25 +213,27 @@ func (st *StatsConn) Lock(ctx context.Context, dirPath, contents string) (LockDe
 }
 
 // Watch is part of the Conn interface
-func (st *StatsConn) Watch(ctx context.Context, filePath string) (current *WatchData, changes <-chan *WatchData, cancel CancelFunc) {
+func (st *StatsConn) Watch(ctx context.Context, filePath string) (current *WatchData, changes <-chan *WatchData, err error) {
 	startTime := time.Now()
 	statsKey := []string{"Watch", st.cell}
 	defer topoStatsConnTimings.Record(statsKey, startTime)
 	return st.conn.Watch(ctx, filePath)
 }
 
+func (st *StatsConn) WatchRecursive(ctx context.Context, path string) ([]*WatchDataRecursive, <-chan *WatchDataRecursive, error) {
+	startTime := time.Now()
+	statsKey := []string{"WatchRecursive", st.cell}
+	defer topoStatsConnTimings.Record(statsKey, startTime)
+	return st.conn.WatchRecursive(ctx, path)
+}
+
 // NewLeaderParticipation is part of the Conn interface
 func (st *StatsConn) NewLeaderParticipation(name, id string) (LeaderParticipation, error) {
 	startTime := time.Now()
-	// TODO(deepthi): delete after v13.0
-	deprecatedKey := []string{"NewMasterParticipation", st.cell}
-	defer topoStatsConnTimings.Record(deprecatedKey, startTime)
-
 	statsKey := []string{"NewLeaderParticipation", st.cell}
 	defer topoStatsConnTimings.Record(statsKey, startTime)
 	res, err := st.conn.NewLeaderParticipation(name, id)
 	if err != nil {
-		topoStatsConnErrors.Add(deprecatedKey, int64(1))
 		topoStatsConnErrors.Add(statsKey, int64(1))
 		return res, err
 	}

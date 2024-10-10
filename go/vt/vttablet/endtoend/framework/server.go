@@ -17,24 +17,24 @@ limitations under the License.
 package framework
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
 	"time"
 
+	"vitess.io/vitess/go/stats"
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/servenv"
 	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/vtenv"
 	"vitess.io/vitess/go/yaml2"
 
 	"vitess.io/vitess/go/vt/topo/memorytopo"
 	"vitess.io/vitess/go/vt/vterrors"
 
-	"context"
-
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/vt/dbconfigs"
-	"vitess.io/vitess/go/vt/vtgate/fakerpcvtgateconn"
-	"vitess.io/vitess/go/vt/vtgate/vtgateconn"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
 
@@ -49,8 +49,6 @@ var (
 	Server *tabletserver.TabletServer
 	// ServerAddress is the http URL for the server.
 	ServerAddress string
-	// ResolveChan is the channel that sends dtids that are to be resolved.
-	ResolveChan = make(chan string, 1)
 	// TopoServer is the topology for the server
 	TopoServer *topo.Server
 )
@@ -58,16 +56,7 @@ var (
 // StartCustomServer starts the server and initializes
 // all the global variables. This function should only be called
 // once at the beginning of the test.
-func StartCustomServer(connParams, connAppDebugParams mysql.ConnParams, dbName string, config *tabletenv.TabletConfig) error {
-	// Setup a fake vtgate server.
-	protocol := "resolveTest"
-	*vtgateconn.VtgateProtocol = protocol
-	vtgateconn.RegisterDialer(protocol, func(context.Context, string) (vtgateconn.Impl, error) {
-		return &txResolver{
-			FakeVTGateConn: fakerpcvtgateconn.FakeVTGateConn{},
-		}, nil
-	})
-
+func StartCustomServer(ctx context.Context, connParams, connAppDebugParams mysql.ConnParams, dbName string, cfg *tabletenv.TabletConfig) error {
 	dbcfgs := dbconfigs.NewTestDBConfigs(connParams, connAppDebugParams, dbName)
 
 	Target = &querypb.Target{
@@ -75,9 +64,10 @@ func StartCustomServer(connParams, connAppDebugParams mysql.ConnParams, dbName s
 		Shard:      "0",
 		TabletType: topodatapb.TabletType_PRIMARY,
 	}
-	TopoServer = memorytopo.NewServer("")
+	TopoServer = memorytopo.NewServer(ctx, "")
 
-	Server = tabletserver.NewTabletServer("", config, TopoServer, &topodatapb.TabletAlias{})
+	srvTopoCounts := stats.NewCountersWithSingleLabel("", "Resilient srvtopo server operations", "type")
+	Server = tabletserver.NewTabletServer(ctx, vtenv.NewTestEnv(), "", cfg, TopoServer, &topodatapb.TabletAlias{}, srvTopoCounts)
 	Server.Register()
 	err := Server.StartService(Target, dbcfgs, nil /* mysqld */)
 	if err != nil {
@@ -90,7 +80,12 @@ func StartCustomServer(connParams, connAppDebugParams mysql.ConnParams, dbName s
 		return vterrors.Wrap(err, "could not start listener")
 	}
 	ServerAddress = fmt.Sprintf("http://%s", ln.Addr().String())
-	go http.Serve(ln, nil)
+	go func() {
+		err := servenv.HTTPServe(ln)
+		if err != nil {
+			log.Errorf("HTTPServe failed: %v", err)
+		}
+	}()
 	for {
 		time.Sleep(10 * time.Millisecond)
 		response, err := http.Get(fmt.Sprintf("%s/debug/vars", ServerAddress))
@@ -105,37 +100,27 @@ func StartCustomServer(connParams, connAppDebugParams mysql.ConnParams, dbName s
 // StartServer starts the server and initializes
 // all the global variables. This function should only be called
 // once at the beginning of the test.
-func StartServer(connParams, connAppDebugParams mysql.ConnParams, dbName string) error {
+func StartServer(ctx context.Context, connParams, connAppDebugParams mysql.ConnParams, dbName string) error {
 	config := tabletenv.NewDefaultConfig()
 	config.StrictTableACL = true
 	config.TwoPCEnable = true
 	config.TwoPCAbandonAge = 1
-	config.TwoPCCoordinatorAddress = "fake"
 	config.HotRowProtection.Mode = tabletenv.Enable
 	config.TrackSchemaVersions = true
-	config.GracePeriods.ShutdownSeconds = 2
-	config.SignalSchemaChangeReloadIntervalSeconds = tabletenv.Seconds(2.1)
+	config.GracePeriods.Shutdown = 2 * time.Second
 	config.SignalWhenSchemaChange = true
-	config.Healthcheck.IntervalSeconds = 0.1
+	config.Healthcheck.Interval = 100 * time.Millisecond
+	config.Oltp.TxTimeout = 5 * time.Second
+	config.Olap.TxTimeout = 5 * time.Second
+	config.EnableViews = true
+	config.QueryCacheDoorkeeper = false
+	config.SchemaReloadInterval = 5 * time.Second
 	gotBytes, _ := yaml2.Marshal(config)
 	log.Infof("Config:\n%s", gotBytes)
-	return StartCustomServer(connParams, connAppDebugParams, dbName, config)
+	return StartCustomServer(ctx, connParams, connAppDebugParams, dbName, config)
 }
 
 // StopServer must be called once all the tests are done.
 func StopServer() {
 	Server.StopService()
-}
-
-// txReolver transmits dtids to be resolved through ResolveChan.
-type txResolver struct {
-	fakerpcvtgateconn.FakeVTGateConn
-}
-
-func (conn *txResolver) ResolveTransaction(ctx context.Context, dtid string) error {
-	select {
-	case ResolveChan <- dtid:
-	default:
-	}
-	return nil
 }

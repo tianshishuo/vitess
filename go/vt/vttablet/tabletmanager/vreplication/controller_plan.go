@@ -18,7 +18,10 @@ package vreplication
 
 import (
 	"fmt"
+	"strings"
 
+	"vitess.io/vitess/go/constants/sidecar"
+	"vitess.io/vitess/go/vt/discovery"
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
@@ -27,6 +30,9 @@ type controllerPlan struct {
 	query  string
 	opcode int
 
+	// tabletPickerOptions is set for updateQuery.
+	tabletPickerOptions discovery.TabletPickerOptions
+
 	// numInserts is set for insertQuery.
 	numInserts int
 
@@ -34,8 +40,11 @@ type controllerPlan struct {
 	selector string
 	applier  *sqlparser.ParsedQuery
 
-	// delCopyState is set of deletes.
+	// delCopyState deletes related copy state.
 	delCopyState *sqlparser.ParsedQuery
+
+	// delPostCopyAction deletes related post copy actions.
+	delPostCopyAction *sqlparser.ParsedQuery
 }
 
 const (
@@ -46,9 +55,90 @@ const (
 	reshardingJournalQuery
 )
 
+// A comment directive that you can include in your VReplication write
+// statements if you want to bypass the safety checks that ensure you are
+// being selective. The full comment directive looks like this:
+// delete /*vt+ ALLOW_UNSAFE_VREPLICATION_WRITE */ from _vt.vreplication
+const AllowUnsafeWriteCommentDirective = "ALLOW_UNSAFE_VREPLICATION_WRITE"
+
+// A comment directive that you need to include in your VReplication
+// statements if you want the controller to include non-serving tablets
+// in the execution plan (via tablet picker options). The full comment
+// directive looks like this:
+// update /*vt+ INCLUDE_NON_SERVING_TABLETS_IN_PLAN=1 */ _vt.vreplication set ...
+const IncludeNonServingTabletsCommentDirective = "INCLUDE_NON_SERVING_TABLETS_IN_PLAN"
+
+// Check that the given WHERE clause is using at least one of the specified
+// columns with an equality or in operator to ensure that it is being
+// properly selective and not unintentionally going to potentially affect
+// multiple workflows.
+// The engine's exec function -- used by the VReplicationExec RPC -- should
+// provide guardrails for data changing statements and if the user wants get
+// around them they can e.g. use the ExecuteFetchAsDba RPC.
+// If you as a developer truly do want to affect multiple workflows, you can
+// add a comment directive using the AllowUnsafeWriteCommentDirective constant.
+var isSelective = func(where *sqlparser.Where, columns ...*sqlparser.ColName) bool {
+	if where == nil {
+		return false
+	}
+	if len(columns) == 0 {
+		return true
+	}
+	selective := false
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (kontinue bool, err error) {
+		switch node := node.(type) {
+		case *sqlparser.ComparisonExpr:
+			column, ok := node.Left.(*sqlparser.ColName)
+			if !ok {
+				return true, nil
+			}
+			wantedColumn := false
+			for i := range columns {
+				if columns[i].Equal(column) {
+					wantedColumn = true
+					break
+				}
+			}
+			// If we found a desired column, check that it is being used with an
+			// equality operator OR an in clause, logically being equal to any
+			// of N things.
+			if wantedColumn &&
+				(node.Operator == sqlparser.EqualOp || node.Operator == sqlparser.InOp) {
+				selective = true  // This is a safe statement
+				return false, nil // We can stop walking
+			}
+		default:
+		}
+		return true, nil
+	}, where)
+	return selective
+}
+
+// tableSelectiveColumns is a map that can be used to declare
+// what selective columns should be used (one or more) in queries
+// against a table.
+var tableSelectiveColumns = map[string][]*sqlparser.ColName{
+	vreplicationTableName: {
+		{Name: sqlparser.NewIdentifierCI("id")},
+		{Name: sqlparser.NewIdentifierCI("workflow")},
+	},
+}
+
+// columnsAsCSV returns a comma-separated list of column names.
+func columnsAsCSV(columns []*sqlparser.ColName) string {
+	if len(columns) == 0 {
+		return ""
+	}
+	colsForError := make([]string, len(columns))
+	for i := range columns {
+		colsForError[i] = columns[i].Name.String()
+	}
+	return strings.Join(colsForError, ", ")
+}
+
 // buildControllerPlan parses the input query and returns an appropriate plan.
-func buildControllerPlan(query string) (*controllerPlan, error) {
-	stmt, err := sqlparser.Parse(query)
+func buildControllerPlan(query string, parser *sqlparser.Parser) (*controllerPlan, error) {
+	stmt, err := parser.Parse(query)
 	if err != nil {
 		return nil, err
 	}
@@ -73,7 +163,18 @@ func buildControllerPlan(query string) (*controllerPlan, error) {
 }
 
 func buildInsertPlan(ins *sqlparser.Insert) (*controllerPlan, error) {
-	switch sqlparser.String(ins.Table) {
+	// This should never happen.
+	if ins == nil {
+		return nil, fmt.Errorf("BUG: invalid nil INSERT statement found when building VReplication plan")
+	}
+	tableName, err := ins.Table.TableName()
+	if err != nil {
+		return nil, err
+	}
+	if tableName.Qualifier.String() != sidecar.GetName() && tableName.Qualifier.String() != sidecar.DefaultName {
+		return nil, fmt.Errorf("invalid database name: %s", tableName.Qualifier.String())
+	}
+	switch tableName.Name.String() {
 	case reshardingJournalTableName:
 		return &controllerPlan{
 			opcode: reshardingJournalQuery,
@@ -81,7 +182,7 @@ func buildInsertPlan(ins *sqlparser.Insert) (*controllerPlan, error) {
 	case vreplicationTableName:
 		// no-op
 	default:
-		return nil, fmt.Errorf("invalid table name: %v", sqlparser.String(ins.Table))
+		return nil, fmt.Errorf("invalid table name: %s", tableName.Name.String())
 	}
 	if ins.Action != sqlparser.InsertAct {
 		return nil, fmt.Errorf("unsupported construct: %v", sqlparser.String(ins))
@@ -126,15 +227,45 @@ func buildInsertPlan(ins *sqlparser.Insert) (*controllerPlan, error) {
 }
 
 func buildUpdatePlan(upd *sqlparser.Update) (*controllerPlan, error) {
-	switch sqlparser.String(upd.TableExprs) {
+	// This should never happen.
+	if upd == nil || len(upd.TableExprs) == 0 {
+		return nil, fmt.Errorf("BUG: invalid UPDATE statement found when building VReplication plan: %s",
+			sqlparser.String(upd))
+	}
+	tableExpr, ok := upd.TableExprs[0].(*sqlparser.AliasedTableExpr)
+	if !ok {
+		return nil, fmt.Errorf("invalid FROM construct: %v", sqlparser.String(upd.TableExprs[0]))
+	}
+	tableName, err := tableExpr.TableName()
+	if err != nil {
+		return nil, err
+	}
+	if tableName.Qualifier.String() != sidecar.GetName() && tableName.Qualifier.String() != sidecar.DefaultName {
+		return nil, fmt.Errorf("invalid database name: %s", tableName.Qualifier.String())
+	}
+	cp := &controllerPlan{
+		opcode: updateQuery,
+	}
+	switch tableName.Name.String() {
 	case reshardingJournalTableName:
 		return &controllerPlan{
 			opcode: reshardingJournalQuery,
 		}, nil
 	case vreplicationTableName:
-		// no-op
+		if upd.Comments == nil || upd.Comments.Directives() == nil || !upd.Comments.Directives().IsSet(AllowUnsafeWriteCommentDirective) {
+			if safe := isSelective(upd.Where, tableSelectiveColumns[vreplicationTableName]...); !safe {
+				return nil, fmt.Errorf("unsafe WHERE clause in update without the /*vt+ %s */ comment directive: %s; should be using = or in with at least one of the following columns: %s",
+					AllowUnsafeWriteCommentDirective, sqlparser.String(upd.Where), columnsAsCSV(tableSelectiveColumns[vreplicationTableName]))
+			}
+		}
+
+		if upd.Comments != nil && upd.Comments.Directives().IsSet(IncludeNonServingTabletsCommentDirective) {
+			cp.tabletPickerOptions = discovery.TabletPickerOptions{
+				IncludeNonServingTablets: true,
+			}
+		}
 	default:
-		return nil, fmt.Errorf("invalid table name: %v", sqlparser.String(upd.TableExprs))
+		return nil, fmt.Errorf("invalid table name: %s", tableName.Name.String())
 	}
 	if upd.OrderBy != nil || upd.Limit != nil {
 		return nil, fmt.Errorf("unsupported construct: %v", sqlparser.String(upd))
@@ -146,36 +277,55 @@ func buildUpdatePlan(upd *sqlparser.Update) (*controllerPlan, error) {
 	}
 
 	buf1 := sqlparser.NewTrackedBuffer(nil)
-	buf1.Myprintf("select id from %s%v", vreplicationTableName, upd.Where)
+	buf1.Myprintf("select id from %s.%s%v", sidecar.GetIdentifier(), vreplicationTableName, upd.Where)
 	upd.Where = &sqlparser.Where{
 		Type: sqlparser.WhereClause,
 		Expr: &sqlparser.ComparisonExpr{
-			Left:     &sqlparser.ColName{Name: sqlparser.NewColIdent("id")},
+			Left:     &sqlparser.ColName{Name: sqlparser.NewIdentifierCI("id")},
 			Operator: sqlparser.InOp,
 			Right:    sqlparser.ListArg("ids"),
 		},
 	}
+	cp.selector = buf1.String()
 
 	buf2 := sqlparser.NewTrackedBuffer(nil)
 	buf2.Myprintf("%v", upd)
+	cp.applier = buf2.ParsedQuery()
 
-	return &controllerPlan{
-		opcode:   updateQuery,
-		selector: buf1.String(),
-		applier:  buf2.ParsedQuery(),
-	}, nil
+	return cp, nil
 }
 
 func buildDeletePlan(del *sqlparser.Delete) (*controllerPlan, error) {
-	switch sqlparser.String(del.TableExprs) {
+	// This should never happen.
+	if del == nil || len(del.TableExprs) == 0 {
+		return nil, fmt.Errorf("BUG: invalid DELETE statement found when building VReplication plan: %s",
+			sqlparser.String(del))
+	}
+	tableExpr, ok := del.TableExprs[0].(*sqlparser.AliasedTableExpr)
+	if !ok {
+		return nil, fmt.Errorf("invalid FROM construct: %v", sqlparser.String(del.TableExprs[0]))
+	}
+	tableName, err := tableExpr.TableName()
+	if err != nil {
+		return nil, err
+	}
+	if tableName.Qualifier.String() != sidecar.GetName() && tableName.Qualifier.String() != sidecar.DefaultName {
+		return nil, fmt.Errorf("invalid database name: %s", tableName.Qualifier.String())
+	}
+	switch tableName.Name.String() {
 	case reshardingJournalTableName:
 		return &controllerPlan{
 			opcode: reshardingJournalQuery,
 		}, nil
 	case vreplicationTableName:
-		// no-op
+		if del.Comments == nil || del.Comments.Directives() == nil || !del.Comments.Directives().IsSet(AllowUnsafeWriteCommentDirective) {
+			if safe := isSelective(del.Where, tableSelectiveColumns[vreplicationTableName]...); !safe {
+				return nil, fmt.Errorf("unsafe WHERE clause in delete without the /*vt+ %s */ comment directive: %s; should be using = or in with at least one of the following columns: %s",
+					AllowUnsafeWriteCommentDirective, sqlparser.String(del.Where), columnsAsCSV(tableSelectiveColumns[vreplicationTableName]))
+			}
+		}
 	default:
-		return nil, fmt.Errorf("invalid table name: %v", sqlparser.String(del.TableExprs))
+		return nil, fmt.Errorf("invalid table name: %s", tableName.Name.String())
 	}
 	if del.Targets != nil {
 		return nil, fmt.Errorf("unsupported construct: %v", sqlparser.String(del))
@@ -188,11 +338,11 @@ func buildDeletePlan(del *sqlparser.Delete) (*controllerPlan, error) {
 	}
 
 	buf1 := sqlparser.NewTrackedBuffer(nil)
-	buf1.Myprintf("select id from %s%v", vreplicationTableName, del.Where)
+	buf1.Myprintf("select id from %s.%s%v", sidecar.GetIdentifier(), vreplicationTableName, del.Where)
 	del.Where = &sqlparser.Where{
 		Type: sqlparser.WhereClause,
 		Expr: &sqlparser.ComparisonExpr{
-			Left:     &sqlparser.ColName{Name: sqlparser.NewColIdent("id")},
+			Left:     &sqlparser.ColName{Name: sqlparser.NewIdentifierCI("id")},
 			Operator: sqlparser.InOp,
 			Right:    sqlparser.ListArg("ids"),
 		},
@@ -204,29 +354,49 @@ func buildDeletePlan(del *sqlparser.Delete) (*controllerPlan, error) {
 	copyStateWhere := &sqlparser.Where{
 		Type: sqlparser.WhereClause,
 		Expr: &sqlparser.ComparisonExpr{
-			Left:     &sqlparser.ColName{Name: sqlparser.NewColIdent("vrepl_id")},
+			Left:     &sqlparser.ColName{Name: sqlparser.NewIdentifierCI("vrepl_id")},
 			Operator: sqlparser.InOp,
 			Right:    sqlparser.ListArg("ids"),
 		},
 	}
 	buf3 := sqlparser.NewTrackedBuffer(nil)
-	buf3.Myprintf("delete from %s%v", copyStateTableName, copyStateWhere)
+	buf3.Myprintf("delete from %s.%s%v", sidecar.GetIdentifier(), copyStateTableName, copyStateWhere)
+
+	buf4 := sqlparser.NewTrackedBuffer(nil)
+	buf4.Myprintf("delete from %s.%s%v", sidecar.GetIdentifier(), postCopyActionTableName, copyStateWhere)
 
 	return &controllerPlan{
-		opcode:       deleteQuery,
-		selector:     buf1.String(),
-		applier:      buf2.ParsedQuery(),
-		delCopyState: buf3.ParsedQuery(),
+		opcode:            deleteQuery,
+		selector:          buf1.String(),
+		applier:           buf2.ParsedQuery(),
+		delCopyState:      buf3.ParsedQuery(),
+		delPostCopyAction: buf4.ParsedQuery(),
 	}, nil
 }
 
 func buildSelectPlan(sel *sqlparser.Select) (*controllerPlan, error) {
-	switch sqlparser.ToString(sel.From) {
+	// This should never happen.
+	if sel == nil || len(sel.From) == 0 {
+		return nil, fmt.Errorf("BUG: invalid SELECT statement found when building VReplication plan: %s",
+			sqlparser.String(sel))
+	}
+	tableExpr, ok := sel.From[0].(*sqlparser.AliasedTableExpr)
+	if !ok {
+		return nil, fmt.Errorf("invalid FROM construct: %v", sqlparser.String(sel.From[0]))
+	}
+	tableName, err := tableExpr.TableName()
+	if err != nil {
+		return nil, err
+	}
+	if tableName.Qualifier.String() != sidecar.GetName() && tableName.Qualifier.String() != sidecar.DefaultName {
+		return nil, fmt.Errorf("invalid database name: %s", tableName.Qualifier.String())
+	}
+	switch tableName.Name.String() {
 	case vreplicationTableName, reshardingJournalTableName, copyStateTableName, vreplicationLogTableName:
 		return &controllerPlan{
 			opcode: selectQuery,
 		}, nil
 	default:
-		return nil, fmt.Errorf("invalid table name: %v", sqlparser.ToString(sel.From))
+		return nil, fmt.Errorf("invalid table name: %s", tableName.Name.String())
 	}
 }

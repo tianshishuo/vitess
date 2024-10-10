@@ -17,9 +17,8 @@ limitations under the License.
 package key
 
 import (
-	"bytes"
 	"encoding/hex"
-	"math/rand"
+	"math/rand/v2"
 	"sort"
 	"strings"
 
@@ -48,7 +47,7 @@ type Destination interface {
 
 // DestinationsString returns a printed version of the destination array.
 func DestinationsString(destinations []Destination) string {
-	var buffer bytes.Buffer
+	var buffer strings.Builder
 	buffer.WriteString("Destinations:")
 	for i, d := range destinations {
 		if i > 0 {
@@ -128,7 +127,7 @@ func (d DestinationExactKeyRange) String() string {
 
 func processExactKeyRange(allShards []*topodatapb.ShardReference, kr *topodatapb.KeyRange, addShard func(shard string) error) error {
 	sort.SliceStable(allShards, func(i, j int) bool {
-		return KeyRangeStartSmaller(allShards[i].GetKeyRange(), allShards[j].GetKeyRange())
+		return KeyRangeLess(allShards[i].GetKeyRange(), allShards[j].GetKeyRange())
 	})
 
 	shardnum := 0
@@ -139,7 +138,7 @@ func processExactKeyRange(allShards []*topodatapb.ShardReference, kr *topodatapb
 		shardnum++
 	}
 	for shardnum < len(allShards) {
-		if !KeyRangesIntersect(kr, allShards[shardnum].KeyRange) {
+		if !KeyRangeIntersect(kr, allShards[shardnum].KeyRange) {
 			// If we are over the requested keyrange, we
 			// can stop now, we won't find more.
 			break
@@ -153,40 +152,6 @@ func processExactKeyRange(allShards []*topodatapb.ShardReference, kr *topodatapb
 		shardnum++
 	}
 	return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "keyrange %v does not exactly match shards", KeyRangeString(kr))
-}
-
-//
-// DestinationExactKeyRanges
-//
-
-// DestinationExactKeyRanges is the destination for multiple KeyRanges.
-// The KeyRanges must map exactly to one or more shards, and cannot
-// start or end in the middle of a shard.
-// It implements the Destination interface.
-type DestinationExactKeyRanges []*topodatapb.KeyRange
-
-// Resolve is part of the Destination interface.
-func (d DestinationExactKeyRanges) Resolve(allShards []*topodatapb.ShardReference, addShard func(shard string) error) error {
-	for _, kr := range d {
-		if err := processExactKeyRange(allShards, kr, addShard); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// String is part of the Destination interface.
-func (d DestinationExactKeyRanges) String() string {
-	var buffer bytes.Buffer
-	buffer.WriteString("DestinationExactKeyRanges(")
-	for i, kr := range d {
-		if i > 0 {
-			buffer.WriteByte(',')
-		}
-		buffer.WriteString(KeyRangeString(kr))
-	}
-	buffer.WriteByte(')')
-	return buffer.String()
 }
 
 //
@@ -215,7 +180,7 @@ func (d DestinationKeyRange) String() string {
 
 func processKeyRange(allShards []*topodatapb.ShardReference, kr *topodatapb.KeyRange, addShard func(shard string) error) error {
 	for _, shard := range allShards {
-		if !KeyRangesIntersect(kr, shard.KeyRange) {
+		if !KeyRangeIntersect(kr, shard.KeyRange) {
 			// We don't need that shard.
 			continue
 		}
@@ -224,38 +189,6 @@ func processKeyRange(allShards []*topodatapb.ShardReference, kr *topodatapb.KeyR
 		}
 	}
 	return nil
-}
-
-//
-// DestinationKeyRanges
-//
-
-// DestinationKeyRanges is the destination for multiple KeyRanges.
-// It implements the Destination interface.
-type DestinationKeyRanges []*topodatapb.KeyRange
-
-// Resolve is part of the Destination interface.
-func (d DestinationKeyRanges) Resolve(allShards []*topodatapb.ShardReference, addShard func(shard string) error) error {
-	for _, kr := range d {
-		if err := processKeyRange(allShards, kr, addShard); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// String is part of the Destination interface.
-func (d DestinationKeyRanges) String() string {
-	var buffer bytes.Buffer
-	buffer.WriteString("DestinationKeyRanges(")
-	for i, kr := range d {
-		if i > 0 {
-			buffer.WriteByte(',')
-		}
-		buffer.WriteString(KeyRangeString(kr))
-	}
-	buffer.WriteByte(')')
-	return buffer.String()
 }
 
 //
@@ -318,7 +251,7 @@ func (d DestinationKeyspaceIDs) Resolve(allShards []*topodatapb.ShardReference, 
 
 // String is part of the Destination interface.
 func (d DestinationKeyspaceIDs) String() string {
-	var buffer bytes.Buffer
+	var buffer strings.Builder
 	buffer.WriteString("DestinationKeyspaceIDs(")
 	for i, ksid := range d {
 		if i > 0 {
@@ -341,7 +274,7 @@ type DestinationAnyShardPickerRandomShard struct{}
 
 // PickShard is DestinationAnyShardPickerRandomShard's implementation.
 func (dp DestinationAnyShardPickerRandomShard) PickShard(shardCount int) int {
-	return rand.Intn(shardCount)
+	return rand.IntN(shardCount)
 }
 
 //

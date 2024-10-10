@@ -20,7 +20,8 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
+	"net/http"
 	"os"
 	"path"
 	"strings"
@@ -30,11 +31,14 @@ import (
 	"time"
 
 	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/mysql/capabilities"
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/schema"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/throttle/throttlerapp"
 
 	"vitess.io/vitess/go/test/endtoend/cluster"
 	"vitess.io/vitess/go/test/endtoend/onlineddl"
+	"vitess.io/vitess/go/test/endtoend/throttler"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -83,8 +87,10 @@ deletesAttempts=%d, deletesFailures=%d, deletesNoops=%d, deletes=%d,
 
 var (
 	clusterInstance *cluster.LocalProcessCluster
+	primaryTablet   *cluster.Vttablet
 	shards          []cluster.Shard
 	vtParams        mysql.ConnParams
+	mysqlVersion    string
 
 	hostname              = "localhost"
 	keyspaceName          = "ks"
@@ -93,34 +99,7 @@ var (
 	tableName             = `stress_test`
 	viewBaseTableName     = `view_base_table_test`
 	viewName              = `view_test`
-	createStatement       = `
-		CREATE TABLE stress_test (
-			id bigint(20) not null,
-			rand_val varchar(32) null default '',
-			hint_col varchar(64) not null default 'just-created',
-			created_timestamp timestamp not null default current_timestamp,
-			updates int unsigned not null default 0,
-			PRIMARY KEY (id),
-			key created_idx(created_timestamp),
-			key updates_idx(updates)
-		) ENGINE=InnoDB
-	`
-	createIfNotExistsStatement = `
-		CREATE TABLE IF NOT EXISTS stress_test (
-			id bigint(20) not null,
-			PRIMARY KEY (id)
-		) ENGINE=InnoDB
-	`
-	dropStatement = `
-		DROP TABLE stress_test
-	`
-	dropIfExistsStatement = `
-		DROP TABLE IF EXISTS stress_test
-	`
-	alterHintStatement = `
-		ALTER TABLE stress_test modify hint_col varchar(64) not null default '%s'
-	`
-	insertRowStatement = `
+	insertRowStatement    = `
 		INSERT IGNORE INTO stress_test (id, rand_val) VALUES (%d, left(md5(rand()), 8))
 	`
 	updateRowStatement = `
@@ -137,25 +116,6 @@ var (
 		TRUNCATE TABLE stress_test
 	`
 
-	createViewBaseTableStatement = `
-		CREATE TABLE view_base_table_test (id INT PRIMARY KEY)
-	`
-	createViewStatement = `
-		CREATE VIEW view_test AS SELECT 'success_create' AS msg FROM view_base_table_test
-	`
-	createOrReplaceViewStatement = `
-		CREATE OR REPLACE VIEW view_test AS SELECT 'success_replace' AS msg FROM view_base_table_test
-	`
-	alterViewStatement = `
-		ALTER VIEW view_test AS SELECT 'success_alter' AS msg FROM view_base_table_test
-	`
-	dropViewStatement = `
-		DROP VIEW view_test
-	`
-	dropViewIfExistsStatement = `
-		DROP VIEW IF EXISTS view_test
-	`
-
 	writeMetrics WriteMetrics
 )
 
@@ -163,6 +123,18 @@ const (
 	maxTableRows   = 4096
 	maxConcurrency = 5
 )
+
+type revertibleTestCase struct {
+	name       string
+	fromSchema string
+	toSchema   string
+	// expectProblems              bool
+	removedForeignKeyNames      string
+	removedUniqueKeyNames       string
+	droppedNoDefaultColumnNames string
+	expandedColumnNames         string
+	onlyIfFKOnlineDDLPossible   bool
+}
 
 func TestMain(m *testing.M) {
 	defer cluster.PanicHandler(nil)
@@ -179,21 +151,19 @@ func TestMain(m *testing.M) {
 		}
 
 		clusterInstance.VtctldExtraArgs = []string{
-			"-schema_change_dir", schemaChangeDirectory,
-			"-schema_change_controller", "local",
-			"-schema_change_check_interval", "1",
-			"-online_ddl_check_interval", "3s",
+			"--schema_change_dir", schemaChangeDirectory,
+			"--schema_change_controller", "local",
+			"--schema_change_check_interval", "1s",
 		}
 
 		clusterInstance.VtTabletExtraArgs = []string{
-			"-enable-lag-throttler",
-			"-throttle_threshold", "1s",
-			"-heartbeat_enable",
-			"-heartbeat_interval", "250ms",
-			"-migration_check_interval", "5s",
+			"--heartbeat_interval", "250ms",
+			"--heartbeat_on_demand_duration", "5s",
+			"--migration_check_interval", "5s",
+			"--watch_replication_stream",
 		}
 		clusterInstance.VtGateExtraArgs = []string{
-			"-ddl_strategy", "online",
+			"--ddl_strategy", "online",
 		}
 
 		if err := clusterInstance.StartTopo(); err != nil {
@@ -211,8 +181,6 @@ func TestMain(m *testing.M) {
 		}
 
 		vtgateInstance := clusterInstance.NewVtgateInstance()
-		// set the gateway we want to use
-		vtgateInstance.GatewayImplementation = "tabletgateway"
 		// Start vtgate
 		if err := vtgateInstance.Setup(); err != nil {
 			return 1, err
@@ -223,7 +191,7 @@ func TestMain(m *testing.M) {
 			Host: clusterInstance.Hostname,
 			Port: clusterInstance.VtgateMySQLPort,
 		}
-
+		primaryTablet = clusterInstance.Keyspaces[0].Shards[0].PrimaryTablet()
 		return m.Run(), nil
 	}()
 	if err != nil {
@@ -235,10 +203,377 @@ func TestMain(m *testing.M) {
 
 }
 
-func TestSchemaChange(t *testing.T) {
+func TestRevertSchemaChanges(t *testing.T) {
 	defer cluster.PanicHandler(t)
 	shards = clusterInstance.Keyspaces[0].Shards
 	require.Equal(t, 1, len(shards))
+
+	throttler.EnableLagThrottlerAndWaitForStatus(t, clusterInstance)
+	throttler.WaitForCheckThrottlerResult(t, clusterInstance, primaryTablet, throttlerapp.TestingName, nil, http.StatusOK, time.Minute)
+
+	t.Run("revertible", testRevertible)
+	t.Run("revert", testRevert)
+}
+
+func testRevertible(t *testing.T) {
+
+	fkOnlineDDLPossible := false
+	t.Run("check 'rename_table_preserve_foreign_key' variable", func(t *testing.T) {
+		// Online DDL is not possible on vanilla MySQL 8.0 for reasons described in https://vitess.io/blog/2021-06-15-online-ddl-why-no-fk/.
+		// However, Online DDL is made possible in via these changes:
+		// - https://github.com/planetscale/mysql-server/commit/bb777e3e86387571c044fb4a2beb4f8c60462ced
+		// - https://github.com/planetscale/mysql-server/commit/c2f1344a6863518d749f2eb01a4c74ca08a5b889
+		// as part of https://github.com/planetscale/mysql-server/releases/tag/8.0.34-ps3.
+		// Said changes introduce a new global/session boolean variable named 'rename_table_preserve_foreign_key'. It defaults 'false'/0 for backwards compatibility.
+		// When enabled, a `RENAME TABLE` to a FK parent "pins" the children's foreign keys to the table name rather than the table pointer. Which means after the RENAME,
+		// the children will point to the newly instated table rather than the original, renamed table.
+		// (Note: this applies to a particular type of RENAME where we swap tables, see the above blog post).
+		// For FK children, the MySQL changes simply ignore any Vitess-internal table.
+		//
+		// In this stress test, we enable Online DDL if the variable 'rename_table_preserve_foreign_key' is present. The Online DDL mechanism will in turn
+		// query for this variable, and manipulate it, when starting the migration and when cutting over.
+		rs, err := shards[0].Vttablets[0].VttabletProcess.QueryTablet("show global variables like 'rename_table_preserve_foreign_key'", keyspaceName, false)
+		require.NoError(t, err)
+		fkOnlineDDLPossible = len(rs.Rows) > 0
+		t.Logf("MySQL support for 'rename_table_preserve_foreign_key': %v", fkOnlineDDLPossible)
+	})
+
+	var testCases = []revertibleTestCase{
+		{
+			name:       "identical schemas",
+			fromSchema: `id int primary key, i1 int not null default 0`,
+			toSchema:   `id int primary key, i2 int not null default 0`,
+		},
+		{
+			name:       "different schemas, nothing to note",
+			fromSchema: `id int primary key, i1 int not null default 0, unique key i1_uidx(i1)`,
+			toSchema:   `id int primary key, i1 int not null default 0, i2 int not null default 0, unique key i1_uidx(i1)`,
+		},
+		{
+			name:                  "removed non-nullable unique key",
+			fromSchema:            `id int primary key, i1 int not null default 0, unique key i1_uidx(i1)`,
+			toSchema:              `id int primary key, i2 int not null default 0`,
+			removedUniqueKeyNames: `i1_uidx`,
+		},
+		{
+			name:                  "removed nullable unique key",
+			fromSchema:            `id int primary key, i1 int default null, unique key i1_uidx(i1)`,
+			toSchema:              `id int primary key, i2 int default null`,
+			removedUniqueKeyNames: `i1_uidx`,
+		},
+		{
+			name:                  "expanding unique key removes unique constraint",
+			fromSchema:            `id int primary key, i1 int default null, unique key i1_uidx(i1)`,
+			toSchema:              `id int primary key, i1 int default null, unique key i1_uidx(i1, id)`,
+			removedUniqueKeyNames: `i1_uidx`,
+		},
+		{
+			name:                  "reducing unique key does not remove unique constraint",
+			fromSchema:            `id int primary key, i1 int default null, unique key i1_uidx(i1, id)`,
+			toSchema:              `id int primary key, i1 int default null, unique key i1_uidx(i1)`,
+			removedUniqueKeyNames: ``,
+		},
+		{
+			name:                      "removed foreign key",
+			fromSchema:                "id int primary key, i int, constraint some_fk_1 foreign key (i) references parent (id) on delete cascade",
+			toSchema:                  "id int primary key, i int",
+			removedForeignKeyNames:    "some_fk_1",
+			onlyIfFKOnlineDDLPossible: true,
+		},
+
+		{
+			name:                      "renamed foreign key",
+			fromSchema:                "id int primary key, i int, constraint f1 foreign key (i) references parent (id) on delete cascade",
+			toSchema:                  "id int primary key, i int, constraint f2 foreign key (i) references parent (id) on delete cascade",
+			onlyIfFKOnlineDDLPossible: true,
+		},
+		{
+			name:                        "remove column without default",
+			fromSchema:                  `id int primary key, i1 int not null`,
+			toSchema:                    `id int primary key, i2 int not null default 0`,
+			droppedNoDefaultColumnNames: `i1`,
+		},
+		{
+			name:                "expanded: nullable",
+			fromSchema:          `id int primary key, i1 int not null, i2 int default null`,
+			toSchema:            `id int primary key, i1 int default null, i2 int not null`,
+			expandedColumnNames: `i1`,
+		},
+		{
+			name:                "expanded: longer text",
+			fromSchema:          `id int primary key, i1 int default null, v1 varchar(40) not null, v2 varchar(5), v3 varchar(3)`,
+			toSchema:            `id int primary key, i1 int not null, v1 varchar(100) not null, v2 char(3), v3 char(5)`,
+			expandedColumnNames: `v1,v3`,
+		},
+		{
+			name:                "expanded: int numeric precision and scale",
+			fromSchema:          `id int primary key, i1 int, i2 tinyint, i3 mediumint, i4 bigint`,
+			toSchema:            `id int primary key, i1 int, i2 mediumint, i3 int, i4 tinyint`,
+			expandedColumnNames: `i2,i3`,
+		},
+		{
+			name:                "expanded: floating point",
+			fromSchema:          `id int primary key, i1 int, n2 bigint, n3 bigint, n4 float, n5 double`,
+			toSchema:            `id int primary key, i1 int, n2 float, n3 double, n4 double, n5 float`,
+			expandedColumnNames: `n2,n3,n4`,
+		},
+		{
+			name:                "expanded: decimal numeric precision and scale",
+			fromSchema:          `id int primary key, i1 int, d1 decimal(10,2), d2 decimal (10,2), d3 decimal (10,2)`,
+			toSchema:            `id int primary key, i1 int, d1 decimal(11,2), d2 decimal (9,1), d3 decimal (10,3)`,
+			expandedColumnNames: `d1,d3`,
+		},
+		{
+			name:                "expanded: signed, unsigned",
+			fromSchema:          `id int primary key, i1 bigint signed, i2 int unsigned, i3 bigint unsigned`,
+			toSchema:            `id int primary key, i1 int signed, i2 int signed, i3 int signed`,
+			expandedColumnNames: `i2,i3`,
+		},
+		{
+			name:                "expanded: signed, unsigned: range",
+			fromSchema:          `id int primary key, i1 int signed, i2 bigint signed, i3 int signed`,
+			toSchema:            `id int primary key, i1 int unsigned, i2 int unsigned, i3 bigint unsigned`,
+			expandedColumnNames: `i1,i3`,
+		},
+		{
+			name:                "expanded: datetime precision",
+			fromSchema:          `id int primary key, dt1 datetime, ts1 timestamp, ti1 time, dt2 datetime(3), dt3 datetime(6), ts2 timestamp(3)`,
+			toSchema:            `id int primary key, dt1 datetime(3), ts1 timestamp(6), ti1 time(3), dt2 datetime(6), dt3 datetime(3), ts2 timestamp`,
+			expandedColumnNames: `dt1,ts1,ti1,dt2`,
+		},
+		{
+			name:                "expanded: strange data type changes",
+			fromSchema:          `id int primary key, dt1 datetime, ts1 timestamp, i1 int, d1 date, e1 enum('a', 'b')`,
+			toSchema:            `id int primary key, dt1 char(32), ts1 varchar(32), i1 tinytext, d1 char(2), e1 varchar(2)`,
+			expandedColumnNames: `dt1,ts1,i1,d1,e1`,
+		},
+		{
+			name:                "expanded: temporal types",
+			fromSchema:          `id int primary key, t1 time, t2 timestamp, t3 date, t4 datetime, t5 time, t6 date`,
+			toSchema:            `id int primary key, t1 datetime, t2 datetime, t3 timestamp, t4 timestamp, t5 timestamp, t6 datetime`,
+			expandedColumnNames: `t1,t2,t3,t5,t6`,
+		},
+		{
+			name:                "expanded: character sets",
+			fromSchema:          `id int primary key, c1 char(3) charset utf8, c2 char(3) charset utf8mb4, c3 char(3) charset ascii, c4 char(3) charset utf8mb4, c5 char(3) charset utf8, c6 char(3) charset latin1`,
+			toSchema:            `id int primary key, c1 char(3) charset utf8mb4, c2 char(3) charset utf8, c3 char(3) charset utf8, c4 char(3) charset ascii, c5 char(3) charset utf8, c6 char(3) charset utf8mb4`,
+			expandedColumnNames: `c1,c3,c6`,
+		},
+		{
+			name:                "expanded: enum",
+			fromSchema:          `id int primary key, e1 enum('a', 'b'), e2 enum('a', 'b'), e3 enum('a', 'b'),      e4 enum('a', 'b'), e5 enum('a', 'b'),      e6 enum('a', 'b'), e7 enum('a', 'b'), e8 enum('a', 'b')`,
+			toSchema:            `id int primary key, e1 enum('a', 'b'), e2 enum('a'),      e3 enum('a', 'b', 'c'), e4 enum('a', 'x'), e5 enum('a', 'x', 'b'), e6 enum('b'),      e7 varchar(1), e8 tinyint`,
+			expandedColumnNames: `e3,e4,e5,e6,e7,e8`,
+		},
+		{
+			name:                "expanded: set",
+			fromSchema:          `id int primary key, e1 set('a', 'b'), e2 set('a', 'b'), e3 set('a', 'b'), e4 set('a', 'b'), e5 set('a', 'b'), e6 set('a', 'b'), e7 set('a', 'b'), e8 set('a', 'b')`,
+			toSchema:            `id int primary key, e1 set('a', 'b'), e2 set('a'), e3 set('a', 'b', 'c'), e4 set('a', 'x'), e5 set('a', 'x', 'b'), e6 set('b'), e7 varchar(1), e8 tinyint`,
+			expandedColumnNames: `e3,e4,e5,e6,e7,e8`,
+		},
+	}
+
+	var (
+		createTableWrapper = `CREATE TABLE onlineddl_test(%s)`
+		dropTableStatement = `
+			DROP TABLE onlineddl_test
+		`
+		tableName         = "onlineddl_test"
+		ddlStrategy       = "online --declarative --allow-zero-in-date --unsafe-allow-foreign-keys"
+		createParentTable = "create table parent (id int primary key)"
+	)
+
+	onlineddl.VtgateExecQuery(t, &vtParams, createParentTable, "")
+
+	removeBackticks := func(s string) string {
+		return strings.Replace(s, "`", "", -1)
+	}
+
+	for _, testcase := range testCases {
+		t.Run(testcase.name, func(t *testing.T) {
+			if testcase.onlyIfFKOnlineDDLPossible && !fkOnlineDDLPossible {
+				t.Skipf("skipped because backing database does not support 'rename_table_preserve_foreign_key'")
+				return
+			}
+
+			t.Run("ensure table dropped", func(t *testing.T) {
+				// A preparation step, to clean up anything from the previous test case
+				uuid := testOnlineDDLStatement(t, dropTableStatement, ddlStrategy, "vtgate", tableName, "")
+				onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, schema.OnlineDDLStatusComplete)
+				checkTable(t, tableName, false)
+			})
+			t.Run("create from-table", func(t *testing.T) {
+				// A preparation step, to re-create the base table
+				fromStatement := fmt.Sprintf(createTableWrapper, testcase.fromSchema)
+				uuid := testOnlineDDLStatement(t, fromStatement, ddlStrategy, "vtgate", tableName, "")
+				onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, schema.OnlineDDLStatusComplete)
+				checkTable(t, tableName, true)
+			})
+			var uuid string
+			t.Run("run migration", func(t *testing.T) {
+				// This is the migration we will test, and see whether it is revertible or not (and why not).
+				toStatement := fmt.Sprintf(createTableWrapper, testcase.toSchema)
+				uuid = testOnlineDDLStatement(t, toStatement, ddlStrategy, "vtgate", tableName, "")
+				if !onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, schema.OnlineDDLStatusComplete) {
+					resp, err := throttler.CheckThrottler(clusterInstance, primaryTablet, throttlerapp.TestingName, nil)
+					assert.NoError(t, err)
+					fmt.Println("Throttler check response: ", resp)
+
+					output, err := throttler.GetThrottlerStatusRaw(&clusterInstance.VtctldClientProcess, primaryTablet)
+					assert.NoError(t, err)
+					fmt.Println("Throttler status response: ", output)
+				}
+
+				checkTable(t, tableName, true)
+			})
+			t.Run("check migration", func(t *testing.T) {
+				// All right, the actual test
+				rs := onlineddl.ReadMigrations(t, &vtParams, uuid)
+				require.NotNil(t, rs)
+				for _, row := range rs.Named().Rows {
+					removedForeignKeyNames := row.AsString("removed_foreign_key_names", "")
+					removedUniqueKeyNames := row.AsString("removed_unique_key_names", "")
+					droppedNoDefaultColumnNames := row.AsString("dropped_no_default_column_names", "")
+					expandedColumnNames := row.AsString("expanded_column_names", "")
+
+					// Online DDL renames constraint names, and keeps the original name as a prefix.
+					// The name of e.g. "some_fk_2_" might turn into "some_fk_2_518ubnm034rel35l1m0u1dc7m"
+					expectRemovedForeignKeyNames := strings.Split(testcase.removedForeignKeyNames, ",")
+					actualRemovedForeignKeyNames := strings.Split(removeBackticks(removedForeignKeyNames), ",")
+					assert.Equal(t, len(expectRemovedForeignKeyNames), len(actualRemovedForeignKeyNames))
+					for _, actualRemovedForeignKeyName := range actualRemovedForeignKeyNames {
+						found := false
+						for _, expectRemovedForeignKeyName := range expectRemovedForeignKeyNames {
+							if strings.HasPrefix(actualRemovedForeignKeyName, expectRemovedForeignKeyName) {
+								found = true
+							}
+						}
+						assert.Truef(t, found, "unexpected FK name", "%s", actualRemovedForeignKeyName)
+					}
+					assert.Equal(t, testcase.removedUniqueKeyNames, removeBackticks(removedUniqueKeyNames))
+					assert.Equal(t, testcase.droppedNoDefaultColumnNames, removeBackticks(droppedNoDefaultColumnNames))
+					assert.Equal(t, testcase.expandedColumnNames, removeBackticks(expandedColumnNames))
+				}
+			})
+		})
+	}
+
+	t.Run("drop fk child table", func(t *testing.T) {
+		t.Run("ensure table dropped", func(t *testing.T) {
+			// A preparation step, to clean up anything from the previous test case
+			uuid := testOnlineDDLStatement(t, dropTableStatement, ddlStrategy, "vtgate", tableName, "")
+			onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, schema.OnlineDDLStatusComplete)
+			checkTable(t, tableName, false)
+		})
+		t.Run("create child table", func(t *testing.T) {
+			fromStatement := fmt.Sprintf(createTableWrapper, "id int primary key, i int, constraint some_fk_2 foreign key (i) references parent (id) on delete cascade")
+			uuid := testOnlineDDLStatement(t, fromStatement, ddlStrategy, "vtgate", tableName, "")
+			onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, schema.OnlineDDLStatusComplete)
+			checkTable(t, tableName, true)
+		})
+		var uuid string
+		t.Run("drop", func(t *testing.T) {
+			uuid = testOnlineDDLStatement(t, dropTableStatement, ddlStrategy, "vtgate", tableName, "")
+			onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, schema.OnlineDDLStatusComplete)
+			checkTable(t, tableName, false)
+		})
+		t.Run("check migration", func(t *testing.T) {
+			// All right, the actual test
+			rs := onlineddl.ReadMigrations(t, &vtParams, uuid)
+			require.NotNil(t, rs)
+			for _, row := range rs.Named().Rows {
+				removedForeignKeyNames := row.AsString("removed_foreign_key_names", "")
+				removedUniqueKeyNames := row.AsString("removed_unique_key_names", "")
+				droppedNoDefaultColumnNames := row.AsString("dropped_no_default_column_names", "")
+				expandedColumnNames := row.AsString("expanded_column_names", "")
+
+				// Online DDL renames constraint names, and keeps the original name as a prefix. The name will be e.g. some_fk_2_518ubnm034rel35l1m0u1dc7m
+				assert.Contains(t, removeBackticks(removedForeignKeyNames), "some_fk_2")
+				assert.Equal(t, "", removeBackticks(removedUniqueKeyNames))
+				assert.Equal(t, "", removeBackticks(droppedNoDefaultColumnNames))
+				assert.Equal(t, "", removeBackticks(expandedColumnNames))
+			}
+		})
+	})
+}
+
+func testRevert(t *testing.T) {
+
+	var (
+		partitionedTableName = `part_test`
+		createStatement      = `
+		CREATE TABLE stress_test (
+			id bigint(20) not null,
+			rand_val varchar(32) null default '',
+			hint_col varchar(64) not null default 'just-created',
+			created_timestamp timestamp not null default current_timestamp,
+			updates int unsigned not null default 0,
+			PRIMARY KEY (id),
+			key created_idx(created_timestamp),
+			key updates_idx(updates)
+		) ENGINE=InnoDB
+	`
+		createIfNotExistsStatement = `
+		CREATE TABLE IF NOT EXISTS stress_test (
+			id bigint(20) not null,
+			PRIMARY KEY (id)
+		) ENGINE=InnoDB
+	`
+		dropStatement = `
+		DROP TABLE stress_test
+	`
+		dropIfExistsStatement = `
+		DROP TABLE IF EXISTS stress_test
+	`
+		alterHintStatement = `
+		ALTER TABLE stress_test modify hint_col varchar(64) not null default '%s'
+	`
+		createViewBaseTableStatement = `
+		CREATE TABLE view_base_table_test (id INT PRIMARY KEY)
+	`
+		createViewStatement = `
+		CREATE VIEW view_test AS SELECT 'success_create' AS msg FROM view_base_table_test
+	`
+		createOrReplaceViewStatement = `
+		CREATE OR REPLACE VIEW view_test AS SELECT 'success_replace' AS msg FROM view_base_table_test
+	`
+		alterViewStatement = `
+		ALTER VIEW view_test AS SELECT 'success_alter' AS msg FROM view_base_table_test
+	`
+		dropViewStatement = `
+		DROP VIEW view_test
+	`
+		dropViewIfExistsStatement = `
+		DROP VIEW IF EXISTS view_test
+	`
+		createPartitionedTableStatement = `
+		CREATE TABLE part_test (
+			id INT NOT NULL,
+			ts TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			primary key (id)
+		)
+		PARTITION BY RANGE (id) (
+				PARTITION p1 VALUES LESS THAN (10),
+				PARTITION p2 VALUES LESS THAN (20),
+				PARTITION p3 VALUES LESS THAN (30),
+				PARTITION p4 VALUES LESS THAN (40),
+				PARTITION p5 VALUES LESS THAN (50),
+				PARTITION p6 VALUES LESS THAN (60)
+		)
+	`
+		populatePartitionedTableStatement = `
+		INSERT INTO part_test (id) VALUES (2),(11),(23),(37),(41),(53)
+	`
+	)
+
+	populatePartitionedTable := func(t *testing.T) {
+		onlineddl.VtgateExecQuery(t, &vtParams, populatePartitionedTableStatement, "")
+	}
+
+	mysqlVersion = onlineddl.GetMySQLVersion(t, primaryTablet)
+	require.NotEmpty(t, mysqlVersion)
+
+	capableOf := mysql.ServerVersionCapableOf(mysqlVersion)
 
 	var uuids []string
 	ddlStrategy := "online"
@@ -322,6 +657,7 @@ func TestSchemaChange(t *testing.T) {
 	// ALTER VIEW
 	t.Run("ALTER VIEW where view exists", func(t *testing.T) {
 		// The view exists
+		checkTable(t, viewName, true)
 		uuid := testOnlineDDLStatementForView(t, alterViewStatement, ddlStrategy, "vtgate", "success_alter")
 		uuids = append(uuids, uuid)
 		onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, schema.OnlineDDLStatusComplete)
@@ -537,11 +873,21 @@ func TestSchemaChange(t *testing.T) {
 				defer wg.Done()
 				runMultipleConnections(ctx, t)
 			}()
-			uuid := testOnlineDDLStatementForTable(t, fmt.Sprintf(alterHintStatement, hint), "online", "vtgate", hint)
-			uuids = append(uuids, uuid)
-			onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, schema.OnlineDDLStatusComplete)
-			cancel() // will cause runMultipleConnections() to terminate
-			wg.Wait()
+
+			func() {
+				// Ensures runMultipleConnections completes before the overall
+				// test does, even in the face of calls to t.FailNow() in the
+				// main goroutine, which still executes deferred functions
+				defer func() {
+					cancel() // will cause runMultipleConnections() to terminate
+					wg.Wait()
+				}()
+
+				uuid := testOnlineDDLStatementForTable(t, fmt.Sprintf(alterHintStatement, hint), "online", "vtgate", hint)
+				uuids = append(uuids, uuid)
+				onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, schema.OnlineDDLStatusComplete)
+			}()
+
 			testSelectTableMetrics(t)
 		})
 	}
@@ -556,11 +902,20 @@ func TestSchemaChange(t *testing.T) {
 			defer wg.Done()
 			runMultipleConnections(ctx, t)
 		}()
-		uuid := testRevertMigration(t, uuids[len(uuids)-1], ddlStrategy)
-		uuids = append(uuids, uuid)
-		onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, schema.OnlineDDLStatusComplete)
-		cancel() // will cause runMultipleConnections() to terminate
-		wg.Wait()
+
+		func() {
+			// Ensures runMultipleConnections completes before the overall
+			// test does, even in the face of calls to t.FailNow() in the
+			// main goroutine, which still executes deferred functions
+			defer func() {
+				cancel() // will cause runMultipleConnections() to terminate
+				wg.Wait()
+			}()
+
+			uuid := testRevertMigration(t, uuids[len(uuids)-1], ddlStrategy)
+			uuids = append(uuids, uuid)
+			onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, schema.OnlineDDLStatusComplete)
+		}()
 		checkMigratedTable(t, tableName, alterHints[0])
 		testSelectTableMetrics(t)
 	})
@@ -575,11 +930,20 @@ func TestSchemaChange(t *testing.T) {
 			defer wg.Done()
 			runMultipleConnections(ctx, t)
 		}()
-		uuid := testRevertMigration(t, uuids[len(uuids)-1], ddlStrategy)
-		uuids = append(uuids, uuid)
-		onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, schema.OnlineDDLStatusComplete)
-		cancel() // will cause runMultipleConnections() to terminate
-		wg.Wait()
+
+		func() {
+			// Ensures runMultipleConnections completes before the overall
+			// test does, even in the face of calls to t.FailNow() in the
+			// main goroutine, which still executes deferred functions
+			defer func() {
+				cancel() // will cause runMultipleConnections() to terminate
+				wg.Wait()
+			}()
+
+			uuid := testRevertMigration(t, uuids[len(uuids)-1], ddlStrategy)
+			uuids = append(uuids, uuid)
+			onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, schema.OnlineDDLStatusComplete)
+		}()
 		checkMigratedTable(t, tableName, alterHints[1])
 		testSelectTableMetrics(t)
 	})
@@ -594,15 +958,25 @@ func TestSchemaChange(t *testing.T) {
 			defer wg.Done()
 			runMultipleConnections(ctx, t)
 		}()
-		uuid := testRevertMigration(t, uuids[len(uuids)-1], ddlStrategy)
-		uuids = append(uuids, uuid)
-		onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, schema.OnlineDDLStatusComplete)
-		cancel() // will cause runMultipleConnections() to terminate
-		wg.Wait()
+
+		func() {
+			// Ensures runMultipleConnections completes before the overall
+			// test does, even in the face of calls to t.FailNow() in the
+			// main goroutine, which still executes deferred functions
+			defer func() {
+				cancel() // will cause runMultipleConnections() to terminate
+				wg.Wait()
+			}()
+
+			uuid := testRevertMigration(t, uuids[len(uuids)-1], ddlStrategy)
+			uuids = append(uuids, uuid)
+			onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, schema.OnlineDDLStatusComplete)
+		}()
 		checkMigratedTable(t, tableName, alterHints[0])
 		testSelectTableMetrics(t)
 	})
-	t.Run("postponed revert", func(t *testing.T) {
+	testPostponedRevert := func(t *testing.T, expectStatuses ...schema.OnlineDDLStatus) {
+		require.NotEmpty(t, expectStatuses)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		var wg sync.WaitGroup
@@ -611,20 +985,101 @@ func TestSchemaChange(t *testing.T) {
 			defer wg.Done()
 			runMultipleConnections(ctx, t)
 		}()
-		uuid := testRevertMigration(t, uuids[len(uuids)-1], ddlStrategy+" -postpone-completion")
+
+		// Ensures runMultipleConnections completes before the overall
+		// test does, even in the face of calls to t.FailNow() in the
+		// main goroutine, which still executes deferred functions
+		defer func() {
+			cancel() // will cause runMultipleConnections() to terminate
+			wg.Wait()
+		}()
+
+		uuid := testRevertMigration(t, uuids[len(uuids)-1], ddlStrategy+" --postpone-completion")
 		uuids = append(uuids, uuid)
 		// Should be still running!
-		onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, schema.OnlineDDLStatusRunning)
+		onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, expectStatuses...)
 		// Issue a complete and wait for successful completion
 		onlineddl.CheckCompleteMigration(t, &vtParams, shards, uuid, true)
-		// This part may take a while, because we depend on vreplicatoin polling
+		// This part may take a while, because we depend on vreplication polling
 		status := onlineddl.WaitForMigrationStatus(t, &vtParams, shards, uuid, 60*time.Second, schema.OnlineDDLStatusComplete, schema.OnlineDDLStatusFailed)
 		fmt.Printf("# Migration status (for debug purposes): <%s>\n", status)
 		onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, schema.OnlineDDLStatusComplete)
-		cancel() // will cause runMultipleConnections() to terminate
-		wg.Wait()
+	}
+	t.Run("postponed revert", func(t *testing.T) {
+		testPostponedRevert(t, schema.OnlineDDLStatusRunning)
 		checkMigratedTable(t, tableName, alterHints[1])
 		testSelectTableMetrics(t)
+	})
+
+	t.Run("postponed revert view", func(t *testing.T) {
+		t.Run("CREATE VIEW again", func(t *testing.T) {
+			// The view does not exist
+			uuid := testOnlineDDLStatementForView(t, createViewStatement, ddlStrategy, "vtgate", "success_create")
+			uuids = append(uuids, uuid)
+			onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, schema.OnlineDDLStatusComplete)
+			checkTable(t, viewName, true)
+			testRevertedUUID(t, uuid, "")
+		})
+		t.Run("ALTER VIEW, postpone completion", func(t *testing.T) {
+			// Technically this test better fits in `onlineddl_scheduler_test.go`, but since we've already laid the grounds here, this is where it landed.
+			// The view exists
+			checkTable(t, viewName, true)
+			uuid := testOnlineDDLStatementForView(t, alterViewStatement, ddlStrategy+" --postpone-completion", "vtgate", "success_create")
+			uuids = append(uuids, uuid)
+
+			onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, schema.OnlineDDLStatusQueued, schema.OnlineDDLStatusReady)
+			// Issue a complete and wait for successful completion
+			onlineddl.CheckCompleteMigration(t, &vtParams, shards, uuid, true)
+			// This part may take a while, because we depend on vreplication polling
+			status := onlineddl.WaitForMigrationStatus(t, &vtParams, shards, uuid, 60*time.Second, schema.OnlineDDLStatusComplete, schema.OnlineDDLStatusFailed)
+			fmt.Printf("# Migration status (for debug purposes): <%s>\n", status)
+			onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, schema.OnlineDDLStatusComplete)
+			checkTable(t, viewName, true)
+			testRevertedUUID(t, uuid, "")
+		})
+		// now verify that the revert for ALTER VIEW respects `--postpone-completion`
+		testPostponedRevert(t, schema.OnlineDDLStatusQueued, schema.OnlineDDLStatusReady)
+		checkTable(t, viewName, true)
+	})
+
+	// INSTANT DDL
+	t.Run("INSTANT DDL: add column", func(t *testing.T) {
+		uuid := testOnlineDDLStatementForTable(t, "alter table stress_test add column i_instant int not null default 0", ddlStrategy+" --prefer-instant-ddl", "vtgate", "i_instant")
+		uuids = append(uuids, uuid)
+		onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, schema.OnlineDDLStatusComplete)
+		checkTable(t, tableName, true)
+
+		rs := onlineddl.ReadMigrations(t, &vtParams, uuid)
+		require.NotNil(t, rs)
+		row := rs.Named().Row()
+		require.NotNil(t, row)
+		specialPlan := row.AsString("special_plan", "")
+		artifacts := row.AsString("artifacts", "")
+		instantDDLCapable, err := capableOf(capabilities.InstantDDLFlavorCapability)
+		assert.NoError(t, err)
+		if instantDDLCapable {
+			// instant DDL expected to apply in 8.0
+			assert.Contains(t, specialPlan, "instant-ddl")
+			assert.Empty(t, artifacts)
+		} else {
+			// instant DDL not possible, this is a normal vrepl migration
+			assert.Empty(t, specialPlan)
+			assert.NotEmpty(t, artifacts)
+		}
+		removedForeignKeyNames := row.AsString("removed_foreign_key_names", "")
+		assert.Empty(t, removedForeignKeyNames)
+	})
+	t.Run("INSTANT DDL: fail revert", func(t *testing.T) {
+		uuid := testRevertMigration(t, uuids[len(uuids)-1], ddlStrategy)
+		uuids = append(uuids, uuid)
+		instantDDLCapable, err := capableOf(capabilities.InstantDDLFlavorCapability)
+		assert.NoError(t, err)
+		if instantDDLCapable {
+			// instant DDL expected to apply in 8.0, therefore revert is impossible
+			onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, schema.OnlineDDLStatusFailed)
+		} else {
+			onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, schema.OnlineDDLStatusComplete)
+		}
 	})
 
 	// DROP
@@ -680,6 +1135,52 @@ func TestSchemaChange(t *testing.T) {
 		checkTable(t, tableName, false)
 	})
 
+	// PARTITIONS
+	checkPartitionedTableCountRows := func(t *testing.T, expectRows int64) {
+		rs := onlineddl.VtgateExecQuery(t, &vtParams, "select count(*) as c from part_test", "")
+		require.NotNil(t, rs)
+		row := rs.Named().Row()
+		require.NotNil(t, row)
+		count, err := row.ToInt64("c")
+		require.NoError(t, err)
+		assert.Equal(t, expectRows, count)
+	}
+	t.Run("partitions: create partitioned table", func(t *testing.T) {
+		uuid := testOnlineDDLStatementForTable(t, createPartitionedTableStatement, ddlStrategy, "vtgate", "")
+		uuids = append(uuids, uuid)
+		onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, schema.OnlineDDLStatusComplete)
+		checkTable(t, partitionedTableName, true)
+
+		populatePartitionedTable(t)
+		checkPartitionedTableCountRows(t, 6)
+	})
+	t.Run("partitions: drop first partition", func(t *testing.T) {
+		uuid := testOnlineDDLStatementForTable(t, "alter table part_test drop partition `p1`", ddlStrategy, "vtgate", "")
+		uuids = append(uuids, uuid)
+		onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, schema.OnlineDDLStatusComplete)
+		checkTable(t, partitionedTableName, true)
+
+		checkPartitionedTableCountRows(t, 5)
+	})
+	t.Run("partitions: fail revert drop first partition", func(t *testing.T) {
+		uuid := testRevertMigration(t, uuids[len(uuids)-1], ddlStrategy)
+		uuids = append(uuids, uuid)
+		onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, schema.OnlineDDLStatusFailed)
+
+		checkPartitionedTableCountRows(t, 5)
+	})
+	t.Run("partitions: add new partition", func(t *testing.T) {
+		uuid := testOnlineDDLStatementForTable(t, "alter table part_test add partition (PARTITION p7 VALUES LESS THAN (70))", ddlStrategy, "vtgate", "")
+		uuids = append(uuids, uuid)
+		onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, schema.OnlineDDLStatusComplete)
+		checkTable(t, partitionedTableName, true)
+	})
+	t.Run("partitions: fail revert add new partition", func(t *testing.T) {
+		uuid := testRevertMigration(t, uuids[len(uuids)-1], ddlStrategy)
+		uuids = append(uuids, uuid)
+		onlineddl.CheckMigrationStatus(t, &vtParams, shards, uuid, schema.OnlineDDLStatusFailed)
+	})
+
 	// FAILURES
 	t.Run("fail online DROP TABLE", func(t *testing.T) {
 		// The table does not exist now
@@ -706,7 +1207,7 @@ func testOnlineDDLStatement(t *testing.T, alterStatement string, ddlStrategy str
 		}
 	} else {
 		var err error
-		uuid, err = clusterInstance.VtctlclientProcess.ApplySchemaWithOutput(keyspaceName, alterStatement, cluster.VtctlClientParams{DDLStrategy: ddlStrategy})
+		uuid, err = clusterInstance.VtctldClientProcess.ApplySchemaWithOutput(keyspaceName, alterStatement, cluster.ApplySchemaParams{DDLStrategy: ddlStrategy})
 		assert.NoError(t, err)
 	}
 	uuid = strings.TrimSpace(uuid)
@@ -794,7 +1295,7 @@ func getCreateTableStatement(t *testing.T, tablet *cluster.Vttablet, tableName s
 }
 
 func generateInsert(t *testing.T, conn *mysql.Conn) error {
-	id := rand.Int31n(int32(maxTableRows))
+	id := rand.Int32N(int32(maxTableRows))
 	query := fmt.Sprintf(insertRowStatement, id)
 	qr, err := conn.ExecuteFetch(query, 1000, true)
 
@@ -818,7 +1319,7 @@ func generateInsert(t *testing.T, conn *mysql.Conn) error {
 }
 
 func generateUpdate(t *testing.T, conn *mysql.Conn) error {
-	id := rand.Int31n(int32(maxTableRows))
+	id := rand.Int32N(int32(maxTableRows))
 	query := fmt.Sprintf(updateRowStatement, id)
 	qr, err := conn.ExecuteFetch(query, 1000, true)
 
@@ -842,7 +1343,7 @@ func generateUpdate(t *testing.T, conn *mysql.Conn) error {
 }
 
 func generateDelete(t *testing.T, conn *mysql.Conn) error {
-	id := rand.Int31n(int32(maxTableRows))
+	id := rand.Int32N(int32(maxTableRows))
 	query := fmt.Sprintf(deleteRowStatement, id)
 	qr, err := conn.ExecuteFetch(query, 1000, true)
 
@@ -881,18 +1382,13 @@ func runSingleConnection(ctx context.Context, t *testing.T, done *int64) {
 			log.Infof("Terminating single connection")
 			return
 		}
-		switch rand.Int31n(3) {
+		switch rand.Int32N(3) {
 		case 0:
 			err = generateInsert(t, conn)
 		case 1:
 			err = generateUpdate(t, conn)
 		case 2:
 			err = generateDelete(t, conn)
-		}
-		if err != nil {
-			if strings.Contains(err.Error(), "disallowed due to rule: enforce denied tables") {
-				err = nil
-			}
 		}
 		assert.Nil(t, err)
 		time.Sleep(10 * time.Millisecond)
@@ -951,11 +1447,11 @@ func testSelectTableMetrics(t *testing.T) {
 
 	ctx := context.Background()
 	conn, err := mysql.Connect(ctx, &vtParams)
-	require.Nil(t, err)
+	require.NoError(t, err)
 	defer conn.Close()
 
 	rs, err := conn.ExecuteFetch(selectCountRowsStatement, 1000, true)
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	row := rs.Named().Row()
 	require.NotNil(t, row)

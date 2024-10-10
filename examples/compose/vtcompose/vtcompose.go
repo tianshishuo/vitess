@@ -19,7 +19,6 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"math"
 	"os"
@@ -29,6 +28,7 @@ import (
 
 	jsonpatch "github.com/evanphx/json-patch"
 	yamlpatch "github.com/krishicks/yaml-patch"
+	"github.com/spf13/pflag"
 
 	"vitess.io/vitess/go/vt/log"
 )
@@ -46,23 +46,23 @@ const (
 	cellUsage             = "Vitess Cell name"
 	DefaultExternalDbData = ""
 	externalDbDataUsage   = "List of Data corresponding to external DBs. List of <external_db_name>,<DB_HOST>,<DB_PORT>,<DB_USER>,<DB_PASS>,<DB_CHARSET> separated by ';'"
-	DefaultTopologyFlags  = "-topo_implementation consul -topo_global_server_address consul1:8500 -topo_global_root vitess/global"
+	DefaultTopologyFlags  = "--topo_implementation consul --topo_global_server_address consul1:8500 --topo_global_root vitess/global"
 	topologyFlagsUsage    = "Vitess Topology Flags config"
 )
 
 var (
 	tabletsUsed           = 0
 	tablesPath            = "tables/"
-	baseDockerComposeFile = flag.String("base_yaml", "vtcompose/docker-compose.base.yml", "Starting docker-compose yaml")
-	baseVschemaFile       = flag.String("base_vschema", "vtcompose/base_vschema.json", "Starting vschema json")
+	baseDockerComposeFile = pflag.String("base_yaml", "vtcompose/docker-compose.base.yml", "Starting docker-compose yaml")
+	baseVschemaFile       = pflag.String("base_vschema", "vtcompose/base_vschema.json", "Starting vschema json")
 
-	topologyFlags  = flag.String("topologyFlags", DefaultTopologyFlags, topologyFlagsUsage)
-	webPort        = flag.Int("webPort", DefaultWebPort, webPortUsage)
-	gRpcPort       = flag.Int("gRpcPort", DefaultGrpcPort, gRpcPortUsage)
-	mySqlPort      = flag.Int("mySqlPort", DefaultMysqlPort, mySqlPortUsage)
-	cell           = flag.String("cell", DefaultCell, cellUsage)
-	keyspaceData   = flag.String("keyspaceData", DefaultKeyspaceData, keyspaceDataUsage)
-	externalDbData = flag.String("externalDbData", DefaultExternalDbData, externalDbDataUsage)
+	topologyFlags  = pflag.String("topologyFlags", DefaultTopologyFlags, topologyFlagsUsage)
+	webPort        = pflag.Int("webPort", DefaultWebPort, webPortUsage)
+	gRpcPort       = pflag.Int("gRpcPort", DefaultGrpcPort, gRpcPortUsage)
+	mySqlPort      = pflag.Int("mySqlPort", DefaultMysqlPort, mySqlPortUsage)
+	cell           = pflag.String("cell", DefaultCell, cellUsage)
+	keyspaceData   = pflag.String("keyspaceData", DefaultKeyspaceData, keyspaceDataUsage)
+	externalDbData = pflag.String("externalDbData", DefaultExternalDbData, externalDbDataUsage)
 )
 
 type vtOptions struct {
@@ -167,7 +167,7 @@ func parseExternalDbData(externalDbData string) map[string]externalDbInfo {
 }
 
 func main() {
-	flag.Parse()
+	pflag.Parse()
 	keyspaceInfoMap := parseKeyspaceInfo(*keyspaceData)
 	externalDbInfoMap := parseExternalDbData(*externalDbData)
 	vtOpts := vtOptions{
@@ -216,24 +216,6 @@ func main() {
 	dockerComposeFile := readFile(*baseDockerComposeFile)
 	dockerComposeFile = applyDockerComposePatches(dockerComposeFile, keyspaceInfoMap, externalDbInfoMap, vtOpts)
 	writeFile(dockerComposeFile, "docker-compose.yml")
-}
-
-func applyFilePatch(dockerYaml []byte, patchFile string) []byte {
-	yamlPatch, err := os.ReadFile(patchFile)
-	if err != nil {
-		log.Fatalf("reading yaml patch file %s: %s", patchFile, err)
-	}
-
-	patch, err := yamlpatch.DecodePatch(yamlPatch)
-	if err != nil {
-		log.Fatalf("decoding patch failed: %s", err)
-	}
-
-	bs, err := patch.Apply(dockerYaml)
-	if err != nil {
-		log.Fatalf("applying patch failed: %s", err)
-	}
-	return bs
 }
 
 func applyJsonInMemoryPatch(vSchemaFile []byte, patchString string) []byte {
@@ -433,6 +415,9 @@ func applyKeyspaceDependentPatches(
 		primaryTablets = append(primaryTablets, strconv.Itoa((i+1)*100+1))
 	}
 
+	setKeyspaceDurabilityPolicy := generateSetKeyspaceDurabilityPolicy(primaryTablets, keyspaceData.keyspace, opts)
+	dockerComposeFile = applyInMemoryPatch(dockerComposeFile, setKeyspaceDurabilityPolicy)
+
 	schemaLoad := generateSchemaload(primaryTablets, "", keyspaceData.keyspace, externalDbInfo, opts)
 	dockerComposeFile = applyInMemoryPatch(dockerComposeFile, schemaLoad)
 
@@ -443,7 +428,7 @@ func applyKeyspaceDependentPatches(
 		dockerComposeFile = applyShardPatches(dockerComposeFile, tabAlias, shard, keyspaceData, externalDbInfoMap, opts)
 	} else {
 		// Determine shard range
-		for i := 0; i < keyspaceData.shards; i++ {
+		for i := range keyspaceData.shards {
 			if i == 0 {
 				shard = fmt.Sprintf("-%x", interval)
 			} else if i == (keyspaceData.shards - 1) {
@@ -478,9 +463,8 @@ func applyDefaultDockerPatches(
 
 	dockerComposeFile = applyInMemoryPatch(dockerComposeFile, generateVtctld(opts))
 	dockerComposeFile = applyInMemoryPatch(dockerComposeFile, generateVtgate(opts))
-	dockerComposeFile = applyInMemoryPatch(dockerComposeFile, generateVtwork(opts))
 	dockerComposeFile = applyInMemoryPatch(dockerComposeFile, generateVreplication(dbInfo, opts))
-	dockerComposeFile = applyInMemoryPatch(dockerComposeFile, generateVtorc(dbInfo, opts))
+	dockerComposeFile = applyInMemoryPatch(dockerComposeFile, generateVTOrc(dbInfo, keyspaceInfoMap, opts))
 	return dockerComposeFile
 }
 
@@ -515,28 +499,6 @@ func applyShardPatches(
 	return dockerComposeFile
 }
 
-func generateDefaultShard(tabAlias int, shard string, keyspaceData keyspaceInfo, opts vtOptions) string {
-	aliases := []int{tabAlias + 1} // primary alias, e.g. 201
-	for i := 0; i < keyspaceData.replicaTablets; i++ {
-		aliases = append(aliases, tabAlias+2+i) // replica aliases, e.g. 202, 203, ...
-	}
-	tabletDepends := make([]string, len(aliases))
-	for i, tabletId := range aliases {
-		tabletDepends[i] = fmt.Sprintf("vttablet%d: {condition : service_healthy}", tabletId)
-	}
-	// Wait on all shard tablets to be healthy
-	dependsOn := "depends_on: {" + strings.Join(tabletDepends, ", ") + "}"
-
-	return fmt.Sprintf(`
-- op: add
-  path: /services/init_shard_primary%[2]d
-  value:
-    image: vitess/lite:${VITESS_TAG:-latest}
-    command: ["sh", "-c", "/vt/bin/vtctlclient %[5]s InitShardPrimary -force %[4]s/%[3]s %[6]s-%[2]d "]
-    %[1]s
-`, dependsOn, aliases[0], shard, keyspaceData.keyspace, opts.topologyFlags, opts.cell)
-}
-
 func generateExternalPrimary(
 	tabAlias int,
 	shard string,
@@ -546,7 +508,7 @@ func generateExternalPrimary(
 ) string {
 
 	aliases := []int{tabAlias + 1} // primary alias, e.g. 201
-	for i := 0; i < keyspaceData.replicaTablets; i++ {
+	for i := range keyspaceData.replicaTablets {
 		aliases = append(aliases, tabAlias+2+i) // replica aliases, e.g. 202, 203, ...
 	}
 
@@ -556,7 +518,7 @@ func generateExternalPrimary(
 	if dbInfo.dbName != "" {
 		externalDb = "1"
 	} else {
-		return fmt.Sprintf(``)
+		return ""
 	}
 
 	return fmt.Sprintf(`
@@ -609,7 +571,7 @@ func applyTabletPatches(
 		dbInfo = val
 	}
 	dockerComposeFile = applyInMemoryPatch(dockerComposeFile, generateDefaultTablet(tabAlias+1, shard, "primary", keyspaceData.keyspace, dbInfo, opts))
-	for i := 0; i < keyspaceData.replicaTablets; i++ {
+	for i := range keyspaceData.replicaTablets {
 		dockerComposeFile = applyInMemoryPatch(dockerComposeFile, generateDefaultTablet(tabAlias+2+i, shard, "replica", keyspaceData.keyspace, dbInfo, opts))
 	}
 	return dockerComposeFile
@@ -669,15 +631,13 @@ func generateVtctld(opts vtOptions) string {
       - "%[2]d"
     command: ["sh", "-c", " /vt/bin/vtctld \
         %[3]s \
-        -cell %[4]s \
-        -workflow_manager_init \
-        -workflow_manager_use_election \
-        -service_map 'grpc-vtctl' \
-        -backup_storage_implementation file \
-        -file_backup_storage_root /vt/vtdataroot/backups \
-        -logtostderr=true \
-        -port %[1]d \
-        -grpc_port %[2]d \
+        --cell %[4]s \
+        --service_map 'grpc-vtctl,grpc-vtctld' \
+        --backup_storage_implementation file \
+        --file_backup_storage_root /vt/vtdataroot/backups \
+        --logtostderr=true \
+        --port %[1]d \
+        --grpc_port %[2]d \
         "]
     volumes:
       - .:/script
@@ -703,16 +663,16 @@ func generateVtgate(opts vtOptions) string {
       - "15306:%[3]d"
     command: ["sh", "-c", "/script/run-forever.sh /vt/bin/vtgate \
         %[4]s \
-        -logtostderr=true \
-        -port %[1]d \
-        -grpc_port %[2]d \
-        -mysql_server_port %[3]d \
-        -mysql_auth_server_impl none \
-        -cell %[5]s \
-        -cells_to_watch %[5]s \
-        -tablet_types_to_wait PRIMARY,REPLICA,RDONLY \
-        -service_map 'grpc-vtgateservice' \
-        -normalize_queries=true \
+        --logtostderr=true \
+        --port %[1]d \
+        --grpc_port %[2]d \
+        --mysql_server_port %[3]d \
+        --mysql_auth_server_impl none \
+        --cell %[5]s \
+        --cells_to_watch %[5]s \
+        --tablet_types_to_wait PRIMARY,REPLICA,RDONLY \
+        --service_map 'grpc-vtgateservice' \
+        --normalize_queries=true \
         "]
     volumes:
       - .:/script
@@ -721,34 +681,19 @@ func generateVtgate(opts vtOptions) string {
 `, opts.webPort, opts.gRpcPort, opts.mySqlPort, opts.topologyFlags, opts.cell)
 }
 
-func generateVtwork(opts vtOptions) string {
-	return fmt.Sprintf(`
-- op: add
-  path: /services/vtwork
-  value:
-    image: vitess/lite:${VITESS_TAG:-latest}
-    ports:
-      - "%[1]d"
-      - "%[2]d"
-    command: ["sh", "-c", "/vt/bin/vtworker \
-        %[3]s \
-        -cell %[4]s \
-        -logtostderr=true \
-        -service_map 'grpc-vtworker' \
-        -port %[1]d \
-        -grpc_port %[2]d \
-        -use_v3_resharding_mode=true \
-        "]
-    depends_on:
-      - vtctld
-`, opts.webPort, opts.gRpcPort, opts.topologyFlags, opts.cell)
-}
-
-func generateVtorc(dbInfo externalDbInfo, opts vtOptions) string {
+func generateVTOrc(dbInfo externalDbInfo, keyspaceInfoMap map[string]keyspaceInfo, opts vtOptions) string {
 	externalDb := "0"
 	if dbInfo.dbName != "" {
 		externalDb = "1"
 	}
+
+	var depends []string
+	for _, keyspaceData := range keyspaceInfoMap {
+		depends = append(depends, "set_keyspace_durability_policy_"+keyspaceData.keyspace)
+	}
+	depends = append(depends, "vtctld")
+	dependsOn := "depends_on: [" + strings.Join(depends, ", ") + "]"
+
 	return fmt.Sprintf(`
 - op: add
   path: /services/vtorc
@@ -757,16 +702,16 @@ func generateVtorc(dbInfo externalDbInfo, opts vtOptions) string {
     volumes:
       - ".:/script"
     environment:
-      - TOPOLOGY_FLAGS=%[1]s
-      - EXTERNAL_DB=%[2]s
-      - DB_USER=%[3]s
-      - DB_PASS=%[4]s
+      - WEB_PORT=%[1]d
+      - TOPOLOGY_FLAGS=%[2]s
+      - EXTERNAL_DB=%[3]s
+      - DB_USER=%[4]s
+      - DB_PASS=%[5]s
     ports:
-      - "13000:3000"
+      - "13000:%[1]d"
     command: ["sh", "-c", "/script/vtorc-up.sh"]
-    depends_on:
-      - vtctld
-`, opts.topologyFlags, externalDb, dbInfo.dbUser, dbInfo.dbPass)
+    %[6]s
+`, opts.webPort, opts.topologyFlags, externalDb, dbInfo.dbUser, dbInfo.dbPass, dependsOn)
 }
 
 func generateVreplication(dbInfo externalDbInfo, opts vtOptions) string {
@@ -788,6 +733,33 @@ func generateVreplication(dbInfo externalDbInfo, opts vtOptions) string {
     depends_on:
       - vtctld
 `, opts.topologyFlags, externalDb)
+}
+
+func generateSetKeyspaceDurabilityPolicy(
+	tabletAliases []string,
+	keyspace string,
+	opts vtOptions,
+) string {
+	// Formatting for list in yaml
+	var aliases []string
+	for _, tabletId := range tabletAliases {
+		aliases = append(aliases, "vttablet"+tabletId)
+	}
+	dependsOn := "depends_on: [" + strings.Join(aliases, ", ") + "]"
+
+	return fmt.Sprintf(`
+- op: add
+  path: /services/set_keyspace_durability_policy_%[3]s
+  value:
+    image: vitess/lite:${VITESS_TAG:-latest}
+    volumes:
+      - ".:/script"
+    environment:
+      - GRPC_PORT=%[2]d
+      - KEYSPACES=%[3]s
+    command: ["sh", "-c", "/script/set_keyspace_durability_policy.sh"]
+    %[1]s
+`, dependsOn, opts.gRpcPort, keyspace)
 }
 
 func generateSchemaload(

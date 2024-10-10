@@ -17,39 +17,68 @@ limitations under the License.
 package testlib
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/stretchr/testify/assert"
-
-	"vitess.io/vitess/go/vt/discovery"
-
-	"context"
-
 	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/mysql/capabilities"
 	"vitess.io/vitess/go/mysql/fakesqldb"
+	"vitess.io/vitess/go/mysql/replication"
 	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/discovery"
 	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/mysqlctl"
 	"vitess.io/vitess/go/vt/mysqlctl/backupstorage"
 	"vitess.io/vitess/go/vt/mysqlctl/filebackupstorage"
-	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
 	"vitess.io/vitess/go/vt/topo/topoproto"
-	"vitess.io/vitess/go/vt/vtctl/reparentutil"
+	"vitess.io/vitess/go/vt/vtenv"
 	"vitess.io/vitess/go/vt/vttablet/tmclient"
 	"vitess.io/vitess/go/vt/wrangler"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
+const mysqlShutdownTimeout = 1 * time.Minute
+
+type compressionDetails struct {
+	CompressionEngineName   string
+	ExternalCompressorCmd   string
+	ExternalCompressorExt   string
+	ExternalDecompressorCmd string
+}
+
 func TestBackupRestore(t *testing.T) {
-	_ = reparentutil.SetDurabilityPolicy("none")
+	defer setDefaultCompressionFlag()
+	err := testBackupRestore(t, nil)
+	require.NoError(t, err)
+}
+
+func TestBackupRestoreWithPargzip(t *testing.T) {
+	defer setDefaultCompressionFlag()
+	cDetails := &compressionDetails{
+		CompressionEngineName: "pargzip",
+	}
+
+	err := testBackupRestore(t, cDetails)
+	require.NoError(t, err)
+}
+
+func setDefaultCompressionFlag() {
+	mysqlctl.CompressionEngineName = "pgzip"
+	mysqlctl.ExternalCompressorCmd = ""
+	mysqlctl.ExternalCompressorExt = ""
+	mysqlctl.ExternalDecompressorCmd = ""
+}
+
+func testBackupRestore(t *testing.T, cDetails *compressionDetails) error {
 	delay := discovery.GetTabletPickerRetryDelay()
 	defer func() {
 		discovery.SetTabletPickerRetryDelay(delay)
@@ -57,36 +86,42 @@ func TestBackupRestore(t *testing.T) {
 	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
 
 	// Initialize our environment
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	db := fakesqldb.New(t)
 	defer db.Close()
-	ts := memorytopo.NewServer("cell1", "cell2")
-	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
-	vp := NewVtctlPipe(t, ts)
+	ts := memorytopo.NewServer(ctx, "cell1", "cell2")
+	wr := wrangler.New(vtenv.NewTestEnv(), logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
+	vp := NewVtctlPipe(ctx, t, ts)
 	defer vp.Close()
 
 	// Set up mock query results.
-	db.AddQuery("CREATE DATABASE IF NOT EXISTS _vt", &sqltypes.Result{})
+	db.AddQuery(mysqlctl.GenerateInitialBinlogEntry(), &sqltypes.Result{})
 	db.AddQuery("BEGIN", &sqltypes.Result{})
 	db.AddQuery("COMMIT", &sqltypes.Result{})
 	db.AddQueryPattern(`SET @@session\.sql_log_bin = .*`, &sqltypes.Result{})
-	db.AddQueryPattern(`CREATE TABLE IF NOT EXISTS _vt\.shard_metadata .*`, &sqltypes.Result{})
-	db.AddQueryPattern(`CREATE TABLE IF NOT EXISTS _vt\.local_metadata .*`, &sqltypes.Result{})
-	db.AddQueryPattern(`ALTER TABLE _vt\.local_metadata .*`, &sqltypes.Result{})
-	db.AddQueryPattern(`ALTER TABLE _vt\.shard_metadata .*`, &sqltypes.Result{})
-	db.AddQueryPattern(`UPDATE _vt\.local_metadata SET db_name=.*`, &sqltypes.Result{})
-	db.AddQueryPattern(`UPDATE _vt\.shard_metadata SET db_name=.*`, &sqltypes.Result{})
-	db.AddQueryPattern(`INSERT INTO _vt\.local_metadata .*`, &sqltypes.Result{})
 
 	// Initialize our temp dirs
-	root, err := os.MkdirTemp("", "backuptest")
-	require.NoError(t, err)
-	defer os.RemoveAll(root)
+	root := t.TempDir()
 
 	// Initialize BackupStorage
 	fbsRoot := path.Join(root, "fbs")
-	*filebackupstorage.FileBackupStorageRoot = fbsRoot
-	*backupstorage.BackupStorageImplementation = "file"
+	filebackupstorage.FileBackupStorageRoot = fbsRoot
+	backupstorage.BackupStorageImplementation = "file"
+	if cDetails != nil {
+		if cDetails.CompressionEngineName != "" {
+			mysqlctl.CompressionEngineName = cDetails.CompressionEngineName
+		}
+		if cDetails.ExternalCompressorCmd != "" {
+			mysqlctl.ExternalCompressorCmd = cDetails.ExternalCompressorCmd
+		}
+		if cDetails.ExternalCompressorExt != "" {
+			mysqlctl.ExternalCompressorExt = cDetails.ExternalCompressorExt
+		}
+		if cDetails.ExternalDecompressorCmd != "" {
+			mysqlctl.ExternalDecompressorCmd = cDetails.ExternalDecompressorCmd
+		}
+	}
 
 	// Initialize the fake mysql root directories
 	sourceInnodbDataDir := path.Join(root, "source_innodb_data")
@@ -96,17 +131,27 @@ func TestBackupRestore(t *testing.T) {
 	for _, s := range []string{sourceInnodbDataDir, sourceInnodbLogDir, sourceDataDbDir} {
 		require.NoError(t, os.MkdirAll(s, os.ModePerm))
 	}
+
+	needIt, err := needInnoDBRedoLogSubdir()
+	require.NoError(t, err)
+	if needIt {
+		newPath := path.Join(sourceInnodbLogDir, mysql.DynamicRedoLogSubdir)
+		require.NoError(t, os.Mkdir(newPath, os.ModePerm))
+		require.NoError(t, os.WriteFile(path.Join(newPath, "#ib_redo1"), []byte("innodb log 1 contents"), os.ModePerm))
+	} else {
+		require.NoError(t, os.WriteFile(path.Join(sourceInnodbLogDir, "innodb_log_1"), []byte("innodb log 1 contents"), os.ModePerm))
+	}
+
 	require.NoError(t, os.WriteFile(path.Join(sourceInnodbDataDir, "innodb_data_1"), []byte("innodb data 1 contents"), os.ModePerm))
-	require.NoError(t, os.WriteFile(path.Join(sourceInnodbLogDir, "innodb_log_1"), []byte("innodb log 1 contents"), os.ModePerm))
 	require.NoError(t, os.WriteFile(path.Join(sourceDataDbDir, "db.opt"), []byte("db opt file"), os.ModePerm))
 
 	// create a primary tablet, set its primary position
 	primary := NewFakeTablet(t, wr, "cell1", 0, topodatapb.TabletType_PRIMARY, db)
 	primary.FakeMysqlDaemon.ReadOnly = false
 	primary.FakeMysqlDaemon.Replicating = false
-	primary.FakeMysqlDaemon.CurrentPrimaryPosition = mysql.Position{
-		GTIDSet: mysql.MariadbGTIDSet{
-			2: mysql.MariadbGTID{
+	primary.FakeMysqlDaemon.CurrentPrimaryPosition = replication.Position{
+		GTIDSet: replication.MariadbGTIDSet{
+			2: replication.MariadbGTID{
 				Domain:   2,
 				Server:   123,
 				Sequence: 457,
@@ -124,9 +169,9 @@ func TestBackupRestore(t *testing.T) {
 	sourceTablet.FakeMysqlDaemon.ReadOnly = true
 	sourceTablet.FakeMysqlDaemon.Replicating = true
 	sourceTablet.FakeMysqlDaemon.SetReplicationSourceInputs = []string{fmt.Sprintf("%s:%d", primary.Tablet.MysqlHostname, primary.Tablet.MysqlPort)}
-	sourceTablet.FakeMysqlDaemon.CurrentPrimaryPosition = mysql.Position{
-		GTIDSet: mysql.MariadbGTIDSet{
-			2: mysql.MariadbGTID{
+	sourceTablet.FakeMysqlDaemon.CurrentPrimaryPosition = replication.Position{
+		GTIDSet: replication.MariadbGTIDSet{
+			2: replication.MariadbGTID{
 				Domain:   2,
 				Server:   123,
 				Sequence: 457,
@@ -134,16 +179,23 @@ func TestBackupRestore(t *testing.T) {
 		},
 	}
 	sourceTablet.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
+		// These 3 statements come from tablet startup
+		"STOP REPLICA",
+		"FAKE SET SOURCE",
+		"START REPLICA",
 		// This first set of STOP and START commands come from
 		// the builtinBackupEngine implementation which stops the replication
 		// while taking the backup
-		"STOP SLAVE",
-		"START SLAVE",
+		"STOP REPLICA",
+		"START REPLICA",
 		// These commands come from SetReplicationSource RPC called
-		// to set the correct primary and semi-sync after Backup has concluded
-		"STOP SLAVE",
-		"FAKE SET MASTER",
-		"START SLAVE",
+		// to set the correct primary and semi-sync after Backup has concluded.
+		// Since the primary hasn't changed, we only restart replication after fixing semi-sync.
+		"STOP REPLICA",
+		"START REPLICA",
+	}
+	sourceTablet.FakeMysqlDaemon.FetchSuperQueryMap = map[string]*sqltypes.Result{
+		"SHOW DATABASES": {},
 	}
 	sourceTablet.StartActionLoop(t, wr)
 	defer sourceTablet.StopActionLoop(t)
@@ -168,9 +220,9 @@ func TestBackupRestore(t *testing.T) {
 	destTablet := NewFakeTablet(t, wr, "cell1", 2, topodatapb.TabletType_REPLICA, db)
 	destTablet.FakeMysqlDaemon.ReadOnly = true
 	destTablet.FakeMysqlDaemon.Replicating = true
-	destTablet.FakeMysqlDaemon.CurrentPrimaryPosition = mysql.Position{
-		GTIDSet: mysql.MariadbGTIDSet{
-			2: mysql.MariadbGTID{
+	destTablet.FakeMysqlDaemon.CurrentPrimaryPosition = replication.Position{
+		GTIDSet: replication.MariadbGTIDSet{
+			2: replication.MariadbGTID{
 				Domain:   2,
 				Server:   123,
 				Sequence: 457,
@@ -178,11 +230,19 @@ func TestBackupRestore(t *testing.T) {
 		},
 	}
 	destTablet.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
-		"STOP SLAVE",
-		"RESET SLAVE ALL",
-		"FAKE SET SLAVE POSITION",
-		"FAKE SET MASTER",
-		"START SLAVE",
+		// These 3 statements come from tablet startup
+		"STOP REPLICA",
+		"FAKE SET SOURCE",
+		"START REPLICA",
+		"FAKE RESET BINARY LOGS AND GTIDS",
+		"FAKE SET GLOBAL gtid_purged",
+		"STOP REPLICA",
+		"FAKE RESET REPLICA ALL",
+		"FAKE RESET BINARY LOGS AND GTIDS",
+		"FAKE SET GLOBAL gtid_purged",
+		"STOP REPLICA",
+		"FAKE SET SOURCE",
+		"START REPLICA",
 	}
 	destTablet.FakeMysqlDaemon.FetchSuperQueryMap = map[string]*sqltypes.Result{
 		"SHOW DATABASES": {},
@@ -203,7 +263,10 @@ func TestBackupRestore(t *testing.T) {
 		RelayLogInfoPath:      path.Join(root, "relay-log.info"),
 	}
 
-	require.NoError(t, destTablet.TM.RestoreData(ctx, logutil.NewConsoleLogger(), 0 /* waitForBackupInterval */, false /* deleteBeforeRestore */, time.Time{} /* backupTime */))
+	err = destTablet.TM.RestoreData(ctx, logutil.NewConsoleLogger(), 0 /* waitForBackupInterval */, false /* deleteBeforeRestore */, time.Time{} /* backupTime */, time.Time{} /* restoreToTimestamp */, "" /* restoreToPos */, []string{} /* ignoreBackupEngines */, mysqlShutdownTimeout)
+	if err != nil {
+		return err
+	}
 	// verify the full status
 	require.NoError(t, destTablet.FakeMysqlDaemon.CheckSuperQueryList(), "destTablet.FakeMysqlDaemon.CheckSuperQueryList failed")
 	assert.True(t, destTablet.FakeMysqlDaemon.Replicating)
@@ -227,17 +290,20 @@ func TestBackupRestore(t *testing.T) {
 		"SHOW DATABASES": {},
 	}
 	primary.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
-		"STOP SLAVE",
-		"RESET SLAVE ALL",
-		"FAKE SET SLAVE POSITION",
-		"FAKE SET MASTER",
-		"START SLAVE",
+		"FAKE RESET BINARY LOGS AND GTIDS",
+		"FAKE SET GLOBAL gtid_purged",
+		"STOP REPLICA",
+		"FAKE RESET REPLICA ALL",
+		"FAKE RESET BINARY LOGS AND GTIDS",
+		"FAKE SET GLOBAL gtid_purged",
+		"FAKE SET SOURCE",
+		"START REPLICA",
 	}
 
 	primary.FakeMysqlDaemon.SetReplicationPositionPos = primary.FakeMysqlDaemon.CurrentPrimaryPosition
 
 	// restore primary from latest backup
-	require.NoError(t, primary.TM.RestoreData(ctx, logutil.NewConsoleLogger(), 0 /* waitForBackupInterval */, false /* deleteBeforeRestore */, time.Time{} /* restoreFromBackupTs */),
+	require.NoError(t, primary.TM.RestoreData(ctx, logutil.NewConsoleLogger(), 0 /* waitForBackupInterval */, false /* deleteBeforeRestore */, time.Time{} /* restoreFromBackupTs */, time.Time{} /* restoreToTimestamp */, "" /* restoreToPos */, []string{} /* ignoreBackupEngines */, mysqlShutdownTimeout),
 		"RestoreData failed")
 	// tablet was created as PRIMARY, so it's baseTabletType is PRIMARY
 	assert.Equal(t, topodatapb.TabletType_PRIMARY, primary.Tablet.Type)
@@ -253,18 +319,18 @@ func TestBackupRestore(t *testing.T) {
 	}
 
 	// Test restore with the backup timestamp
-	require.NoError(t, primary.TM.RestoreData(ctx, logutil.NewConsoleLogger(), 0 /* waitForBackupInterval */, false /* deleteBeforeRestore */, backupTime),
+	require.NoError(t, primary.TM.RestoreData(ctx, logutil.NewConsoleLogger(), 0 /* waitForBackupInterval */, false /* deleteBeforeRestore */, backupTime, time.Time{} /* restoreToTimestamp */, "" /* restoreToPos */, []string{} /* ignoreBackupEngines */, mysqlShutdownTimeout),
 		"RestoreData with backup timestamp failed")
 	assert.Equal(t, topodatapb.TabletType_PRIMARY, primary.Tablet.Type)
 	assert.False(t, primary.FakeMysqlDaemon.Replicating)
 	assert.True(t, primary.FakeMysqlDaemon.Running)
+	return nil
 }
 
 // TestBackupRestoreLagged tests the changes made in https://github.com/vitessio/vitess/pull/5000
 // While doing a backup or a restore, we wait for a change of the replica's position before completing the action
 // This is because otherwise ReplicationLagSeconds is not accurate and the tablet may go into SERVING when it should not
 func TestBackupRestoreLagged(t *testing.T) {
-	_ = reparentutil.SetDurabilityPolicy("none")
 	delay := discovery.GetTabletPickerRetryDelay()
 	defer func() {
 		discovery.SetTabletPickerRetryDelay(delay)
@@ -272,36 +338,28 @@ func TestBackupRestoreLagged(t *testing.T) {
 	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
 
 	// Initialize our environment
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	db := fakesqldb.New(t)
 	defer db.Close()
-	ts := memorytopo.NewServer("cell1", "cell2")
-	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
-	vp := NewVtctlPipe(t, ts)
+	ts := memorytopo.NewServer(ctx, "cell1", "cell2")
+	wr := wrangler.New(vtenv.NewTestEnv(), logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
+	vp := NewVtctlPipe(ctx, t, ts)
 	defer vp.Close()
 
 	// Set up mock query results.
-	db.AddQuery("CREATE DATABASE IF NOT EXISTS _vt", &sqltypes.Result{})
+	db.AddQuery(mysqlctl.GenerateInitialBinlogEntry(), &sqltypes.Result{})
 	db.AddQuery("BEGIN", &sqltypes.Result{})
 	db.AddQuery("COMMIT", &sqltypes.Result{})
 	db.AddQueryPattern(`SET @@session\.sql_log_bin = .*`, &sqltypes.Result{})
-	db.AddQueryPattern(`CREATE TABLE IF NOT EXISTS _vt\.shard_metadata .*`, &sqltypes.Result{})
-	db.AddQueryPattern(`CREATE TABLE IF NOT EXISTS _vt\.local_metadata .*`, &sqltypes.Result{})
-	db.AddQueryPattern(`ALTER TABLE _vt\.local_metadata .*`, &sqltypes.Result{})
-	db.AddQueryPattern(`ALTER TABLE _vt\.shard_metadata .*`, &sqltypes.Result{})
-	db.AddQueryPattern(`UPDATE _vt\.local_metadata SET db_name=.*`, &sqltypes.Result{})
-	db.AddQueryPattern(`UPDATE _vt\.shard_metadata SET db_name=.*`, &sqltypes.Result{})
-	db.AddQueryPattern(`INSERT INTO _vt\.local_metadata .*`, &sqltypes.Result{})
 
 	// Initialize our temp dirs
-	root, err := os.MkdirTemp("", "backuptest")
-	require.NoError(t, err)
-	defer os.RemoveAll(root)
+	root := t.TempDir()
 
 	// Initialize BackupStorage
 	fbsRoot := path.Join(root, "fbs")
-	*filebackupstorage.FileBackupStorageRoot = fbsRoot
-	*backupstorage.BackupStorageImplementation = "file"
+	filebackupstorage.FileBackupStorageRoot = fbsRoot
+	backupstorage.BackupStorageImplementation = "file"
 
 	// Initialize the fake mysql root directories
 	sourceInnodbDataDir := path.Join(root, "source_innodb_data")
@@ -312,16 +370,26 @@ func TestBackupRestoreLagged(t *testing.T) {
 		require.NoError(t, os.MkdirAll(s, os.ModePerm))
 	}
 	require.NoError(t, os.WriteFile(path.Join(sourceInnodbDataDir, "innodb_data_1"), []byte("innodb data 1 contents"), os.ModePerm))
-	require.NoError(t, os.WriteFile(path.Join(sourceInnodbLogDir, "innodb_log_1"), []byte("innodb log 1 contents"), os.ModePerm))
+
+	needIt, err := needInnoDBRedoLogSubdir()
+	require.NoError(t, err)
+	if needIt {
+		newPath := path.Join(sourceInnodbLogDir, mysql.DynamicRedoLogSubdir)
+		require.NoError(t, os.Mkdir(newPath, os.ModePerm))
+		require.NoError(t, os.WriteFile(path.Join(newPath, "#ib_redo1"), []byte("innodb log 1 contents"), os.ModePerm))
+	} else {
+		require.NoError(t, os.WriteFile(path.Join(sourceInnodbLogDir, "innodb_log_1"), []byte("innodb log 1 contents"), os.ModePerm))
+	}
+
 	require.NoError(t, os.WriteFile(path.Join(sourceDataDbDir, "db.opt"), []byte("db opt file"), os.ModePerm))
 
 	// create a primary tablet, set its position
 	primary := NewFakeTablet(t, wr, "cell1", 0, topodatapb.TabletType_PRIMARY, db)
 	primary.FakeMysqlDaemon.ReadOnly = false
 	primary.FakeMysqlDaemon.Replicating = false
-	primary.FakeMysqlDaemon.CurrentPrimaryPosition = mysql.Position{
-		GTIDSet: mysql.MariadbGTIDSet{
-			2: mysql.MariadbGTID{
+	primary.FakeMysqlDaemon.CurrentPrimaryPosition = replication.Position{
+		GTIDSet: replication.MariadbGTIDSet{
+			2: replication.MariadbGTID{
 				Domain:   2,
 				Server:   123,
 				Sequence: 457,
@@ -338,9 +406,9 @@ func TestBackupRestoreLagged(t *testing.T) {
 	sourceTablet := NewFakeTablet(t, wr, "cell1", 1, topodatapb.TabletType_REPLICA, db)
 	sourceTablet.FakeMysqlDaemon.ReadOnly = true
 	sourceTablet.FakeMysqlDaemon.Replicating = true
-	sourceTablet.FakeMysqlDaemon.CurrentPrimaryPosition = mysql.Position{
-		GTIDSet: mysql.MariadbGTIDSet{
-			2: mysql.MariadbGTID{
+	sourceTablet.FakeMysqlDaemon.CurrentPrimaryPosition = replication.Position{
+		GTIDSet: replication.MariadbGTIDSet{
+			2: replication.MariadbGTID{
 				Domain:   2,
 				Server:   123,
 				Sequence: 456,
@@ -349,16 +417,20 @@ func TestBackupRestoreLagged(t *testing.T) {
 	}
 	sourceTablet.FakeMysqlDaemon.SetReplicationSourceInputs = []string{fmt.Sprintf("%s:%d", primary.Tablet.MysqlHostname, primary.Tablet.MysqlPort)}
 	sourceTablet.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
+		// These 3 statements come from tablet startup
+		"STOP REPLICA",
+		"FAKE SET SOURCE",
+		"START REPLICA",
 		// This first set of STOP and START commands come from
 		// the builtinBackupEngine implementation which stops the replication
 		// while taking the backup
-		"STOP SLAVE",
-		"START SLAVE",
+		"STOP REPLICA",
+		"START REPLICA",
 		// These commands come from SetReplicationSource RPC called
-		// to set the correct primary and semi-sync after Backup has concluded
-		"STOP SLAVE",
-		"FAKE SET MASTER",
-		"START SLAVE",
+		// to set the correct primary and semi-sync after Backup has concluded.
+		// Since the primary hasn't changed, we only restart replication after fixing semi-sync.
+		"STOP REPLICA",
+		"START REPLICA",
 	}
 	sourceTablet.StartActionLoop(t, wr)
 	defer sourceTablet.StopActionLoop(t)
@@ -376,9 +448,9 @@ func TestBackupRestoreLagged(t *testing.T) {
 
 	timer := time.NewTicker(1 * time.Second)
 	<-timer.C
-	sourceTablet.FakeMysqlDaemon.CurrentPrimaryPositionLocked(mysql.Position{
-		GTIDSet: mysql.MariadbGTIDSet{
-			2: mysql.MariadbGTID{
+	sourceTablet.FakeMysqlDaemon.CurrentPrimaryPositionLocked(replication.Position{
+		GTIDSet: replication.MariadbGTIDSet{
+			2: replication.MariadbGTID{
 				Domain:   2,
 				Server:   123,
 				Sequence: 457,
@@ -404,9 +476,9 @@ func TestBackupRestoreLagged(t *testing.T) {
 	destTablet := NewFakeTablet(t, wr, "cell1", 2, topodatapb.TabletType_REPLICA, db)
 	destTablet.FakeMysqlDaemon.ReadOnly = true
 	destTablet.FakeMysqlDaemon.Replicating = true
-	destTablet.FakeMysqlDaemon.CurrentPrimaryPosition = mysql.Position{
-		GTIDSet: mysql.MariadbGTIDSet{
-			2: mysql.MariadbGTID{
+	destTablet.FakeMysqlDaemon.CurrentPrimaryPosition = replication.Position{
+		GTIDSet: replication.MariadbGTIDSet{
+			2: replication.MariadbGTID{
 				Domain:   2,
 				Server:   123,
 				Sequence: 456,
@@ -414,11 +486,19 @@ func TestBackupRestoreLagged(t *testing.T) {
 		},
 	}
 	destTablet.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
-		"STOP SLAVE",
-		"RESET SLAVE ALL",
-		"FAKE SET SLAVE POSITION",
-		"FAKE SET MASTER",
-		"START SLAVE",
+		// These 3 statements come from tablet startup
+		"STOP REPLICA",
+		"FAKE SET SOURCE",
+		"START REPLICA",
+		"FAKE RESET BINARY LOGS AND GTIDS",
+		"FAKE SET GLOBAL gtid_purged",
+		"STOP REPLICA",
+		"FAKE RESET REPLICA ALL",
+		"FAKE RESET BINARY LOGS AND GTIDS",
+		"FAKE SET GLOBAL gtid_purged",
+		"STOP REPLICA",
+		"FAKE SET SOURCE",
+		"START REPLICA",
 	}
 	destTablet.FakeMysqlDaemon.FetchSuperQueryMap = map[string]*sqltypes.Result{
 		"SHOW DATABASES": {},
@@ -441,14 +521,14 @@ func TestBackupRestoreLagged(t *testing.T) {
 
 	errCh = make(chan error, 1)
 	go func(ctx context.Context, tablet *FakeTablet) {
-		errCh <- tablet.TM.RestoreData(ctx, logutil.NewConsoleLogger(), 0 /* waitForBackupInterval */, false /* deleteBeforeRestore */, time.Time{} /* restoreFromBackupTs */)
+		errCh <- tablet.TM.RestoreData(ctx, logutil.NewConsoleLogger(), 0 /* waitForBackupInterval */, false /* deleteBeforeRestore */, time.Time{} /* restoreFromBackupTs */, time.Time{} /* restoreToTimestamp */, "" /* restoreToPos */, []string{} /* ignoreBackupEngines */, mysqlShutdownTimeout)
 	}(ctx, destTablet)
 
 	timer = time.NewTicker(1 * time.Second)
 	<-timer.C
-	destTablet.FakeMysqlDaemon.CurrentPrimaryPositionLocked(mysql.Position{
-		GTIDSet: mysql.MariadbGTIDSet{
-			2: mysql.MariadbGTID{
+	destTablet.FakeMysqlDaemon.CurrentPrimaryPositionLocked(replication.Position{
+		GTIDSet: replication.MariadbGTIDSet{
+			2: replication.MariadbGTID{
 				Domain:   2,
 				Server:   123,
 				Sequence: 457,
@@ -471,7 +551,6 @@ func TestBackupRestoreLagged(t *testing.T) {
 }
 
 func TestRestoreUnreachablePrimary(t *testing.T) {
-	_ = reparentutil.SetDurabilityPolicy("none")
 	delay := discovery.GetTabletPickerRetryDelay()
 	defer func() {
 		discovery.SetTabletPickerRetryDelay(delay)
@@ -479,36 +558,28 @@ func TestRestoreUnreachablePrimary(t *testing.T) {
 	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
 
 	// Initialize our environment
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	db := fakesqldb.New(t)
 	defer db.Close()
-	ts := memorytopo.NewServer("cell1")
-	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
-	vp := NewVtctlPipe(t, ts)
+	ts := memorytopo.NewServer(ctx, "cell1")
+	wr := wrangler.New(vtenv.NewTestEnv(), logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
+	vp := NewVtctlPipe(ctx, t, ts)
 	defer vp.Close()
 
 	// Set up mock query results.
-	db.AddQuery("CREATE DATABASE IF NOT EXISTS _vt", &sqltypes.Result{})
+	db.AddQuery(mysqlctl.GenerateInitialBinlogEntry(), &sqltypes.Result{})
 	db.AddQuery("BEGIN", &sqltypes.Result{})
 	db.AddQuery("COMMIT", &sqltypes.Result{})
 	db.AddQueryPattern(`SET @@session\.sql_log_bin = .*`, &sqltypes.Result{})
-	db.AddQueryPattern(`CREATE TABLE IF NOT EXISTS _vt\.shard_metadata .*`, &sqltypes.Result{})
-	db.AddQueryPattern(`CREATE TABLE IF NOT EXISTS _vt\.local_metadata .*`, &sqltypes.Result{})
-	db.AddQueryPattern(`ALTER TABLE _vt\.local_metadata .*`, &sqltypes.Result{})
-	db.AddQueryPattern(`ALTER TABLE _vt\.shard_metadata .*`, &sqltypes.Result{})
-	db.AddQueryPattern(`UPDATE _vt\.local_metadata SET db_name=.*`, &sqltypes.Result{})
-	db.AddQueryPattern(`UPDATE _vt\.shard_metadata SET db_name=.*`, &sqltypes.Result{})
-	db.AddQueryPattern(`INSERT INTO _vt\.local_metadata .*`, &sqltypes.Result{})
 
 	// Initialize our temp dirs
-	root, err := os.MkdirTemp("", "backuptest")
-	require.NoError(t, err)
-	defer os.RemoveAll(root)
+	root := t.TempDir()
 
 	// Initialize BackupStorage
 	fbsRoot := path.Join(root, "fbs")
-	*filebackupstorage.FileBackupStorageRoot = fbsRoot
-	*backupstorage.BackupStorageImplementation = "file"
+	filebackupstorage.FileBackupStorageRoot = fbsRoot
+	backupstorage.BackupStorageImplementation = "file"
 
 	// Initialize the fake mysql root directories
 	sourceInnodbDataDir := path.Join(root, "source_innodb_data")
@@ -519,16 +590,26 @@ func TestRestoreUnreachablePrimary(t *testing.T) {
 		require.NoError(t, os.MkdirAll(s, os.ModePerm))
 	}
 	require.NoError(t, os.WriteFile(path.Join(sourceInnodbDataDir, "innodb_data_1"), []byte("innodb data 1 contents"), os.ModePerm))
-	require.NoError(t, os.WriteFile(path.Join(sourceInnodbLogDir, "innodb_log_1"), []byte("innodb log 1 contents"), os.ModePerm))
+
+	needIt, err := needInnoDBRedoLogSubdir()
+	require.NoError(t, err)
+	if needIt {
+		newPath := path.Join(sourceInnodbLogDir, mysql.DynamicRedoLogSubdir)
+		require.NoError(t, os.Mkdir(newPath, os.ModePerm))
+		require.NoError(t, os.WriteFile(path.Join(newPath, "#ib_redo1"), []byte("innodb log 1 contents"), os.ModePerm))
+	} else {
+		require.NoError(t, os.WriteFile(path.Join(sourceInnodbLogDir, "innodb_log_1"), []byte("innodb log 1 contents"), os.ModePerm))
+	}
+
 	require.NoError(t, os.WriteFile(path.Join(sourceDataDbDir, "db.opt"), []byte("db opt file"), os.ModePerm))
 
 	// create a primary tablet, set its primary position
 	primary := NewFakeTablet(t, wr, "cell1", 0, topodatapb.TabletType_PRIMARY, db)
 	primary.FakeMysqlDaemon.ReadOnly = false
 	primary.FakeMysqlDaemon.Replicating = false
-	primary.FakeMysqlDaemon.CurrentPrimaryPosition = mysql.Position{
-		GTIDSet: mysql.MariadbGTIDSet{
-			2: mysql.MariadbGTID{
+	primary.FakeMysqlDaemon.CurrentPrimaryPosition = replication.Position{
+		GTIDSet: replication.MariadbGTIDSet{
+			2: replication.MariadbGTID{
 				Domain:   2,
 				Server:   123,
 				Sequence: 457,
@@ -544,9 +625,9 @@ func TestRestoreUnreachablePrimary(t *testing.T) {
 	sourceTablet := NewFakeTablet(t, wr, "cell1", 1, topodatapb.TabletType_REPLICA, db)
 	sourceTablet.FakeMysqlDaemon.ReadOnly = true
 	sourceTablet.FakeMysqlDaemon.Replicating = true
-	sourceTablet.FakeMysqlDaemon.CurrentPrimaryPosition = mysql.Position{
-		GTIDSet: mysql.MariadbGTIDSet{
-			2: mysql.MariadbGTID{
+	sourceTablet.FakeMysqlDaemon.CurrentPrimaryPosition = replication.Position{
+		GTIDSet: replication.MariadbGTIDSet{
+			2: replication.MariadbGTID{
 				Domain:   2,
 				Server:   123,
 				Sequence: 457,
@@ -555,16 +636,20 @@ func TestRestoreUnreachablePrimary(t *testing.T) {
 	}
 	sourceTablet.FakeMysqlDaemon.SetReplicationSourceInputs = []string{fmt.Sprintf("%s:%d", primary.Tablet.MysqlHostname, primary.Tablet.MysqlPort)}
 	sourceTablet.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
+		// These 3 statements come from tablet startup
+		"STOP REPLICA",
+		"FAKE SET SOURCE",
+		"START REPLICA",
 		// This first set of STOP and START commands come from
 		// the builtinBackupEngine implementation which stops the replication
 		// while taking the backup
-		"STOP SLAVE",
-		"START SLAVE",
+		"STOP REPLICA",
+		"START REPLICA",
 		// These commands come from SetReplicationSource RPC called
-		// to set the correct primary and semi-sync after Backup has concluded
-		"STOP SLAVE",
-		"FAKE SET MASTER",
-		"START SLAVE",
+		// to set the correct primary and semi-sync after Backup has concluded.
+		// Since the primary hasn't changed, we only restart replication after fixing semi-sync.
+		"STOP REPLICA",
+		"START REPLICA",
 	}
 	sourceTablet.StartActionLoop(t, wr)
 	defer sourceTablet.StopActionLoop(t)
@@ -582,9 +667,9 @@ func TestRestoreUnreachablePrimary(t *testing.T) {
 	destTablet := NewFakeTablet(t, wr, "cell1", 2, topodatapb.TabletType_REPLICA, db)
 	destTablet.FakeMysqlDaemon.ReadOnly = true
 	destTablet.FakeMysqlDaemon.Replicating = true
-	destTablet.FakeMysqlDaemon.CurrentPrimaryPosition = mysql.Position{
-		GTIDSet: mysql.MariadbGTIDSet{
-			2: mysql.MariadbGTID{
+	destTablet.FakeMysqlDaemon.CurrentPrimaryPosition = replication.Position{
+		GTIDSet: replication.MariadbGTIDSet{
+			2: replication.MariadbGTID{
 				Domain:   2,
 				Server:   123,
 				Sequence: 457,
@@ -592,11 +677,16 @@ func TestRestoreUnreachablePrimary(t *testing.T) {
 		},
 	}
 	destTablet.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
-		"STOP SLAVE",
-		"RESET SLAVE ALL",
-		"FAKE SET SLAVE POSITION",
-		"FAKE SET MASTER",
-		"START SLAVE",
+		// These 3 statements come from tablet startup
+		"STOP REPLICA",
+		"FAKE SET SOURCE",
+		"START REPLICA",
+		"FAKE RESET BINARY LOGS AND GTIDS",
+		"FAKE SET GLOBAL gtid_purged",
+		"STOP REPLICA",
+		"FAKE RESET REPLICA ALL",
+		"FAKE RESET BINARY LOGS AND GTIDS",
+		"FAKE SET GLOBAL gtid_purged",
 	}
 	destTablet.FakeMysqlDaemon.FetchSuperQueryMap = map[string]*sqltypes.Result{
 		"SHOW DATABASES": {},
@@ -620,58 +710,52 @@ func TestRestoreUnreachablePrimary(t *testing.T) {
 	// stop primary so that it is unreachable
 	primary.StopActionLoop(t)
 
-	// set a short timeout so that we don't have to wait 30 seconds
-	*topo.RemoteOperationTimeout = 2 * time.Second
-	// Restore should still succeed
-	require.NoError(t, destTablet.TM.RestoreData(ctx, logutil.NewConsoleLogger(), 0 /* waitForBackupInterval */, false /* deleteBeforeRestore */, time.Time{} /* restoreFromBackupTs */))
+	// Attempt to fix the test, but its still failing :man_shrugging.
+	ctx, cancel = context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	// Restore will return an error while trying to contact the primary for its position, but otherwise will succeed.
+	// The replication won't be running however, since we can't run errant GTID detection without the primary being online.
+	err = destTablet.TM.RestoreData(ctx, logutil.NewConsoleLogger(), 0 /* waitForBackupInterval */, false /* deleteBeforeRestore */, time.Time{} /* restoreFromBackupTs */, time.Time{} /* restoreToTimestamp */, "" /* restoreToPos */, []string{} /* ignoreBackupEngines */, mysqlShutdownTimeout)
+	require.ErrorContains(t, err, "DeadlineExceeded")
 	// verify the full status
 	require.NoError(t, destTablet.FakeMysqlDaemon.CheckSuperQueryList(), "destTablet.FakeMysqlDaemon.CheckSuperQueryList failed")
-	assert.True(t, destTablet.FakeMysqlDaemon.Replicating)
+	assert.False(t, destTablet.FakeMysqlDaemon.Replicating)
 	assert.True(t, destTablet.FakeMysqlDaemon.Running)
 }
 
 func TestDisableActiveReparents(t *testing.T) {
-	_ = reparentutil.SetDurabilityPolicy("none")
-	*mysqlctl.DisableActiveReparents = true
+	mysqlctl.DisableActiveReparents = true
 	delay := discovery.GetTabletPickerRetryDelay()
 	defer func() {
 		// When you mess with globals you must remember to reset them
-		*mysqlctl.DisableActiveReparents = false
+		mysqlctl.DisableActiveReparents = false
 		discovery.SetTabletPickerRetryDelay(delay)
 	}()
 	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
 
 	// Initialize our environment
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	db := fakesqldb.New(t)
 	defer db.Close()
-	ts := memorytopo.NewServer("cell1", "cell2")
-	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
-	vp := NewVtctlPipe(t, ts)
+	ts := memorytopo.NewServer(ctx, "cell1", "cell2")
+	wr := wrangler.New(vtenv.NewTestEnv(), logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
+	vp := NewVtctlPipe(ctx, t, ts)
 	defer vp.Close()
 
 	// Set up mock query results.
-	db.AddQuery("CREATE DATABASE IF NOT EXISTS _vt", &sqltypes.Result{})
+	db.AddQuery(mysqlctl.GenerateInitialBinlogEntry(), &sqltypes.Result{})
 	db.AddQuery("BEGIN", &sqltypes.Result{})
 	db.AddQuery("COMMIT", &sqltypes.Result{})
 	db.AddQueryPattern(`SET @@session\.sql_log_bin = .*`, &sqltypes.Result{})
-	db.AddQueryPattern(`CREATE TABLE IF NOT EXISTS _vt\.shard_metadata .*`, &sqltypes.Result{})
-	db.AddQueryPattern(`CREATE TABLE IF NOT EXISTS _vt\.local_metadata .*`, &sqltypes.Result{})
-	db.AddQueryPattern(`ALTER TABLE _vt\.local_metadata .*`, &sqltypes.Result{})
-	db.AddQueryPattern(`ALTER TABLE _vt\.shard_metadata .*`, &sqltypes.Result{})
-	db.AddQueryPattern(`UPDATE _vt\.local_metadata SET db_name=.*`, &sqltypes.Result{})
-	db.AddQueryPattern(`UPDATE _vt\.shard_metadata SET db_name=.*`, &sqltypes.Result{})
-	db.AddQueryPattern(`INSERT INTO _vt\.local_metadata .*`, &sqltypes.Result{})
 
 	// Initialize our temp dirs
-	root, err := os.MkdirTemp("", "backuptest")
-	require.NoError(t, err)
-	defer os.RemoveAll(root)
+	root := t.TempDir()
 
 	// Initialize BackupStorage
 	fbsRoot := path.Join(root, "fbs")
-	*filebackupstorage.FileBackupStorageRoot = fbsRoot
-	*backupstorage.BackupStorageImplementation = "file"
+	filebackupstorage.FileBackupStorageRoot = fbsRoot
+	backupstorage.BackupStorageImplementation = "file"
 
 	// Initialize the fake mysql root directories
 	sourceInnodbDataDir := path.Join(root, "source_innodb_data")
@@ -682,16 +766,26 @@ func TestDisableActiveReparents(t *testing.T) {
 		require.NoError(t, os.MkdirAll(s, os.ModePerm))
 	}
 	require.NoError(t, os.WriteFile(path.Join(sourceInnodbDataDir, "innodb_data_1"), []byte("innodb data 1 contents"), os.ModePerm))
-	require.NoError(t, os.WriteFile(path.Join(sourceInnodbLogDir, "innodb_log_1"), []byte("innodb log 1 contents"), os.ModePerm))
+
+	needIt, err := needInnoDBRedoLogSubdir()
+	require.NoError(t, err)
+	if needIt {
+		newPath := path.Join(sourceInnodbLogDir, mysql.DynamicRedoLogSubdir)
+		require.NoError(t, os.Mkdir(newPath, os.ModePerm))
+		require.NoError(t, os.WriteFile(path.Join(newPath, "#ib_redo1"), []byte("innodb log 1 contents"), os.ModePerm))
+	} else {
+		require.NoError(t, os.WriteFile(path.Join(sourceInnodbLogDir, "innodb_log_1"), []byte("innodb log 1 contents"), os.ModePerm))
+	}
+
 	require.NoError(t, os.WriteFile(path.Join(sourceDataDbDir, "db.opt"), []byte("db opt file"), os.ModePerm))
 
 	// create a primary tablet, set its primary position
 	primary := NewFakeTablet(t, wr, "cell1", 0, topodatapb.TabletType_PRIMARY, db)
 	primary.FakeMysqlDaemon.ReadOnly = false
 	primary.FakeMysqlDaemon.Replicating = false
-	primary.FakeMysqlDaemon.CurrentPrimaryPosition = mysql.Position{
-		GTIDSet: mysql.MariadbGTIDSet{
-			2: mysql.MariadbGTID{
+	primary.FakeMysqlDaemon.CurrentPrimaryPosition = replication.Position{
+		GTIDSet: replication.MariadbGTIDSet{
+			2: replication.MariadbGTID{
 				Domain:   2,
 				Server:   123,
 				Sequence: 457,
@@ -708,9 +802,9 @@ func TestDisableActiveReparents(t *testing.T) {
 	sourceTablet := NewFakeTablet(t, wr, "cell1", 1, topodatapb.TabletType_REPLICA, db)
 	sourceTablet.FakeMysqlDaemon.ReadOnly = true
 	sourceTablet.FakeMysqlDaemon.Replicating = true
-	sourceTablet.FakeMysqlDaemon.CurrentPrimaryPosition = mysql.Position{
-		GTIDSet: mysql.MariadbGTIDSet{
-			2: mysql.MariadbGTID{
+	sourceTablet.FakeMysqlDaemon.CurrentPrimaryPosition = replication.Position{
+		GTIDSet: replication.MariadbGTIDSet{
+			2: replication.MariadbGTID{
 				Domain:   2,
 				Server:   123,
 				Sequence: 457,
@@ -718,7 +812,7 @@ func TestDisableActiveReparents(t *testing.T) {
 		},
 	}
 	sourceTablet.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
-		"STOP SLAVE",
+		"STOP REPLICA",
 	}
 	sourceTablet.StartActionLoop(t, wr)
 	defer sourceTablet.StopActionLoop(t)
@@ -741,9 +835,9 @@ func TestDisableActiveReparents(t *testing.T) {
 	destTablet := NewFakeTablet(t, wr, "cell1", 2, topodatapb.TabletType_REPLICA, db)
 	destTablet.FakeMysqlDaemon.ReadOnly = true
 	destTablet.FakeMysqlDaemon.Replicating = true
-	destTablet.FakeMysqlDaemon.CurrentPrimaryPosition = mysql.Position{
-		GTIDSet: mysql.MariadbGTIDSet{
-			2: mysql.MariadbGTID{
+	destTablet.FakeMysqlDaemon.CurrentPrimaryPosition = replication.Position{
+		GTIDSet: replication.MariadbGTIDSet{
+			2: replication.MariadbGTID{
 				Domain:   2,
 				Server:   123,
 				Sequence: 457,
@@ -751,9 +845,12 @@ func TestDisableActiveReparents(t *testing.T) {
 		},
 	}
 	destTablet.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
-		"STOP SLAVE",
-		"RESET SLAVE ALL",
-		"FAKE SET SLAVE POSITION",
+		"FAKE RESET BINARY LOGS AND GTIDS",
+		"FAKE SET GLOBAL gtid_purged",
+		"STOP REPLICA",
+		"FAKE RESET REPLICA ALL",
+		"FAKE RESET BINARY LOGS AND GTIDS",
+		"FAKE SET GLOBAL gtid_purged",
 	}
 	destTablet.FakeMysqlDaemon.FetchSuperQueryMap = map[string]*sqltypes.Result{
 		"SHOW DATABASES": {},
@@ -774,9 +871,31 @@ func TestDisableActiveReparents(t *testing.T) {
 		RelayLogInfoPath:      path.Join(root, "relay-log.info"),
 	}
 
-	require.NoError(t, destTablet.TM.RestoreData(ctx, logutil.NewConsoleLogger(), 0 /* waitForBackupInterval */, false /* deleteBeforeRestore */, time.Time{} /* restoreFromBackupTs */))
+	require.NoError(t, destTablet.TM.RestoreData(ctx, logutil.NewConsoleLogger(), 0 /* waitForBackupInterval */, false /* deleteBeforeRestore */, time.Time{} /* restoreFromBackupTs */, time.Time{} /* restoreToTimestamp */, "" /* restoreToPos */, []string{} /* ignoreBackupEngines */, mysqlShutdownTimeout))
 	// verify the full status
 	require.NoError(t, destTablet.FakeMysqlDaemon.CheckSuperQueryList(), "destTablet.FakeMysqlDaemon.CheckSuperQueryList failed")
 	assert.False(t, destTablet.FakeMysqlDaemon.Replicating)
 	assert.True(t, destTablet.FakeMysqlDaemon.Running)
+}
+
+// needInnoDBRedoLogSubdir indicates whether we need to create a redo log subdirectory.
+// Starting with MySQL 8.0.30, the InnoDB redo logs are stored in a subdirectory of the
+// <innodb_log_group_home_dir> (<datadir>/. by default) called "#innodb_redo". See:
+//
+//	https://dev.mysql.com/doc/refman/8.0/en/innodb-redo-log.html#innodb-modifying-redo-log-capacity
+func needInnoDBRedoLogSubdir() (needIt bool, err error) {
+	mysqldVersionStr, err := mysqlctl.GetVersionString()
+	if err != nil {
+		return needIt, err
+	}
+	_, sv, err := mysqlctl.ParseVersionString(mysqldVersionStr)
+	if err != nil {
+		return needIt, err
+	}
+	versionStr := fmt.Sprintf("%d.%d.%d", sv.Major, sv.Minor, sv.Patch)
+	capableOf := mysql.ServerVersionCapableOf(versionStr)
+	if capableOf == nil {
+		return needIt, fmt.Errorf("cannot determine database flavor details for version %s", versionStr)
+	}
+	return capableOf(capabilities.DynamicRedoLogCapacityFlavorCapability)
 }

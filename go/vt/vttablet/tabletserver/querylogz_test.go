@@ -17,6 +17,7 @@ limitations under the License.
 package tabletserver
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -25,25 +26,12 @@ import (
 	"testing"
 	"time"
 
-	"context"
-
 	"vitess.io/vitess/go/streamlog"
 	"vitess.io/vitess/go/vt/callerid"
+	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/planbuilder"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
 )
-
-func TestQuerylogzHandlerInvalidLogStats(t *testing.T) {
-	req, _ := http.NewRequest("GET", "/querylogz?timeout=10&limit=1", nil)
-	response := httptest.NewRecorder()
-	ch := make(chan interface{}, 1)
-	ch <- "test msg"
-	querylogzHandler(ch, response, req)
-	close(ch)
-	if !strings.Contains(response.Body.String(), "error") {
-		t.Fatalf("should show an error page for an non LogStats")
-	}
-}
 
 func TestQuerylogzHandler(t *testing.T) {
 	req, _ := http.NewRequest("GET", "/querylogz?timeout=10&limit=1", nil)
@@ -87,9 +75,9 @@ func TestQuerylogzHandler(t *testing.T) {
 	}
 	logStats.EndTime = logStats.StartTime.Add(1 * time.Millisecond)
 	response := httptest.NewRecorder()
-	ch := make(chan interface{}, 1)
+	ch := make(chan *tabletenv.LogStats, 1)
 	ch <- logStats
-	querylogzHandler(ch, response, req)
+	querylogzHandler(ch, response, req, sqlparser.NewTestParser())
 	close(ch)
 	body, _ := io.ReadAll(response.Body)
 	checkQuerylogzHasStats(t, fastQueryPattern, logStats, body)
@@ -118,9 +106,9 @@ func TestQuerylogzHandler(t *testing.T) {
 	}
 	logStats.EndTime = logStats.StartTime.Add(20 * time.Millisecond)
 	response = httptest.NewRecorder()
-	ch = make(chan interface{}, 1)
+	ch = make(chan *tabletenv.LogStats, 1)
 	ch <- logStats
-	querylogzHandler(ch, response, req)
+	querylogzHandler(ch, response, req, sqlparser.NewTestParser())
 	close(ch)
 	body, _ = io.ReadAll(response.Body)
 	checkQuerylogzHasStats(t, mediumQueryPattern, logStats, body)
@@ -148,19 +136,19 @@ func TestQuerylogzHandler(t *testing.T) {
 		`<td></td>`,
 	}
 	logStats.EndTime = logStats.StartTime.Add(500 * time.Millisecond)
-	ch = make(chan interface{}, 1)
+	ch = make(chan *tabletenv.LogStats, 1)
 	ch <- logStats
-	querylogzHandler(ch, response, req)
+	querylogzHandler(ch, response, req, sqlparser.NewTestParser())
 	close(ch)
 	body, _ = io.ReadAll(response.Body)
 	checkQuerylogzHasStats(t, slowQueryPattern, logStats, body)
 
 	// ensure querylogz is not affected by the filter tag
-	*streamlog.QueryLogFilterTag = "XXX_SKIP_ME"
-	defer func() { *streamlog.QueryLogFilterTag = "" }()
-	ch = make(chan interface{}, 1)
+	streamlog.SetQueryLogFilterTag("XXX_SKIP_ME")
+	defer func() { streamlog.SetQueryLogFilterTag("") }()
+	ch = make(chan *tabletenv.LogStats, 1)
 	ch <- logStats
-	querylogzHandler(ch, response, req)
+	querylogzHandler(ch, response, req, sqlparser.NewTestParser())
 	close(ch)
 	body, _ = io.ReadAll(response.Body)
 	checkQuerylogzHasStats(t, slowQueryPattern, logStats, body)

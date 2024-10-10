@@ -55,15 +55,17 @@ type DBDDLPlugin interface {
 	DropDatabase(ctx context.Context, name string) error
 }
 
+const dbDDLDefaultTimeout = 500 * time.Millisecond
+
 // DBDDL is just a container around custom database provisioning plugins
 // The default behaviour is to just return an error
 type DBDDL struct {
+	noInputs
+	noTxNeeded
+
 	name         string
 	create       bool
 	queryTimeout int
-
-	noInputs
-	noTxNeeded
 }
 
 // NewDBDDL creates the engine primitive
@@ -95,27 +97,28 @@ func (c *DBDDL) GetTableName() string {
 }
 
 // TryExecute implements the Primitive interface
-func (c *DBDDL) TryExecute(vcursor VCursor, _ map[string]*querypb.BindVariable, _ bool) (*sqltypes.Result, error) {
+func (c *DBDDL) TryExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
 	name := vcursor.GetDBDDLPluginName()
 	plugin, ok := databaseCreatorPlugins[name]
 	if !ok {
 		log.Errorf("'%s' database ddl plugin is not registered. Falling back to default plugin", name)
 		plugin = databaseCreatorPlugins[defaultDBDDLPlugin]
 	}
-	if c.queryTimeout != 0 {
-		cancel := vcursor.SetContextTimeout(time.Duration(c.queryTimeout) * time.Millisecond)
+
+	if c.queryTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(c.queryTimeout)*time.Millisecond)
 		defer cancel()
 	}
 
 	if c.create {
-		return c.createDatabase(vcursor, plugin)
+		return c.createDatabase(ctx, vcursor, plugin)
 	}
 
-	return c.dropDatabase(vcursor, plugin)
+	return c.dropDatabase(ctx, vcursor, plugin)
 }
 
-func (c *DBDDL) createDatabase(vcursor VCursor, plugin DBDDLPlugin) (*sqltypes.Result, error) {
-	ctx := vcursor.Context()
+func (c *DBDDL) createDatabase(ctx context.Context, vcursor VCursor, plugin DBDDLPlugin) (*sqltypes.Result, error) {
 	err := plugin.CreateDatabase(ctx, c.name)
 	if err != nil {
 		return nil, err
@@ -123,14 +126,14 @@ func (c *DBDDL) createDatabase(vcursor VCursor, plugin DBDDLPlugin) (*sqltypes.R
 	var destinations []*srvtopo.ResolvedShard
 	for {
 		// loop until we have found a valid shard
-		destinations, _, err = vcursor.ResolveDestinations(c.name, nil, []key.Destination{key.DestinationAllShards{}})
+		destinations, _, err = vcursor.ResolveDestinations(ctx, c.name, nil, []key.Destination{key.DestinationAllShards{}})
 		if err == nil {
 			break
 		}
 		select {
-		case <-ctx.Done(): //context cancelled
+		case <-ctx.Done(): // context cancelled
 			return nil, vterrors.Errorf(vtrpc.Code_DEADLINE_EXCEEDED, "could not validate create database: destination not resolved")
-		case <-time.After(500 * time.Millisecond): //timeout
+		case <-time.After(dbDDLDefaultTimeout): // timeout
 		}
 	}
 	var queries []*querypb.BoundQuery
@@ -142,16 +145,16 @@ func (c *DBDDL) createDatabase(vcursor VCursor, plugin DBDDLPlugin) (*sqltypes.R
 	}
 
 	for {
-		_, errors := vcursor.ExecuteMultiShard(destinations, queries, false, true)
+		_, errors := vcursor.ExecuteMultiShard(ctx, c, destinations, queries, false, true)
 
 		noErr := true
 		for _, err := range errors {
 			if err != nil {
 				noErr = false
 				select {
-				case <-ctx.Done(): //context cancelled
+				case <-ctx.Done(): // context cancelled
 					return nil, vterrors.Errorf(vtrpc.Code_DEADLINE_EXCEEDED, "could not validate create database: tablets not healthy")
-				case <-time.After(500 * time.Millisecond): //timeout
+				case <-time.After(dbDDLDefaultTimeout): // timeout
 				}
 				break
 			}
@@ -163,17 +166,16 @@ func (c *DBDDL) createDatabase(vcursor VCursor, plugin DBDDLPlugin) (*sqltypes.R
 	return &sqltypes.Result{RowsAffected: 1}, nil
 }
 
-func (c *DBDDL) dropDatabase(vcursor VCursor, plugin DBDDLPlugin) (*sqltypes.Result, error) {
-	ctx := vcursor.Context()
+func (c *DBDDL) dropDatabase(ctx context.Context, vcursor VCursor, plugin DBDDLPlugin) (*sqltypes.Result, error) {
 	err := plugin.DropDatabase(ctx, c.name)
 	if err != nil {
 		return nil, err
 	}
 	for vcursor.KeyspaceAvailable(c.name) {
 		select {
-		case <-ctx.Done(): //context cancelled
+		case <-ctx.Done(): // context cancelled
 			return nil, vterrors.Errorf(vtrpc.Code_DEADLINE_EXCEEDED, "could not validate drop database: keyspace still available in vschema")
-		case <-time.After(500 * time.Millisecond): //timeout
+		case <-time.After(dbDDLDefaultTimeout): // timeout
 		}
 	}
 
@@ -181,8 +183,8 @@ func (c *DBDDL) dropDatabase(vcursor VCursor, plugin DBDDLPlugin) (*sqltypes.Res
 }
 
 // TryStreamExecute implements the Primitive interface
-func (c *DBDDL) TryStreamExecute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
-	res, err := c.TryExecute(vcursor, bindVars, wantfields)
+func (c *DBDDL) TryStreamExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
+	res, err := c.TryExecute(ctx, vcursor, bindVars, wantfields)
 	if err != nil {
 		return err
 	}
@@ -190,7 +192,7 @@ func (c *DBDDL) TryStreamExecute(vcursor VCursor, bindVars map[string]*querypb.B
 }
 
 // GetFields implements the Primitive interface
-func (c *DBDDL) GetFields(VCursor, map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
+func (c *DBDDL) GetFields(context.Context, VCursor, map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
 	return &sqltypes.Result{}, nil
 }
 

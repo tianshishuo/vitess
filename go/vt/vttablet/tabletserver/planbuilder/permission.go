@@ -36,30 +36,43 @@ func BuildPermissions(stmt sqlparser.Statement) []Permission {
 	var permissions []Permission
 	// All Statement types myst be covered here.
 	switch node := stmt.(type) {
-	case *sqlparser.Union, *sqlparser.Select:
+	case *sqlparser.Select:
+		role := tableacl.READER
+		if _, ok := node.SelectExprs[0].(*sqlparser.Nextval); ok {
+			role = tableacl.WRITER
+		}
+		permissions = buildSubqueryPermissions(node, role, permissions)
+	case *sqlparser.Union:
 		permissions = buildSubqueryPermissions(node, tableacl.READER, permissions)
 	case *sqlparser.Insert:
-		permissions = buildTableNamePermissions(node.Table, tableacl.WRITER, permissions)
+		permissions = buildTableExprPermissions(node.Table, tableacl.WRITER, nil, permissions)
 		permissions = buildSubqueryPermissions(node, tableacl.READER, permissions)
 	case *sqlparser.Update:
-		permissions = buildTableExprsPermissions(node.TableExprs, tableacl.WRITER, permissions)
+		permissions = buildTableExprsPermissions(node.TableExprs, tableacl.WRITER, nil, permissions)
 		permissions = buildSubqueryPermissions(node, tableacl.READER, permissions)
 	case *sqlparser.Delete:
-		permissions = buildTableExprsPermissions(node.TableExprs, tableacl.WRITER, permissions)
+		permissions = buildTableExprsPermissions(node.TableExprs, tableacl.WRITER, nil, permissions)
 		permissions = buildSubqueryPermissions(node, tableacl.READER, permissions)
 	case sqlparser.DDLStatement:
 		for _, t := range node.AffectedTables() {
-			permissions = buildTableNamePermissions(t, tableacl.ADMIN, permissions)
+			permissions = buildTableNamePermissions(t, tableacl.ADMIN, nil, permissions)
 		}
-	case *sqlparser.AlterMigration, *sqlparser.RevertMigration, *sqlparser.ShowMigrationLogs:
+	case
+		*sqlparser.AlterMigration,
+		*sqlparser.RevertMigration,
+		*sqlparser.ShowMigrationLogs,
+		*sqlparser.ShowThrottledApps,
+		*sqlparser.ShowThrottlerStatus:
 		permissions = []Permission{} // TODO(shlomi) what are the correct permissions here? Table is unknown
 	case *sqlparser.Flush:
 		for _, t := range node.TableNames {
-			permissions = buildTableNamePermissions(t, tableacl.ADMIN, permissions)
+			permissions = buildTableNamePermissions(t, tableacl.ADMIN, nil, permissions)
 		}
+	case *sqlparser.Analyze:
+		permissions = buildTableNamePermissions(node.Table, tableacl.WRITER, nil, permissions)
 	case *sqlparser.OtherAdmin, *sqlparser.CallProc, *sqlparser.Begin, *sqlparser.Commit, *sqlparser.Rollback,
-		*sqlparser.Load, *sqlparser.Savepoint, *sqlparser.Release, *sqlparser.SRollback, *sqlparser.Set, *sqlparser.Show,
-		*sqlparser.OtherRead, sqlparser.Explain:
+		*sqlparser.Load, *sqlparser.Savepoint, *sqlparser.Release, *sqlparser.SRollback, *sqlparser.Set, *sqlparser.Show, sqlparser.Explain,
+		*sqlparser.UnlockTables:
 		// no op
 	default:
 		panic(fmt.Errorf("BUG: unexpected statement type: %T", node))
@@ -68,49 +81,92 @@ func BuildPermissions(stmt sqlparser.Statement) []Permission {
 }
 
 func buildSubqueryPermissions(stmt sqlparser.Statement, role tableacl.Role, permissions []Permission) []Permission {
-	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
-		switch node := node.(type) {
+	var cteScopes [][]sqlparser.IdentifierCS
+	sqlparser.Rewrite(stmt, func(cursor *sqlparser.Cursor) bool {
+		switch node := cursor.Node().(type) {
 		case *sqlparser.Select:
-			permissions = buildTableExprsPermissions(node.From, role, permissions)
-		case sqlparser.TableExprs:
-			return false, nil
+			if node.With != nil {
+				cteScopes = append(cteScopes, gatherCTEs(node.With))
+			}
+			var ctes []sqlparser.IdentifierCS
+			for _, cteScope := range cteScopes {
+				ctes = append(ctes, cteScope...)
+			}
+			permissions = buildTableExprsPermissions(node.From, role, ctes, permissions)
+		case *sqlparser.Delete:
+			if node.With != nil {
+				cteScopes = append(cteScopes, gatherCTEs(node.With))
+			}
+		case *sqlparser.Update:
+			if node.With != nil {
+				cteScopes = append(cteScopes, gatherCTEs(node.With))
+			}
+		case *sqlparser.Union:
+			if node.With != nil {
+				cteScopes = append(cteScopes, gatherCTEs(node.With))
+			}
 		}
-		return true, nil
-	}, stmt)
+		return true
+	}, func(cursor *sqlparser.Cursor) bool {
+		// When we encounter a With expression coming up, we should remove
+		// the last value from the cte scopes to ensure we none of the outer
+		// elements of the query see this table name.
+		_, isWith := cursor.Node().(*sqlparser.With)
+		if isWith {
+			cteScopes = cteScopes[:len(cteScopes)-1]
+		}
+		return true
+	})
 	return permissions
 }
 
-func buildTableExprsPermissions(node sqlparser.TableExprs, role tableacl.Role, permissions []Permission) []Permission {
+// gatherCTEs gathers the CTEs from the WITH clause.
+func gatherCTEs(with *sqlparser.With) []sqlparser.IdentifierCS {
+	var ctes []sqlparser.IdentifierCS
+	for _, cte := range with.CTEs {
+		ctes = append(ctes, cte.ID)
+	}
+	return ctes
+}
+
+func buildTableExprsPermissions(node []sqlparser.TableExpr, role tableacl.Role, ctes []sqlparser.IdentifierCS, permissions []Permission) []Permission {
 	for _, node := range node {
-		permissions = buildTableExprPermissions(node, role, permissions)
+		permissions = buildTableExprPermissions(node, role, ctes, permissions)
 	}
 	return permissions
 }
 
-func buildTableExprPermissions(node sqlparser.TableExpr, role tableacl.Role, permissions []Permission) []Permission {
+func buildTableExprPermissions(node sqlparser.TableExpr, role tableacl.Role, ctes []sqlparser.IdentifierCS, permissions []Permission) []Permission {
 	switch node := node.(type) {
 	case *sqlparser.AliasedTableExpr:
-		// An AliasedTableExpr can also be a subquery, but we should skip them here
+		// An AliasedTableExpr can also be a derived table, but we should skip them here
 		// because the buildSubQueryPermissions walker will catch them and extract
 		// the corresponding table names.
-		switch node := node.Expr.(type) {
-		case sqlparser.TableName:
-			permissions = buildTableNamePermissions(node, role, permissions)
-		case *sqlparser.DerivedTable:
-			permissions = buildSubqueryPermissions(node.Select, role, permissions)
+		if tblName, ok := node.Expr.(sqlparser.TableName); ok {
+			permissions = buildTableNamePermissions(tblName, role, ctes, permissions)
 		}
 	case *sqlparser.ParenTableExpr:
-		permissions = buildTableExprsPermissions(node.Exprs, role, permissions)
+		permissions = buildTableExprsPermissions(node.Exprs, role, ctes, permissions)
 	case *sqlparser.JoinTableExpr:
-		permissions = buildTableExprPermissions(node.LeftExpr, role, permissions)
-		permissions = buildTableExprPermissions(node.RightExpr, role, permissions)
+		permissions = buildTableExprPermissions(node.LeftExpr, role, ctes, permissions)
+		permissions = buildTableExprPermissions(node.RightExpr, role, ctes, permissions)
 	}
 	return permissions
 }
 
-func buildTableNamePermissions(node sqlparser.TableName, role tableacl.Role, permissions []Permission) []Permission {
+func buildTableNamePermissions(node sqlparser.TableName, role tableacl.Role, ctes []sqlparser.IdentifierCS, permissions []Permission) []Permission {
+	tableName := node.Name.String()
+	// Check whether this table is a cte or not.
+	// If the table name is qualified, then it cannot be a cte.
+	if node.Qualifier.IsEmpty() {
+		for _, cte := range ctes {
+			if cte.String() == tableName {
+				return permissions
+			}
+		}
+	}
 	permissions = append(permissions, Permission{
-		TableName: node.Name.String(),
+		TableName: tableName,
 		Role:      role,
 	})
 	return permissions

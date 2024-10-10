@@ -17,6 +17,7 @@ limitations under the License.
 package localvtctldclient
 
 import (
+	"context"
 	"errors"
 	"sync"
 
@@ -38,7 +39,7 @@ type localVtctldClient struct {
 func (client *localVtctldClient) Close() error { return nil }
 
 //go:generate -command localvtctldclient go run ../vtctldclient/codegen
-//go:generate localvtctldclient -targetpkg localvtctldclient -impl localVtctldClient -out client_gen.go -local
+//go:generate localvtctldclient --targetpkg localvtctldclient --impl localVtctldClient --out client_gen.go --local
 
 // New returns a local vtctldclient.VtctldClient that makes method calls on the
 // provided VtctldServer implementation. No network traffic takes place between
@@ -58,7 +59,7 @@ func SetServer(s vtctlservicepb.VtctldServer) {
 	server = s
 }
 
-func localVtctldClientFactory(addr string) (vtctldclient.VtctldClient, error) {
+func localVtctldClientFactory(ctx context.Context, addr string) (vtctldclient.VtctldClient, error) {
 	m.Lock()
 	defer m.Unlock()
 

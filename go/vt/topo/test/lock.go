@@ -17,11 +17,10 @@ limitations under the License.
 package test
 
 import (
+	"context"
 	"path"
 	"testing"
 	"time"
-
-	"context"
 
 	"vitess.io/vitess/go/vt/topo"
 
@@ -35,8 +34,7 @@ var timeUntilLockIsTaken = 10 * time.Millisecond
 
 // checkLock checks we can lock / unlock as expected. It's using a keyspace
 // as the lock target.
-func checkLock(t *testing.T, ts *topo.Server) {
-	ctx := context.Background()
+func checkLock(t *testing.T, ctx context.Context, ts *topo.Server) {
 	if err := ts.CreateKeyspace(ctx, "test_keyspace", &topodatapb.Keyspace{}); err != nil {
 		t.Fatalf("CreateKeyspace: %v", err)
 	}
@@ -171,6 +169,6 @@ func checkLockUnblocks(ctx context.Context, t *testing.T, conn topo.Conn) {
 	select {
 	case <-finished:
 	case <-timeout:
-		t.Fatalf("unlocking timed out")
+		t.Fatalf("Unlock(test_keyspace) timed out")
 	}
 }

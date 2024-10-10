@@ -17,6 +17,7 @@ limitations under the License.
 package vtgate
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -25,27 +26,16 @@ import (
 	"testing"
 	"time"
 
-	"context"
+	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vtgate/logstats"
 
 	"vitess.io/vitess/go/streamlog"
 	"vitess.io/vitess/go/vt/callerid"
 )
 
-func TestQuerylogzHandlerInvalidLogStats(t *testing.T) {
-	req, _ := http.NewRequest("GET", "/querylogz?timeout=10&limit=1", nil)
-	response := httptest.NewRecorder()
-	ch := make(chan interface{}, 1)
-	ch <- "test msg"
-	querylogzHandler(ch, response, req)
-	close(ch)
-	if !strings.Contains(response.Body.String(), "error") {
-		t.Fatalf("should show an error page for an non LogStats")
-	}
-}
-
 func TestQuerylogzHandlerFormatting(t *testing.T) {
 	req, _ := http.NewRequest("GET", "/querylogz?timeout=10&limit=1", nil)
-	logStats := NewLogStats(context.Background(), "Execute", "select name from test_table limit 1000", nil)
+	logStats := logstats.NewLogStats(context.Background(), "Execute", "select name from test_table limit 1000", "suuid", nil)
 	logStats.StmtType = "select"
 	logStats.RowsAffected = 1000
 	logStats.ShardQueries = 1
@@ -66,6 +56,7 @@ func TestQuerylogzHandlerFormatting(t *testing.T) {
 		`<td></td>`,
 		`<td>effective-caller</td>`,
 		`<td>immediate-caller</td>`,
+		`<td>suuid</td>`,
 		`<td>Nov 29 13:33:09.000000</td>`,
 		`<td>Nov 29 13:33:09.001000</td>`,
 		`<td>0.001</td>`,
@@ -81,9 +72,9 @@ func TestQuerylogzHandlerFormatting(t *testing.T) {
 	}
 	logStats.EndTime = logStats.StartTime.Add(1 * time.Millisecond)
 	response := httptest.NewRecorder()
-	ch := make(chan interface{}, 1)
+	ch := make(chan *logstats.LogStats, 1)
 	ch <- logStats
-	querylogzHandler(ch, response, req)
+	querylogzHandler(ch, response, req, sqlparser.NewTestParser())
 	close(ch)
 	body, _ := io.ReadAll(response.Body)
 	checkQuerylogzHasStats(t, fastQueryPattern, logStats, body)
@@ -95,6 +86,7 @@ func TestQuerylogzHandlerFormatting(t *testing.T) {
 		`<td></td>`,
 		`<td>effective-caller</td>`,
 		`<td>immediate-caller</td>`,
+		`<td>suuid</td>`,
 		`<td>Nov 29 13:33:09.000000</td>`,
 		`<td>Nov 29 13:33:09.020000</td>`,
 		`<td>0.02</td>`,
@@ -110,9 +102,9 @@ func TestQuerylogzHandlerFormatting(t *testing.T) {
 	}
 	logStats.EndTime = logStats.StartTime.Add(20 * time.Millisecond)
 	response = httptest.NewRecorder()
-	ch = make(chan interface{}, 1)
+	ch = make(chan *logstats.LogStats, 1)
 	ch <- logStats
-	querylogzHandler(ch, response, req)
+	querylogzHandler(ch, response, req, sqlparser.NewTestParser())
 	close(ch)
 	body, _ = io.ReadAll(response.Body)
 	checkQuerylogzHasStats(t, mediumQueryPattern, logStats, body)
@@ -124,6 +116,7 @@ func TestQuerylogzHandlerFormatting(t *testing.T) {
 		`<td></td>`,
 		`<td>effective-caller</td>`,
 		`<td>immediate-caller</td>`,
+		`<td>suuid</td>`,
 		`<td>Nov 29 13:33:09.000000</td>`,
 		`<td>Nov 29 13:33:09.500000</td>`,
 		`<td>0.5</td>`,
@@ -138,26 +131,26 @@ func TestQuerylogzHandlerFormatting(t *testing.T) {
 		`</tr>`,
 	}
 	logStats.EndTime = logStats.StartTime.Add(500 * time.Millisecond)
-	ch = make(chan interface{}, 1)
+	ch = make(chan *logstats.LogStats, 1)
 	ch <- logStats
-	querylogzHandler(ch, response, req)
+	querylogzHandler(ch, response, req, sqlparser.NewTestParser())
 	close(ch)
 	body, _ = io.ReadAll(response.Body)
 	checkQuerylogzHasStats(t, slowQueryPattern, logStats, body)
 
 	// ensure querylogz is not affected by the filter tag
-	*streamlog.QueryLogFilterTag = "XXX_SKIP_ME"
-	defer func() { *streamlog.QueryLogFilterTag = "" }()
-	ch = make(chan interface{}, 1)
+	streamlog.SetQueryLogFilterTag("XXX_SKIP_ME")
+	defer func() { streamlog.SetQueryLogFilterTag("") }()
+	ch = make(chan *logstats.LogStats, 1)
 	ch <- logStats
-	querylogzHandler(ch, response, req)
+	querylogzHandler(ch, response, req, sqlparser.NewTestParser())
 	close(ch)
 	body, _ = io.ReadAll(response.Body)
 	checkQuerylogzHasStats(t, slowQueryPattern, logStats, body)
 
 }
 
-func checkQuerylogzHasStats(t *testing.T, pattern []string, logStats *LogStats, page []byte) {
+func checkQuerylogzHasStats(t *testing.T, pattern []string, logStats *logstats.LogStats, page []byte) {
 	t.Helper()
 	matcher := regexp.MustCompile(strings.Join(pattern, `\s*`))
 	if !matcher.Match(page) {

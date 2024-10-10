@@ -30,16 +30,13 @@ type Numbered struct {
 	mu                   sync.Mutex
 	empty                *sync.Cond // Broadcast when pool becomes empty
 	resources            map[int64]*numberedWrapper
-	recentlyUnregistered *cache.LRUCache
+	recentlyUnregistered *cache.LRUCache[*unregistered]
 }
 
 type numberedWrapper struct {
-	val            interface{}
-	inUse          bool
-	purpose        string
-	timeCreated    time.Time
-	timeUsed       time.Time
-	enforceTimeout bool
+	val     any
+	inUse   bool
+	purpose string
 }
 
 type unregistered struct {
@@ -47,13 +44,11 @@ type unregistered struct {
 	timeUnregistered time.Time
 }
 
-//NewNumbered creates a new numbered
+// NewNumbered creates a new numbered
 func NewNumbered() *Numbered {
 	n := &Numbered{
-		resources: make(map[int64]*numberedWrapper),
-		recentlyUnregistered: cache.NewLRUCache(1000, func(_ interface{}) int64 {
-			return 1
-		}),
+		resources:            make(map[int64]*numberedWrapper),
+		recentlyUnregistered: cache.NewLRUCache[*unregistered](1000),
 	}
 	n.empty = sync.NewCond(&n.mu)
 	return n
@@ -62,14 +57,10 @@ func NewNumbered() *Numbered {
 // Register starts tracking a resource by the supplied id.
 // It does not lock the object.
 // It returns an error if the id already exists.
-func (nu *Numbered) Register(id int64, val interface{}, enforceTimeout bool) error {
+func (nu *Numbered) Register(id int64, val any) error {
 	// Optimistically assume we're not double registering.
-	now := time.Now()
 	resource := &numberedWrapper{
-		val:            val,
-		timeCreated:    now,
-		timeUsed:       now,
-		enforceTimeout: enforceTimeout,
+		val: val,
 	}
 
 	nu.mu.Lock()
@@ -109,16 +100,15 @@ func (nu *Numbered) unregister(id int64) bool {
 // Get locks the resource for use. It accepts a purpose as a string.
 // If it cannot be found, it returns a "not found" error. If in use,
 // it returns a "in use: purpose" error.
-func (nu *Numbered) Get(id int64, purpose string) (val interface{}, err error) {
+func (nu *Numbered) Get(id int64, purpose string) (val any, err error) {
 	nu.mu.Lock()
 	defer nu.mu.Unlock()
 	nw, ok := nu.resources[id]
 	if !ok {
-		if val, ok := nu.recentlyUnregistered.Get(fmt.Sprintf("%v", id)); ok {
-			unreg := val.(*unregistered)
+		if unreg, ok := nu.recentlyUnregistered.Get(fmt.Sprintf("%v", id)); ok {
 			return nil, fmt.Errorf("ended at %v (%v)", unreg.timeUnregistered.Format("2006-01-02 15:04:05.000 MST"), unreg.reason)
 		}
-		return nil, fmt.Errorf("not found")
+		return nil, fmt.Errorf("not found (potential transaction timeout)")
 	}
 	if nw.inUse {
 		return nil, fmt.Errorf("in use: %s", nw.purpose)
@@ -129,23 +119,22 @@ func (nu *Numbered) Get(id int64, purpose string) (val interface{}, err error) {
 }
 
 // Put unlocks a resource for someone else to use.
-func (nu *Numbered) Put(id int64, updateTime bool) {
+func (nu *Numbered) Put(id int64) bool {
 	nu.mu.Lock()
 	defer nu.mu.Unlock()
 	if nw, ok := nu.resources[id]; ok {
 		nw.inUse = false
 		nw.purpose = ""
-		if updateTime {
-			nw.timeUsed = time.Now()
-		}
+		return true
 	}
+	return false
 }
 
 // GetAll returns the list of all resources in the pool.
-func (nu *Numbered) GetAll() (vals []interface{}) {
+func (nu *Numbered) GetAll() (vals []any) {
 	nu.mu.Lock()
 	defer nu.mu.Unlock()
-	vals = make([]interface{}, 0, len(nu.resources))
+	vals = make([]any, 0, len(nu.resources))
 	for _, nw := range nu.resources {
 		vals = append(vals, nw.val)
 	}
@@ -154,53 +143,14 @@ func (nu *Numbered) GetAll() (vals []interface{}) {
 
 // GetByFilter returns a list of resources that match the filter.
 // It does not return any resources that are already locked.
-func (nu *Numbered) GetByFilter(purpose string, match func(val interface{}) bool) (vals []interface{}) {
+func (nu *Numbered) GetByFilter(purpose string, match func(val any) bool) (vals []any) {
 	nu.mu.Lock()
 	defer nu.mu.Unlock()
-	for _, nw := range nu.resources {
-		if nw.inUse || !nw.enforceTimeout {
-			continue
-		}
-		if match(nw.val) {
-			nw.inUse = true
-			nw.purpose = purpose
-			vals = append(vals, nw.val)
-		}
-	}
-	return vals
-}
-
-// GetOutdated returns a list of resources that are older than age, and locks them.
-// It does not return any resources that are already locked.
-func (nu *Numbered) GetOutdated(age time.Duration, purpose string) (vals []interface{}) {
-	nu.mu.Lock()
-	defer nu.mu.Unlock()
-	now := time.Now()
-	for _, nw := range nu.resources {
-		if nw.inUse || !nw.enforceTimeout {
-			continue
-		}
-		if nw.timeUsed.Add(age).Sub(now) <= 0 {
-			nw.inUse = true
-			nw.purpose = purpose
-			vals = append(vals, nw.val)
-		}
-	}
-	return vals
-}
-
-// GetIdle returns a list of resurces that have been idle for longer
-// than timeout, and locks them. It does not return any resources that
-// are already locked.
-func (nu *Numbered) GetIdle(timeout time.Duration, purpose string) (vals []interface{}) {
-	nu.mu.Lock()
-	defer nu.mu.Unlock()
-	now := time.Now()
 	for _, nw := range nu.resources {
 		if nw.inUse {
 			continue
 		}
-		if nw.timeUsed.Add(timeout).Sub(now) <= 0 {
+		if match(nw.val) {
 			nw.inUse = true
 			nw.purpose = purpose
 			vals = append(vals, nw.val)
@@ -218,12 +168,12 @@ func (nu *Numbered) WaitForEmpty() {
 	}
 }
 
-//StatsJSON returns stats in JSON format
+// StatsJSON returns stats in JSON format
 func (nu *Numbered) StatsJSON() string {
 	return fmt.Sprintf("{\"Size\": %v}", nu.Size())
 }
 
-//Size returns the current size
+// Size returns the current size
 func (nu *Numbered) Size() int64 {
 	nu.mu.Lock()
 	defer nu.mu.Unlock()

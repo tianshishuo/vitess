@@ -17,6 +17,7 @@ limitations under the License.
 package vindexes
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -29,94 +30,119 @@ import (
 	"vitess.io/vitess/go/vt/vterrors"
 )
 
-func assertEqualVtError(t *testing.T, expected, actual error) {
-	// vterrors.Errorf returns a struct containing a stacktrace, which fails
-	// assert.EqualError since the stacktrace would be guaranteed to be different.
-	// so just check the error message
-	if expected == nil {
-		assert.NoError(t, actual)
-	} else {
-		assert.EqualError(t, actual, expected.Error())
+func cfcCreateVindexTestCase(
+	testName string,
+	vindexParams map[string]string,
+	expectErr error,
+	expectUnknownParams []string,
+) createVindexTestCase {
+	return createVindexTestCase{
+		testName: testName,
+
+		vindexType:   "cfc",
+		vindexName:   "cfc",
+		vindexParams: vindexParams,
+
+		expectCost:          1,
+		expectErr:           expectErr,
+		expectIsUnique:      true,
+		expectNeedsVCursor:  false,
+		expectString:        "cfc",
+		expectUnknownParams: expectUnknownParams,
 	}
 }
 
-func TestCFCBuildCFC(t *testing.T) {
-	cases := []struct {
-		testName string
-		params   map[string]string
-		err      error
-		offsets  []int
-	}{
-		{
-			testName: "no params",
-		},
-		{
-			testName: "no hash",
-			params:   map[string]string{},
-		},
-		{
-			testName: "no hash",
-			params:   map[string]string{"offsets": "[1,2]"},
-		},
-		{
-			testName: "no offsets",
-			params:   map[string]string{"hash": "md5"},
-			err:      vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "CFC vindex requires offsets when hash is defined"),
-		},
-		{
-			testName: "invalid offset",
-			params:   map[string]string{"hash": "md5", "offsets": "10,12"},
-			err:      vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "invalid offsets 10,12 to CFC vindex cfc. expected sorted positive ints in brackets"),
-		},
-		{
-			testName: "invalid offset",
-			params:   map[string]string{"hash": "md5", "offsets": "xxx"},
-			err:      vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "invalid offsets xxx to CFC vindex cfc. expected sorted positive ints in brackets"),
-		},
-		{
-			testName: "empty offsets",
-			params:   map[string]string{"hash": "md5", "offsets": "[]"},
-			err:      vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "invalid offsets [] to CFC vindex cfc. expected sorted positive ints in brackets"),
-		},
-		{
-			testName: "unsorted offsets",
-			params:   map[string]string{"hash": "md5", "offsets": "[10,3]"},
-			err:      vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "invalid offsets [10,3] to CFC vindex cfc. expected sorted positive ints in brackets"),
-		},
-		{
-			testName: "negative offsets",
-			params:   map[string]string{"hash": "md5", "offsets": "[-1,3]"},
-			err:      vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "invalid offsets [-1,3] to CFC vindex cfc. expected sorted positive ints in brackets"),
-		},
-		{
-			testName: "normal",
-			params:   map[string]string{"hash": "md5", "offsets": "[3, 7]"},
-			offsets:  []int{3, 7},
-		},
-		{
-			testName: "duplicated offsets",
-			params:   map[string]string{"hash": "md5", "offsets": "[4,4,6]"},
-			err:      vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "invalid offsets [4,4,6] to CFC vindex cfc. expected sorted positive ints in brackets"),
-		},
+func TestCFCCreateVindex(t *testing.T) {
+	cases := []createVindexTestCase{
+		cfcCreateVindexTestCase(
+			"no params",
+			nil,
+			nil,
+			nil,
+		),
+		cfcCreateVindexTestCase(
+			"no hash",
+			map[string]string{},
+			nil,
+			nil,
+		),
+		cfcCreateVindexTestCase(
+			"no hash with offsets",
+			map[string]string{"offsets": "[1,2]"},
+			nil,
+			nil,
+		),
+		cfcCreateVindexTestCase(
+			"hash with no offsets",
+			map[string]string{"hash": "md5"},
+			vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "CFC vindex requires offsets when hash is defined"),
+			nil,
+		),
+		cfcCreateVindexTestCase(
+			"invalid offsets 10,12",
+			map[string]string{"hash": "md5", "offsets": "10,12"},
+			vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "invalid offsets 10,12 to CFC vindex cfc. expected sorted positive ints in brackets"),
+			nil,
+		),
+		cfcCreateVindexTestCase(
+			"invalid offsets xxx",
+			map[string]string{"hash": "md5", "offsets": "xxx"},
+			vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "invalid offsets xxx to CFC vindex cfc. expected sorted positive ints in brackets"),
+			nil,
+		),
+		cfcCreateVindexTestCase(
+			"empty offsets",
+			map[string]string{"hash": "md5", "offsets": "[]"},
+			vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "invalid offsets [] to CFC vindex cfc. expected sorted positive ints in brackets"),
+			nil,
+		),
+		cfcCreateVindexTestCase(
+			"unsorted offsets",
+			map[string]string{"hash": "md5", "offsets": "[10,3]"},
+			vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "invalid offsets [10,3] to CFC vindex cfc. expected sorted positive ints in brackets"),
+			nil,
+		),
+		cfcCreateVindexTestCase(
+			"negative offsets",
+			map[string]string{"hash": "md5", "offsets": "[-1,3]"},
+			vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "invalid offsets [-1,3] to CFC vindex cfc. expected sorted positive ints in brackets"),
+			nil,
+		),
+		cfcCreateVindexTestCase(
+			"duplicated offsets",
+			map[string]string{"hash": "md5", "offsets": "[4,4,6]"},
+			vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "invalid offsets [4,4,6] to CFC vindex cfc. expected sorted positive ints in brackets"),
+			nil,
+		),
+		cfcCreateVindexTestCase(
+			"unknown params",
+			map[string]string{"hash": "md5", "offsets": "[3, 7]", "hello": "world"},
+			nil,
+			[]string{"hello"},
+		),
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.testName, func(t *testing.T) {
-			cfc, err := NewCFC("cfc", tc.params)
-			assertEqualVtError(t, tc.err, err)
-			if cfc != nil {
-				assert.EqualValues(t, tc.offsets, cfc.(*CFC).offsets)
-				assert.Equal(t, "cfc", cfc.String())
-				assert.Equal(t, 1, cfc.Cost())
-				assert.Equal(t, true, cfc.IsUnique())
-				assert.Equal(t, false, cfc.NeedsVCursor())
-			}
-		})
-	}
+	testCreateVindexes(t, cases)
+}
+
+func TestCFCCreateVindexOptions(t *testing.T) {
+	vdx, err := CreateVindex(
+		"cfc",
+		"normal",
+		map[string]string{
+			"hash":    "md5",
+			"offsets": "[3, 7]",
+		},
+	)
+	require.NotNil(t, vdx)
+	require.Nil(t, err)
+	unknownParams := vdx.(ParamValidating).UnknownParams()
+	require.Empty(t, unknownParams)
+	require.EqualValues(t, vdx.(*CFC).offsets, []int{3, 7})
 }
 
 func makeCFC(t *testing.T, params map[string]string) *CFC {
-	vind, err := NewCFC("cfc", params)
+	vind, err := newCFC("cfc", params)
 	require.NoError(t, err)
 	cfc, ok := vind.(*CFC)
 	require.True(t, ok)
@@ -173,7 +199,7 @@ func TestCFCComputeKsid(t *testing.T) {
 			testName: "misaligned prefix",
 			id:       [][]byte{{3, 4, 5}, {1}},
 			prefix:   true,
-			// use the first component that's availabe
+			// use the first component that's available
 			expected: expectedHash([][]byte{{3, 4, 5}}),
 			err:      nil,
 		},
@@ -181,7 +207,7 @@ func TestCFCComputeKsid(t *testing.T) {
 			testName: "misaligned prefix",
 			id:       [][]byte{{3, 4}},
 			prefix:   true,
-			// use the first component that's availabe
+			// use the first component that's available
 			expected: nil,
 			err:      nil,
 		},
@@ -224,7 +250,6 @@ func TestCFCComputeKsid(t *testing.T) {
 			}
 		})
 	}
-
 }
 
 func TestCFCComputeKsidXxhash(t *testing.T) {
@@ -261,7 +286,7 @@ func TestCFCComputeKsidXxhash(t *testing.T) {
 			testName: "misaligned prefix",
 			id:       [][]byte{{3, 4, 5}, {1}},
 			prefix:   true,
-			// use the first component that's availabe
+			// use the first component that's available
 			expected: expectedHashXX([][]byte{{3, 4, 5}}),
 			err:      nil,
 		},
@@ -269,7 +294,7 @@ func TestCFCComputeKsidXxhash(t *testing.T) {
 			testName: "misaligned prefix",
 			id:       [][]byte{{3, 4}},
 			prefix:   true,
-			// use the first component that's availabe
+			// use the first component that's available
 			expected: nil,
 			err:      nil,
 		},
@@ -311,24 +336,15 @@ func TestCFCComputeKsidXxhash(t *testing.T) {
 func TestCFCVerifyNoHash(t *testing.T) {
 	cfc := makeCFC(t, nil)
 	id := []byte{3, 10, 7, 200}
-	out, err := cfc.Verify(
-		nil,
-		[]sqltypes.Value{sqltypes.NewVarBinary(string(id))},
-		[][]byte{id})
+	out, err := cfc.Verify(context.Background(), nil, []sqltypes.Value{sqltypes.NewVarBinary(string(id))}, [][]byte{id})
 	assert.NoError(t, err)
 	assert.EqualValues(t, []bool{true}, out)
 
-	out, err = cfc.Verify(
-		nil,
-		[]sqltypes.Value{sqltypes.NewVarBinary("foobar")},
-		[][]byte{id})
+	out, err = cfc.Verify(context.Background(), nil, []sqltypes.Value{sqltypes.NewVarBinary("foobar")}, [][]byte{id})
 	assert.NoError(t, err)
 	assert.EqualValues(t, []bool{false}, out)
 	pcfc := cfc.PrefixVindex()
-	out, err = pcfc.Verify(
-		nil,
-		[]sqltypes.Value{sqltypes.NewVarBinary("foobar")},
-		[][]byte{id})
+	out, err = pcfc.Verify(context.Background(), nil, []sqltypes.Value{sqltypes.NewVarBinary("foobar")}, [][]byte{id})
 	assert.NoError(t, err)
 	assert.EqualValues(t, []bool{false}, out)
 }
@@ -338,24 +354,15 @@ func TestCFCVerifyWithHash(t *testing.T) {
 	id := [][]byte{
 		{1, 234, 3}, {12, 32}, {7, 9},
 	}
-	out, err := cfc.Verify(
-		nil,
-		[]sqltypes.Value{sqltypes.NewVarBinary(string(flattenKey(id)))},
-		[][]byte{expectedHash(id)})
+	out, err := cfc.Verify(context.Background(), nil, []sqltypes.Value{sqltypes.NewVarBinary(string(flattenKey(id)))}, [][]byte{expectedHash(id)})
 	assert.NoError(t, err)
 	assert.EqualValues(t, []bool{true}, out)
 
-	_, err = cfc.Verify(
-		nil,
-		[]sqltypes.Value{sqltypes.NewVarBinary("foo")},
-		[][]byte{expectedHash(id)})
+	_, err = cfc.Verify(context.Background(), nil, []sqltypes.Value{sqltypes.NewVarBinary("foo")}, [][]byte{expectedHash(id)})
 	assert.Error(t, err)
 
 	pcfc := cfc.PrefixVindex()
-	out, err = pcfc.Verify(
-		nil,
-		[]sqltypes.Value{sqltypes.NewVarBinary(string(flattenKey(id)))},
-		[][]byte{expectedHash(id)})
+	out, err = pcfc.Verify(context.Background(), nil, []sqltypes.Value{sqltypes.NewVarBinary(string(flattenKey(id)))}, [][]byte{expectedHash(id)})
 	assert.NoError(t, err)
 	assert.EqualValues(t, []bool{true}, out)
 
@@ -363,14 +370,14 @@ func TestCFCVerifyWithHash(t *testing.T) {
 
 func TestCFCMap(t *testing.T) {
 	cfc := makeCFC(t, map[string]string{"hash": "md5", "offsets": "[3,5]"})
-	_, err := cfc.Map(nil, []sqltypes.Value{sqltypes.NewVarBinary("abc")})
+	_, err := cfc.Map(context.Background(), nil, []sqltypes.Value{sqltypes.NewVarBinary("abc")})
 	assert.EqualError(t, err, "insufficient size for cfc vindex cfc. need 5, got 3")
 
-	dests, err := cfc.Map(nil, []sqltypes.Value{sqltypes.NewVarBinary("12345567")})
+	dests, err := cfc.Map(context.Background(), nil, []sqltypes.Value{sqltypes.NewVarBinary("12345567")})
 	require.NoError(t, err)
 	ksid, ok := dests[0].(key.DestinationKeyspaceID)
 	require.True(t, ok)
-	out, err := cfc.Verify(nil, []sqltypes.Value{sqltypes.NewVarBinary("12345567")}, [][]byte{ksid})
+	out, err := cfc.Verify(context.Background(), nil, []sqltypes.Value{sqltypes.NewVarBinary("12345567")}, [][]byte{ksid})
 	assert.NoError(t, err)
 	assert.EqualValues(t, []bool{true}, out)
 }
@@ -418,12 +425,11 @@ func TestCFCPrefixMap(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.testName, func(t *testing.T) {
-			dests, err := prefixcfc.Map(nil, []sqltypes.Value{sqltypes.NewVarBinary(tc.id)})
+			dests, err := prefixcfc.Map(context.Background(), nil, []sqltypes.Value{sqltypes.NewVarBinary(tc.id)})
 			require.NoError(t, err)
 			assert.EqualValues(t, tc.dest, dests[0])
 		})
 	}
-
 }
 
 func TestCFCPrefixQueryMapNoHash(t *testing.T) {
@@ -441,7 +447,7 @@ func TestCFCPrefixQueryMapNoHash(t *testing.T) {
 	for _, exp := range expected {
 		ids = append(ids, sqltypes.NewVarBinary(string(exp.start)+"%"))
 	}
-	dests, err := prefixcfc.Map(nil, ids)
+	dests, err := prefixcfc.Map(context.Background(), nil, ids)
 	require.NoError(t, err)
 
 	for i, dest := range dests {
@@ -529,7 +535,6 @@ func TestCFCFindPrefixEscape(t *testing.T) {
 	for _, tc := range cases {
 		assert.EqualValues(t, tc.prefix, string(findPrefix([]byte(tc.str))))
 	}
-
 }
 
 func TestDestinationKeyRangeFromPrefix(t *testing.T) {
@@ -639,4 +644,11 @@ func TestCFCHashFunction(t *testing.T) {
 		assert.Equal(t, c.outMD5, len(md5hash([]byte(c.src))))
 		assert.Equal(t, c.outXXHash, len(xxhash64([]byte(c.src))))
 	}
+}
+
+// TestCFCCache tests for CFC vindex, cache size can be calculated.
+func TestCFCCache(t *testing.T) {
+	cfc := makeCFC(t, map[string]string{"hash": "md5", "offsets": "[3,5]"})
+	// should be able to return.
+	_ = cfc.CachedSize(true)
 }

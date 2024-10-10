@@ -2,59 +2,82 @@ This page lists all active maintainers and their areas of expertise. This can be
 
 The following is the full list, alphabetically ordered.
 
-* Alkin Tezuysal ([askdba](https://github.com/askdba)) alkin@planetscale.com
 * Andres Taylor ([systay](https://github.com/systay)) andres@planetscale.com
-* Andrew Mason ([amason](https://github.com/ajm188)) andrew@planetscale.com
-* Anthony Yeh ([enisoc](https://github.com/enisoc)) enisoc@enisoc.dev
-* Dan Kozlowski ([dkhenry](https://github.com/dkhenry)) dan.kozlowski@gmail.com
-* David Weitzman ([dweitzman](https://github.com/dweitzman)) dweitzman@pinterest.com
+* Andrew Mason ([amason](https://github.com/ajm188)) amason@hey.com
+* Arthur Schreiber ([arthurschreiber](https://github.com/arthurschreiber)) arthurschreiber@github.com
 * Deepthi Sigireddi ([deepthi](https://github.com/deepthi)) deepthi@planetscale.com
 * Derek Perkins ([derekperkins](https://github.com/derekperkins)) derek@nozzle.io
-* Florent Poinsard ([frouioui](https://github.com/frouioui)) frouioui@planetscale.com
+* Dirkjan Bussink ([dbussink](https://github.com/dbussink)) dbussink@planetscale.com
+* Florent Poinsard ([frouioui](https://github.com/frouioui)) florent@planetscale.com
+* Frances Thai ([notfelineit](https://github.com/notfelineit)) frances@planetscale.com
 * Harshit Gangal ([harshit-gangal](https://github.com/harshit-gangal)) harshit.gangal@gmail.com
-* Jon Tirsen ([tirsen](https://github.com/tirsen)) jontirsen@squareup.com
-* Mali Akmanalp ([makmanalp](https://github.com/makmanalp) makmanalp@hubspot.com
 * Manan Gupta ([GuptaManan100](https://github.com/GuptaManan100)) manan@planetscale.com
-* Michael Demmer ([demmer](https://github.com/demmer)) mdemmer@slack-corp.com
-* Michael Pawliszyn ([mpawliszyn](https://github.com/mpawliszyn)) mikepaw@squareup.com
-* Rafael Chacon ([rafael](https://github.com/rafael)) rchacon@figma.com
+* Matt Lord ([mattlord](https://github.com/mattlord)) mlord@planetscale.com
 * Rohit Nayak ([rohit-nayak-ps](https://github.com/rohit-nayak-ps)) rohit@planetscale.com
-* Sara Bee ([doeg](https://github.com/doeg)) sarab@slack-corp.com
 * Shlomi Noach ([shlomi-noach](https://github.com/shlomi-noach)) shlomi@planetscale.com
-* Sugu Sougoumarane ([sougou](https://github.com/sougou)) sougou@planetscale.com
+* Tim Vaillancourt ([timvaillancourt](https://github.com/timvaillancourt)) tim@timvaillancourt.com
 * Vicent Marti ([vmg](https://github.com/vmg)) vmg@planetscale.com
 
 ## Areas of expertise
 
 ### General Vitess
-sougou, deepthi, demmer, rafael, dweitzman, tirsen, askdba, enisoc
+deepthi, mattlord, derekperkins
 
 ### Builds
-dkhenry, shlomi-noach, ajm188, vmg, GuptaManan100
+shlomi-noach, ajm188, vmg, GuptaManan100, frouioui
 
 ### Resharding
-sougou, rafael, tirsen, dweitzman, systay, rohit-nayak-ps, deepthi
+rohit-nayak-ps, deepthi, mattlord
 
 ### Parser
-sougou, dweitzman, systay, harshit-gangal, vmg, GuptaManan100
+systay, harshit-gangal, vmg, GuptaManan100, dbussink
+
+### Evaluation Engine
+vmg
 
 ### Planner
-sougou, systay, harshit-gangal, GuptaManan100, frouioui
+systay, harshit-gangal, GuptaManan100, frouioui 
+
+### Query Serving
+systay, harshit-gangal, GuptaManan100, frouioui, vmg, dbussink
+
+### Online DDL
+shlomi-noach, dbussink
 
 ### Performance
 vmg
 
 ### Cluster Management
-deepthi, rafael, enisoc, shlomi-noach, ajm188, GuptaManan100
+deepthi, ajm188, GuptaManan100, dbussink
 
 ### Java
-mpawliszyn, makmanalp, harshit-gangal
+harshit-gangal
 
 ### Kubernetes
-derekperkins, dkhenry, enisoc
+derekperkins, GuptaManan100, frouioui
 
 ### VTAdmin
-ajm188, doeg
+ajm188, notfelineit
 
 ### Messaging
-derekperkins
+derekperkins, mattlord
+
+## Past Maintainers
+We thank the following past maintainers for their contributions.
+
+* Alain Jobart ([alainjobart](https://github.com/alainjobart))
+* Alkin Tezuysal ([askdba](https://github.com/askdba))
+* Anthony Yeh ([enisoc](https://github.com/enisoc))
+* Dan Kozlowski ([dkhenry](https://github.com/dkhenry))
+* David Weitzman ([dweitzman](https://github.com/dweitzman))
+* Jon Tirsen ([tirsen](https://github.com/tirsen))
+* Leo X. Lin ([leoxlin](https://github.com/leoxlin))
+* Mali Akmanalp ([makmanalp](https://github.com/makmanalp)
+* Michael Berlin ([michael-berlin](https://github.com/michael-berlin))
+* Michael Demmer ([demmer](https://github.com/demmer))
+* Michael Pawliszyn ([mpawliszyn](https://github.com/mpawliszyn))
+* Morgan Tocker ([morgo](https://github.com/morgo))
+* Paul Hemberger ([pH14](https://github.com/pH14))
+* Rafael Chacon ([rafael](https://github.com/rafael))
+* Sara Bee ([doeg](https://github.com/doeg))
+* Sugu Sougoumarane ([sougou](https://github.com/sougou))

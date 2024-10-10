@@ -17,34 +17,34 @@ limitations under the License.
 package vtgate
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
-
-	"vitess.io/vitess/go/sync2"
-
-	"vitess.io/vitess/go/vt/topo"
-
-	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
-	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
-	"vitess.io/vitess/go/vt/vterrors"
-
-	"vitess.io/vitess/go/stats"
-	"vitess.io/vitess/go/vt/vttablet/sandboxconn"
-
-	"context"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 
+	"vitess.io/vitess/go/stats"
+	"vitess.io/vitess/go/test/utils"
 	"vitess.io/vitess/go/vt/discovery"
-	"vitess.io/vitess/go/vt/proto/binlogdata"
-	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
-	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/srvtopo"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/vttablet/sandboxconn"
+
+	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 )
 
 var mu sync.Mutex
@@ -73,8 +73,12 @@ func TestVStreamSkew(t *testing.T) {
 		{numEventsPerShard: 4, shard0idx: 1, shard1idx: 0, expectedDelays: 0},
 	}
 	previousDelays := int64(0)
-	vstreamSkewDelayCount = stats.NewCounter("VStreamEventsDelayedBySkewAlignment",
-		"Number of events that had to wait because the skew across shards was too high")
+	if vstreamSkewDelayCount == nil {
+		// HACK: without a mutex we are not guaranteed that this will avoid the panic caused by a race
+		// between this initialization and the one in vtgate.go
+		vstreamSkewDelayCount = stats.NewCounter("VStreamEventsDelayedBySkewAlignment",
+			"Number of events that had to wait because the skew across shards was too high")
+	}
 
 	cell := "aa"
 	for idx, tcase := range tcases {
@@ -86,13 +90,13 @@ func TestVStreamSkew(t *testing.T) {
 			_ = createSandbox(ks)
 			hc := discovery.NewFakeHealthCheck(nil)
 			st := getSandboxTopo(ctx, cell, ks, []string{"-20", "20-40"})
-			vsm := newTestVStreamManager(hc, st, cell)
+			vsm := newTestVStreamManager(ctx, hc, st, cell)
 			vgtid := &binlogdatapb.VGtid{ShardGtids: []*binlogdatapb.ShardGtid{}}
 			want := int64(0)
 			var sbc0, sbc1 *sandboxconn.SandboxConn
 			if tcase.shard0idx != 0 {
 				sbc0 = hc.AddTestTablet(cell, "1.1.1.1", 1001, ks, "-20", topodatapb.TabletType_PRIMARY, true, 1, nil)
-				addTabletToSandboxTopo(t, st, ks, "-20", sbc0.Tablet())
+				addTabletToSandboxTopo(t, ctx, st, ks, "-20", sbc0.Tablet())
 				sbc0.VStreamCh = make(chan *binlogdatapb.VEvent)
 				want += 2 * tcase.numEventsPerShard
 				vgtid.ShardGtids = append(vgtid.ShardGtids, &binlogdatapb.ShardGtid{Keyspace: ks, Gtid: "pos", Shard: "-20"})
@@ -100,7 +104,7 @@ func TestVStreamSkew(t *testing.T) {
 			}
 			if tcase.shard1idx != 0 {
 				sbc1 = hc.AddTestTablet(cell, "1.1.1.1", 1002, ks, "20-40", topodatapb.TabletType_PRIMARY, true, 1, nil)
-				addTabletToSandboxTopo(t, st, ks, "20-40", sbc1.Tablet())
+				addTabletToSandboxTopo(t, ctx, st, ks, "20-40", sbc1.Tablet())
 				sbc1.VStreamCh = make(chan *binlogdatapb.VEvent)
 				want += 2 * tcase.numEventsPerShard
 				vgtid.ShardGtids = append(vgtid.ShardGtids, &binlogdatapb.ShardGtid{Keyspace: ks, Gtid: "pos", Shard: "20-40"})
@@ -132,9 +136,9 @@ func TestVStreamEvents(t *testing.T) {
 	hc := discovery.NewFakeHealthCheck(nil)
 	st := getSandboxTopo(ctx, cell, ks, []string{"-20"})
 
-	vsm := newTestVStreamManager(hc, st, cell)
+	vsm := newTestVStreamManager(ctx, hc, st, cell)
 	sbc0 := hc.AddTestTablet(cell, "1.1.1.1", 1001, ks, "-20", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	addTabletToSandboxTopo(t, st, ks, "-20", sbc0.Tablet())
+	addTabletToSandboxTopo(t, ctx, st, ks, "-20", sbc0.Tablet())
 
 	send1 := []*binlogdatapb.VEvent{
 		{Type: binlogdatapb.VEventType_GTID, Gtid: "gtid01"},
@@ -209,11 +213,11 @@ func TestVStreamChunks(t *testing.T) {
 	_ = createSandbox(ks)
 	hc := discovery.NewFakeHealthCheck(nil)
 	st := getSandboxTopo(ctx, cell, ks, []string{"-20", "20-40"})
-	vsm := newTestVStreamManager(hc, st, cell)
+	vsm := newTestVStreamManager(ctx, hc, st, cell)
 	sbc0 := hc.AddTestTablet("aa", "1.1.1.1", 1001, ks, "-20", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	addTabletToSandboxTopo(t, st, ks, "-20", sbc0.Tablet())
+	addTabletToSandboxTopo(t, ctx, st, ks, "-20", sbc0.Tablet())
 	sbc1 := hc.AddTestTablet("aa", "1.1.1.1", 1002, ks, "20-40", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	addTabletToSandboxTopo(t, st, ks, "20-40", sbc1.Tablet())
+	addTabletToSandboxTopo(t, ctx, st, ks, "20-40", sbc1.Tablet())
 
 	for i := 0; i < 100; i++ {
 		sbc0.AddVStreamEvents([]*binlogdatapb.VEvent{{Type: binlogdatapb.VEventType_DDL}}, nil)
@@ -223,9 +227,7 @@ func TestVStreamChunks(t *testing.T) {
 
 	rowEncountered := false
 	doneCounting := false
-	var rowCount, ddlCount sync2.AtomicInt32
-	rowCount.Set(0)
-	ddlCount.Set(0)
+	var rowCount, ddlCount atomic.Int32
 	vgtid := &binlogdatapb.VGtid{
 		ShardGtids: []*binlogdatapb.ShardGtid{{
 			Keyspace: ks,
@@ -262,13 +264,13 @@ func TestVStreamChunks(t *testing.T) {
 			t.Errorf("Unexpected event: %v", events[0])
 			return fmt.Errorf("unexpected event: %v", events[0])
 		}
-		if rowCount.Get() == int32(100) && ddlCount.Get() == int32(100) {
+		if rowCount.Load() == int32(100) && ddlCount.Load() == int32(100) {
 			cancel()
 		}
 		return nil
 	})
-	assert.Equal(t, int32(100), rowCount.Get())
-	assert.Equal(t, int32(100), ddlCount.Get())
+	assert.Equal(t, int32(100), rowCount.Load())
+	assert.Equal(t, int32(100), ddlCount.Load())
 }
 
 func TestVStreamMulti(t *testing.T) {
@@ -279,11 +281,11 @@ func TestVStreamMulti(t *testing.T) {
 	_ = createSandbox(ks)
 	hc := discovery.NewFakeHealthCheck(nil)
 	st := getSandboxTopo(ctx, cell, ks, []string{"-20", "20-40"})
-	vsm := newTestVStreamManager(hc, st, "aa")
+	vsm := newTestVStreamManager(ctx, hc, st, "aa")
 	sbc0 := hc.AddTestTablet(cell, "1.1.1.1", 1001, ks, "-20", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	addTabletToSandboxTopo(t, st, ks, "-20", sbc0.Tablet())
+	addTabletToSandboxTopo(t, ctx, st, ks, "-20", sbc0.Tablet())
 	sbc1 := hc.AddTestTablet(cell, "1.1.1.1", 1002, ks, "20-40", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	addTabletToSandboxTopo(t, st, ks, "20-40", sbc1.Tablet())
+	addTabletToSandboxTopo(t, ctx, st, ks, "20-40", sbc1.Tablet())
 
 	send0 := []*binlogdatapb.VEvent{
 		{Type: binlogdatapb.VEventType_GTID, Gtid: "gtid01"},
@@ -333,47 +335,186 @@ func TestVStreamMulti(t *testing.T) {
 	}
 }
 
-func TestVStreamRetry(t *testing.T) {
+func TestVStreamsCreatedAndLagMetrics(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
 	cell := "aa"
 	ks := "TestVStream"
 	_ = createSandbox(ks)
 	hc := discovery.NewFakeHealthCheck(nil)
-
-	st := getSandboxTopo(ctx, cell, ks, []string{"-20"})
-	vsm := newTestVStreamManager(hc, st, "aa")
+	st := getSandboxTopo(ctx, cell, ks, []string{"-20", "20-40"})
+	vsm := newTestVStreamManager(ctx, hc, st, cell)
+	vsm.vstreamsCreated.ResetAll()
+	vsm.vstreamsLag.ResetAll()
 	sbc0 := hc.AddTestTablet(cell, "1.1.1.1", 1001, ks, "-20", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	addTabletToSandboxTopo(t, st, ks, "-20", sbc0.Tablet())
-	commit := []*binlogdatapb.VEvent{
-		{Type: binlogdatapb.VEventType_COMMIT},
+	addTabletToSandboxTopo(t, ctx, st, ks, "-20", sbc0.Tablet())
+	sbc1 := hc.AddTestTablet(cell, "1.1.1.1", 1002, ks, "20-40", topodatapb.TabletType_PRIMARY, true, 1, nil)
+	addTabletToSandboxTopo(t, ctx, st, ks, "20-40", sbc1.Tablet())
+
+	send0 := []*binlogdatapb.VEvent{
+		{Type: binlogdatapb.VEventType_GTID, Gtid: "gtid01"},
+		{Type: binlogdatapb.VEventType_COMMIT, Timestamp: 10, CurrentTime: 15 * 1e9},
 	}
-	sbc0.AddVStreamEvents(commit, nil)
-	sbc0.AddVStreamEvents(nil, vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "aa"))
-	sbc0.AddVStreamEvents(commit, nil)
-	sbc0.AddVStreamEvents(nil, vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "bb"))
-	sbc0.AddVStreamEvents(nil, vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "cc"))
-	sbc0.AddVStreamEvents(nil, vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "final error"))
-	var count sync2.AtomicInt32
-	count.Set(0)
+	sbc0.AddVStreamEvents(send0, nil)
+
+	send1 := []*binlogdatapb.VEvent{
+		{Type: binlogdatapb.VEventType_GTID, Gtid: "gtid02"},
+		{Type: binlogdatapb.VEventType_COMMIT, Timestamp: 10, CurrentTime: 17 * 1e9},
+	}
+	sbc1.AddVStreamEvents(send1, nil)
+
 	vgtid := &binlogdatapb.VGtid{
 		ShardGtids: []*binlogdatapb.ShardGtid{{
 			Keyspace: ks,
 			Shard:    "-20",
 			Gtid:     "pos",
+		}, {
+			Keyspace: ks,
+			Shard:    "20-40",
+			Gtid:     "pos",
 		}},
 	}
-	err := vsm.VStream(ctx, topodatapb.TabletType_PRIMARY, vgtid, nil, &vtgatepb.VStreamFlags{}, func(events []*binlogdatapb.VEvent) error {
-		count.Add(1)
-		return nil
-	})
-	wantErr := "final error"
-	if err == nil || !strings.Contains(err.Error(), wantErr) {
-		t.Errorf("vstream end: %v, must contain %v", err.Error(), wantErr)
+	ch := startVStream(ctx, t, vsm, vgtid, nil)
+	<-ch
+	<-ch
+	wantVStreamsCreated := make(map[string]int64)
+	wantVStreamsCreated["TestVStream.-20.PRIMARY"] = 1
+	wantVStreamsCreated["TestVStream.20-40.PRIMARY"] = 1
+	assert.Equal(t, wantVStreamsCreated, vsm.vstreamsCreated.Counts(), "vstreamsCreated matches")
+
+	wantVStreamsLag := make(map[string]int64)
+	wantVStreamsLag["TestVStream.-20.PRIMARY"] = 5
+	wantVStreamsLag["TestVStream.20-40.PRIMARY"] = 7
+	assert.Equal(t, wantVStreamsLag, vsm.vstreamsLag.Counts(), "vstreamsLag matches")
+}
+
+func TestVStreamRetriableErrors(t *testing.T) {
+	type testCase struct {
+		name         string
+		code         vtrpcpb.Code
+		msg          string
+		shouldRetry  bool
+		ignoreTablet bool
 	}
-	time.Sleep(100 * time.Millisecond) // wait for goroutine within VStream to finish
-	assert.Equal(t, int32(2), count.Get())
+
+	tcases := []testCase{
+		{
+			name:         "failed precondition",
+			code:         vtrpcpb.Code_FAILED_PRECONDITION,
+			msg:          "",
+			shouldRetry:  true,
+			ignoreTablet: false,
+		},
+		{
+			name:         "gtid mismatch",
+			code:         vtrpcpb.Code_INVALID_ARGUMENT,
+			msg:          "GTIDSet Mismatch aa",
+			shouldRetry:  true,
+			ignoreTablet: true,
+		},
+		{
+			name:         "unavailable",
+			code:         vtrpcpb.Code_UNAVAILABLE,
+			msg:          "",
+			shouldRetry:  true,
+			ignoreTablet: false,
+		},
+		{
+			name:         "should not retry",
+			code:         vtrpcpb.Code_INVALID_ARGUMENT,
+			msg:          "final error",
+			shouldRetry:  false,
+			ignoreTablet: false,
+		},
+	}
+
+	commit := []*binlogdatapb.VEvent{
+		{Type: binlogdatapb.VEventType_COMMIT},
+	}
+
+	want := &binlogdatapb.VStreamResponse{Events: commit}
+
+	for _, tcase := range tcases {
+		t.Run(tcase.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			// aa will be the local cell for this test, but that tablet will have a vstream error.
+			cells := []string{"aa", "ab"}
+
+			ks := "TestVStream"
+			_ = createSandbox(ks)
+			hc := discovery.NewFakeHealthCheck(nil)
+
+			st := getSandboxTopoMultiCell(ctx, cells, ks, []string{"-20"})
+
+			sbc0 := hc.AddTestTablet(cells[0], "1.1.1.1", 1001, ks, "-20", topodatapb.TabletType_REPLICA, true, 1, nil)
+			sbc1 := hc.AddTestTablet(cells[1], "1.1.1.1", 1002, ks, "-20", topodatapb.TabletType_REPLICA, true, 1, nil)
+
+			addTabletToSandboxTopo(t, ctx, st, ks, "-20", sbc0.Tablet())
+			addTabletToSandboxTopo(t, ctx, st, ks, "-20", sbc1.Tablet())
+
+			vsm := newTestVStreamManager(ctx, hc, st, cells[0])
+
+			// Always have the local cell tablet error so it's ignored on retry and we pick the other one
+			// if the error requires ignoring the tablet on retry.
+			sbc0.AddVStreamEvents(nil, vterrors.New(tcase.code, tcase.msg))
+
+			if tcase.ignoreTablet {
+				sbc1.AddVStreamEvents(commit, nil)
+			} else {
+				sbc0.AddVStreamEvents(commit, nil)
+			}
+
+			vgtid := &binlogdatapb.VGtid{
+				ShardGtids: []*binlogdatapb.ShardGtid{{
+					Keyspace: ks,
+					Shard:    "-20",
+					Gtid:     "pos",
+				}},
+			}
+
+			ch := make(chan *binlogdatapb.VStreamResponse)
+			done := make(chan struct{})
+			go func() {
+				err := vsm.VStream(ctx, topodatapb.TabletType_REPLICA, vgtid, nil, &vtgatepb.VStreamFlags{Cells: strings.Join(cells, ",")}, func(events []*binlogdatapb.VEvent) error {
+					ch <- &binlogdatapb.VStreamResponse{Events: events}
+					return nil
+				})
+				wantErr := "context canceled"
+
+				if !tcase.shouldRetry {
+					wantErr = tcase.msg
+				}
+
+				if err == nil || !strings.Contains(err.Error(), wantErr) {
+					t.Errorf("vstream end: %v, must contain %v", err.Error(), wantErr)
+				}
+				close(done)
+			}()
+
+		Loop:
+			for {
+				if tcase.shouldRetry {
+					select {
+					case event := <-ch:
+						got := event.CloneVT()
+						if !proto.Equal(got, want) {
+							t.Errorf("got different vstream event than expected")
+						}
+						cancel()
+					case <-done:
+						// The goroutine has completed, so break out of the loop
+						break Loop
+					}
+				} else {
+					<-done
+					break Loop
+				}
+			}
+		})
+	}
+
 }
 
 func TestVStreamShouldNotSendSourceHeartbeats(t *testing.T) {
@@ -384,9 +525,9 @@ func TestVStreamShouldNotSendSourceHeartbeats(t *testing.T) {
 	_ = createSandbox(ks)
 	hc := discovery.NewFakeHealthCheck(nil)
 	st := getSandboxTopo(ctx, cell, ks, []string{"-20"})
-	vsm := newTestVStreamManager(hc, st, cell)
+	vsm := newTestVStreamManager(ctx, hc, st, cell)
 	sbc0 := hc.AddTestTablet(cell, "1.1.1.1", 1001, ks, "-20", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	addTabletToSandboxTopo(t, st, ks, "-20", sbc0.Tablet())
+	addTabletToSandboxTopo(t, ctx, st, ks, "-20", sbc0.Tablet())
 
 	send0 := []*binlogdatapb.VEvent{
 		{Type: binlogdatapb.VEventType_HEARTBEAT},
@@ -434,13 +575,13 @@ func TestVStreamJournalOneToMany(t *testing.T) {
 	_ = createSandbox(ks)
 	hc := discovery.NewFakeHealthCheck(nil)
 	st := getSandboxTopo(ctx, cell, ks, []string{"-20", "-10", "10-20"})
-	vsm := newTestVStreamManager(hc, st, "aa")
+	vsm := newTestVStreamManager(ctx, hc, st, "aa")
 	sbc0 := hc.AddTestTablet(cell, "1.1.1.1", 1001, ks, "-20", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	addTabletToSandboxTopo(t, st, ks, "-20", sbc0.Tablet())
+	addTabletToSandboxTopo(t, ctx, st, ks, "-20", sbc0.Tablet())
 	sbc1 := hc.AddTestTablet(cell, "1.1.1.1", 1002, ks, "-10", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	addTabletToSandboxTopo(t, st, ks, "-10", sbc1.Tablet())
+	addTabletToSandboxTopo(t, ctx, st, ks, "-10", sbc1.Tablet())
 	sbc2 := hc.AddTestTablet(cell, "1.1.1.1", 1003, ks, "10-20", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	addTabletToSandboxTopo(t, st, ks, "10-20", sbc2.Tablet())
+	addTabletToSandboxTopo(t, ctx, st, ks, "10-20", sbc2.Tablet())
 
 	send1 := []*binlogdatapb.VEvent{
 		{Type: binlogdatapb.VEventType_GTID, Gtid: "gtid01"},
@@ -547,13 +688,13 @@ func TestVStreamJournalManyToOne(t *testing.T) {
 	_ = createSandbox(ks)
 	hc := discovery.NewFakeHealthCheck(nil)
 	st := getSandboxTopo(ctx, cell, ks, []string{"-20", "-10", "10-20"})
-	vsm := newTestVStreamManager(hc, st, cell)
+	vsm := newTestVStreamManager(ctx, hc, st, cell)
 	sbc0 := hc.AddTestTablet(cell, "1.1.1.1", 1001, ks, "-20", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	addTabletToSandboxTopo(t, st, ks, "-20", sbc0.Tablet())
+	addTabletToSandboxTopo(t, ctx, st, ks, "-20", sbc0.Tablet())
 	sbc1 := hc.AddTestTablet(cell, "1.1.1.1", 1002, ks, "-10", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	addTabletToSandboxTopo(t, st, ks, "-10", sbc1.Tablet())
+	addTabletToSandboxTopo(t, ctx, st, ks, "-10", sbc1.Tablet())
 	sbc2 := hc.AddTestTablet(cell, "1.1.1.1", 1003, ks, "10-20", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	addTabletToSandboxTopo(t, st, ks, "10-20", sbc2.Tablet())
+	addTabletToSandboxTopo(t, ctx, st, ks, "10-20", sbc2.Tablet())
 
 	send3 := []*binlogdatapb.VEvent{
 		{Type: binlogdatapb.VEventType_GTID, Gtid: "gtid03"},
@@ -664,9 +805,9 @@ func TestVStreamJournalNoMatch(t *testing.T) {
 	_ = createSandbox(ks)
 	hc := discovery.NewFakeHealthCheck(nil)
 	st := getSandboxTopo(ctx, cell, ks, []string{"-20"})
-	vsm := newTestVStreamManager(hc, st, "aa")
+	vsm := newTestVStreamManager(ctx, hc, st, "aa")
 	sbc0 := hc.AddTestTablet("aa", "1.1.1.1", 1001, ks, "-20", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	addTabletToSandboxTopo(t, st, ks, "-20", sbc0.Tablet())
+	addTabletToSandboxTopo(t, ctx, st, ks, "-20", sbc0.Tablet())
 
 	send1 := []*binlogdatapb.VEvent{
 		{Type: binlogdatapb.VEventType_GTID, Gtid: "gtid01"},
@@ -696,7 +837,7 @@ func TestVStreamJournalNoMatch(t *testing.T) {
 		{Type: binlogdatapb.VEventType_GTID, Gtid: "jn1"},
 		{Type: binlogdatapb.VEventType_COMMIT},
 	}
-	wantjn1 := &binlogdata.VStreamResponse{Events: []*binlogdatapb.VEvent{
+	wantjn1 := &binlogdatapb.VStreamResponse{Events: []*binlogdatapb.VEvent{
 		{Type: binlogdatapb.VEventType_VGTID, Vgtid: &binlogdatapb.VGtid{
 			ShardGtids: []*binlogdatapb.ShardGtid{{
 				Keyspace: ks,
@@ -744,7 +885,7 @@ func TestVStreamJournalNoMatch(t *testing.T) {
 		{Type: binlogdatapb.VEventType_GTID, Gtid: "jn2"},
 		{Type: binlogdatapb.VEventType_COMMIT},
 	}
-	wantjn2 := &binlogdata.VStreamResponse{Events: []*binlogdatapb.VEvent{
+	wantjn2 := &binlogdatapb.VStreamResponse{Events: []*binlogdatapb.VEvent{
 		{Type: binlogdatapb.VEventType_VGTID, Vgtid: &binlogdatapb.VGtid{
 			ShardGtids: []*binlogdatapb.ShardGtid{{
 				Keyspace: ks,
@@ -793,11 +934,11 @@ func TestVStreamJournalPartialMatch(t *testing.T) {
 	_ = createSandbox(ks)
 	hc := discovery.NewFakeHealthCheck(nil)
 	st := getSandboxTopo(ctx, cell, ks, []string{"-20", "-10", "10-20"})
-	vsm := newTestVStreamManager(hc, st, "aa")
+	vsm := newTestVStreamManager(ctx, hc, st, "aa")
 	sbc1 := hc.AddTestTablet("aa", "1.1.1.1", 1002, ks, "-10", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	addTabletToSandboxTopo(t, st, ks, "-10", sbc1.Tablet())
+	addTabletToSandboxTopo(t, ctx, st, ks, "-10", sbc1.Tablet())
 	sbc2 := hc.AddTestTablet("aa", "1.1.1.1", 1003, ks, "10-20", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	addTabletToSandboxTopo(t, st, ks, "10-20", sbc2.Tablet())
+	addTabletToSandboxTopo(t, ctx, st, ks, "10-20", sbc2.Tablet())
 
 	send := []*binlogdatapb.VEvent{
 		{Type: binlogdatapb.VEventType_JOURNAL, Journal: &binlogdatapb.Journal{
@@ -870,10 +1011,13 @@ func TestVStreamJournalPartialMatch(t *testing.T) {
 }
 
 func TestResolveVStreamParams(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	name := "TestVStream"
 	_ = createSandbox(name)
 	hc := discovery.NewFakeHealthCheck(nil)
-	vsm := newTestVStreamManager(hc, new(sandboxTopo), "aa")
+	vsm := newTestVStreamManager(ctx, hc, newSandboxForCells(ctx, []string{"aa"}), "aa")
 	testcases := []struct {
 		input  *binlogdatapb.VGtid
 		output *binlogdatapb.VGtid
@@ -890,9 +1034,44 @@ func TestResolveVStreamParams(t *testing.T) {
 		input: &binlogdatapb.VGtid{
 			ShardGtids: []*binlogdatapb.ShardGtid{{
 				Keyspace: "TestVStream",
+				Gtid:     "other",
 			}},
 		},
-		err: "if shards are unspecified, the Gtid value must be 'current'",
+		err: "if shards are unspecified, the Gtid value must be 'current' or empty",
+	}, {
+		// Verify that the function maps the input missing the shard to a list of all shards in the topology.
+		input: &binlogdatapb.VGtid{
+			ShardGtids: []*binlogdatapb.ShardGtid{{
+				Keyspace: "TestVStream",
+			}},
+		},
+		output: &binlogdatapb.VGtid{
+			ShardGtids: []*binlogdatapb.ShardGtid{{
+				Keyspace: "TestVStream",
+				Shard:    "-20",
+			}, {
+				Keyspace: "TestVStream",
+				Shard:    "20-40",
+			}, {
+				Keyspace: "TestVStream",
+				Shard:    "40-60",
+			}, {
+				Keyspace: "TestVStream",
+				Shard:    "60-80",
+			}, {
+				Keyspace: "TestVStream",
+				Shard:    "80-a0",
+			}, {
+				Keyspace: "TestVStream",
+				Shard:    "a0-c0",
+			}, {
+				Keyspace: "TestVStream",
+				Shard:    "c0-e0",
+			}, {
+				Keyspace: "TestVStream",
+				Shard:    "e0-",
+			}},
+		},
 	}, {
 		input: &binlogdatapb.VGtid{
 			ShardGtids: []*binlogdatapb.ShardGtid{{
@@ -984,17 +1163,49 @@ func TestResolveVStreamParams(t *testing.T) {
 		assert.Equal(t, wantFilter, filter, tcase.input)
 		require.False(t, flags.MinimizeSkew)
 	}
-	// Special-case: empty keyspace because output is too big.
-	input := &binlogdatapb.VGtid{
-		ShardGtids: []*binlogdatapb.ShardGtid{{
-			Gtid: "current",
-		}},
+
+	// Special-case: empty keyspace or keyspace containing wildcards because output is too big.
+	// Verify that the function resolves input for multiple keyspaces into a list of all corresponding shards.
+	// Ensure that the number of shards returned is greater than the number of shards in a single keyspace named 'TestVStream.'
+	specialCases := []struct {
+		input *binlogdatapb.ShardGtid
+	}{
+		{
+			input: &binlogdatapb.ShardGtid{
+				Gtid: "current",
+			},
+		},
+		{
+			input: &binlogdatapb.ShardGtid{
+				Keyspace: "/.*",
+			},
+		},
+		{
+			input: &binlogdatapb.ShardGtid{
+				Keyspace: "/.*",
+				Gtid:     "current",
+			},
+		},
+		{
+			input: &binlogdatapb.ShardGtid{
+				Keyspace: "/Test.*",
+			},
+		},
 	}
-	vgtid, _, _, err := vsm.resolveParams(context.Background(), topodatapb.TabletType_REPLICA, input, nil, nil)
-	require.NoError(t, err, input)
-	if got, want := len(vgtid.ShardGtids), 8; want >= got {
-		t.Errorf("len(vgtid.ShardGtids): %v, must be >%d", got, want)
+	for _, tcase := range specialCases {
+		input := &binlogdatapb.VGtid{
+			ShardGtids: []*binlogdatapb.ShardGtid{tcase.input},
+		}
+		vgtid, _, _, err := vsm.resolveParams(context.Background(), topodatapb.TabletType_REPLICA, input, nil, nil)
+		require.NoError(t, err, tcase.input)
+		if got, expectTestVStreamShardNumber := len(vgtid.ShardGtids), 8; expectTestVStreamShardNumber >= got {
+			t.Errorf("len(vgtid.ShardGtids): %v, must be >%d", got, expectTestVStreamShardNumber)
+		}
+		for _, s := range vgtid.ShardGtids {
+			require.Equal(t, tcase.input.Gtid, s.Gtid)
+		}
 	}
+
 	for _, minimizeSkew := range []bool{true, false} {
 		t.Run(fmt.Sprintf("resolveParams MinimizeSkew %t", minimizeSkew), func(t *testing.T) {
 			flags := &vtgatepb.VStreamFlags{MinimizeSkew: minimizeSkew}
@@ -1014,14 +1225,16 @@ func TestResolveVStreamParams(t *testing.T) {
 }
 
 func TestVStreamIdleHeartbeat(t *testing.T) {
+	ctx := utils.LeakCheckContext(t)
+
 	cell := "aa"
 	ks := "TestVStream"
 	_ = createSandbox(ks)
 	hc := discovery.NewFakeHealthCheck(nil)
 	st := getSandboxTopo(ctx, cell, ks, []string{"-20"})
-	vsm := newTestVStreamManager(hc, st, cell)
+	vsm := newTestVStreamManager(ctx, hc, st, cell)
 	sbc0 := hc.AddTestTablet("aa", "1.1.1.1", 1001, ks, "-20", topodatapb.TabletType_PRIMARY, true, 1, nil)
-	addTabletToSandboxTopo(t, st, ks, "-20", sbc0.Tablet())
+	addTabletToSandboxTopo(t, ctx, st, ks, "-20", sbc0.Tablet())
 	vgtid := &binlogdatapb.VGtid{
 		ShardGtids: []*binlogdatapb.ShardGtid{{
 			Keyspace: ks,
@@ -1045,7 +1258,7 @@ func TestVStreamIdleHeartbeat(t *testing.T) {
 		t.Run(tcase.name, func(t *testing.T) {
 			var mu sync.Mutex
 			var heartbeatCount int
-			ctx, cancel := context.WithCancel(context.Background())
+			ctx, cancel := context.WithCancel(ctx)
 			go func() {
 				vsm.VStream(ctx, topodatapb.TabletType_PRIMARY, vgtid, nil, &vtgatepb.VStreamFlags{HeartbeatInterval: tcase.heartbeatInterval},
 					func(events []*binlogdatapb.VEvent) error {
@@ -1068,13 +1281,417 @@ func TestVStreamIdleHeartbeat(t *testing.T) {
 	}
 }
 
-func newTestVStreamManager(hc discovery.HealthCheck, serv srvtopo.Server, cell string) *vstreamManager {
-	gw := NewTabletGateway(context.Background(), hc, serv, cell)
+func TestKeyspaceHasBeenSharded(t *testing.T) {
+	ctx := utils.LeakCheckContext(t)
+
+	cell := "zone1"
+	ks := "testks"
+
+	type testcase struct {
+		name            string
+		oldshards       []string
+		newshards       []string
+		vgtid           *binlogdatapb.VGtid
+		trafficSwitched bool
+		want            bool
+		wantErr         string
+	}
+	testcases := []testcase{
+		{
+			name: "2 to 4, split both, traffic not switched",
+			oldshards: []string{
+				"-80",
+				"80-",
+			},
+			newshards: []string{
+				"-40",
+				"40-80",
+				"80-c0",
+				"c0-",
+			},
+			vgtid: &binlogdatapb.VGtid{
+				ShardGtids: []*binlogdatapb.ShardGtid{
+					{
+						Keyspace: ks,
+						Shard:    "-80",
+					},
+					{
+						Keyspace: ks,
+						Shard:    "80-",
+					},
+				},
+			},
+			trafficSwitched: false,
+			want:            false,
+		},
+		{
+			name: "2 to 4, split both, traffic not switched",
+			oldshards: []string{
+				"-80",
+				"80-",
+			},
+			newshards: []string{
+				"-40",
+				"40-80",
+				"80-c0",
+				"c0-",
+			},
+			vgtid: &binlogdatapb.VGtid{
+				ShardGtids: []*binlogdatapb.ShardGtid{
+					{
+						Keyspace: ks,
+						Shard:    "-80",
+					},
+					{
+						Keyspace: ks,
+						Shard:    "80-",
+					},
+				},
+			},
+			trafficSwitched: false,
+			want:            false,
+		},
+		{
+			name: "2 to 8, split both, traffic switched",
+			oldshards: []string{
+				"-80",
+				"80-",
+			},
+			newshards: []string{
+				"-20",
+				"20-40",
+				"40-60",
+				"60-80",
+				"80-a0",
+				"a0-c0",
+				"c0-e0",
+				"e0-",
+			},
+			vgtid: &binlogdatapb.VGtid{
+				ShardGtids: []*binlogdatapb.ShardGtid{
+					{
+						Keyspace: ks,
+						Shard:    "-80",
+					},
+					{
+						Keyspace: ks,
+						Shard:    "80-",
+					},
+				},
+			},
+			trafficSwitched: true,
+			want:            true,
+		},
+		{
+			name: "2 to 4, split only first shard, traffic switched",
+			oldshards: []string{
+				"-80",
+				"80-",
+			},
+			newshards: []string{
+				"-20",
+				"20-40",
+				"40-60",
+				"60-80",
+				// 80- is not being resharded.
+			},
+			vgtid: &binlogdatapb.VGtid{
+				ShardGtids: []*binlogdatapb.ShardGtid{
+					{
+						Keyspace: ks,
+						Shard:    "-80",
+					},
+					{
+						Keyspace: ks,
+						Shard:    "80-",
+					},
+				},
+			},
+			trafficSwitched: true,
+			want:            true,
+		},
+		{
+			name: "4 to 2, merge both shards, traffic switched",
+			oldshards: []string{
+				"-40",
+				"40-80",
+				"80-c0",
+				"c0-",
+			},
+			newshards: []string{
+				"-80",
+				"80-",
+			},
+			vgtid: &binlogdatapb.VGtid{
+				ShardGtids: []*binlogdatapb.ShardGtid{
+					{
+						Keyspace: ks,
+						Shard:    "-40",
+					},
+					{
+						Keyspace: ks,
+						Shard:    "40-80",
+					},
+					{
+						Keyspace: ks,
+						Shard:    "80-c0",
+					},
+					{
+						Keyspace: ks,
+						Shard:    "c0-",
+					},
+				},
+			},
+			trafficSwitched: true,
+			want:            true,
+		},
+		{
+			name: "4 to 3, merge second half, traffic not switched",
+			oldshards: []string{
+				"-40",
+				"40-80",
+				"80-c0",
+				"c0-",
+			},
+			newshards: []string{
+				// -40 and 40-80 are not being resharded.
+				"80-", // Merge of 80-c0 and c0-
+			},
+			vgtid: &binlogdatapb.VGtid{
+				ShardGtids: []*binlogdatapb.ShardGtid{
+					{
+						Keyspace: ks,
+						Shard:    "-40",
+					},
+					{
+						Keyspace: ks,
+						Shard:    "40-80",
+					},
+					{
+						Keyspace: ks,
+						Shard:    "80-c0",
+					},
+					{
+						Keyspace: ks,
+						Shard:    "c0-",
+					},
+				},
+			},
+			trafficSwitched: false,
+			want:            false,
+		},
+		{
+			name: "4 to 3, merge second half, traffic switched",
+			oldshards: []string{
+				"-40",
+				"40-80",
+				"80-c0",
+				"c0-",
+			},
+			newshards: []string{
+				// -40 and 40-80 are not being resharded.
+				"80-", // Merge of 80-c0 and c0-
+			},
+			vgtid: &binlogdatapb.VGtid{
+				ShardGtids: []*binlogdatapb.ShardGtid{
+					{
+						Keyspace: ks,
+						Shard:    "-40",
+					},
+					{
+						Keyspace: ks,
+						Shard:    "40-80",
+					},
+					{
+						Keyspace: ks,
+						Shard:    "80-c0",
+					},
+					{
+						Keyspace: ks,
+						Shard:    "c0-",
+					},
+				},
+			},
+			trafficSwitched: true,
+			want:            true,
+		},
+	}
+
+	addTablet := func(t *testing.T, ctx context.Context, host string, port int32, cell, ks, shard string, ts *topo.Server, hc *discovery.FakeHealthCheck, serving bool) {
+		tabletconn := hc.AddTestTablet(cell, host, port, ks, shard, topodatapb.TabletType_PRIMARY, serving, 0, nil)
+		err := ts.CreateTablet(ctx, tabletconn.Tablet())
+		require.NoError(t, err)
+		var alias *topodatapb.TabletAlias
+		if serving {
+			alias = tabletconn.Tablet().Alias
+		}
+		_, err = ts.UpdateShardFields(ctx, ks, shard, func(si *topo.ShardInfo) error {
+			si.PrimaryAlias = alias
+			si.IsPrimaryServing = serving
+			return nil
+		})
+		require.NoError(t, err)
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			hc := discovery.NewFakeHealthCheck(nil)
+			_ = createSandbox(ks)
+			st := getSandboxTopo(ctx, cell, ks, append(tc.oldshards, tc.newshards...))
+			vsm := newTestVStreamManager(ctx, hc, st, cell)
+			vs := vstream{
+				vgtid:      tc.vgtid,
+				tabletType: topodatapb.TabletType_PRIMARY,
+				optCells:   cell,
+				vsm:        vsm,
+				ts:         st.topoServer,
+			}
+			for i, shard := range tc.oldshards {
+				addTablet(t, ctx, fmt.Sprintf("1.1.0.%d", i), int32(1000+i), cell, ks, shard, st.topoServer, hc, !tc.trafficSwitched)
+			}
+			for i, shard := range tc.newshards {
+				addTablet(t, ctx, fmt.Sprintf("1.1.1.%d", i), int32(2000+i), cell, ks, shard, st.topoServer, hc, tc.trafficSwitched)
+			}
+			got, err := vs.keyspaceHasBeenResharded(ctx, ks)
+			if tc.wantErr != "" {
+				require.EqualError(t, err, tc.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// TestVStreamManagerHealthCheckResponseHandling tests the handling of healthcheck responses by
+// the vstream manager to confirm that we are correctly restarting the vstream when we should.
+func TestVStreamManagerHealthCheckResponseHandling(t *testing.T) {
+	ctx := utils.LeakCheckContext(t)
+
+	// Capture the vstream warning log. Otherwise we need to re-implement the vstream error
+	// handling in SandboxConn's implementation and then we're not actually testing the
+	// production code.
+	logger := logutil.NewMemoryLogger()
+	log.Warningf = logger.Warningf
+
+	cell := "aa"
+	ks := "TestVStream"
+	shard := "0"
+	tabletType := topodatapb.TabletType_REPLICA
+	_ = createSandbox(ks)
+	hc := discovery.NewFakeHealthCheck(nil)
+	st := getSandboxTopo(ctx, cell, ks, []string{shard})
+	vsm := newTestVStreamManager(ctx, hc, st, cell)
+	vgtid := &binlogdatapb.VGtid{
+		ShardGtids: []*binlogdatapb.ShardGtid{{
+			Keyspace: ks,
+			Shard:    shard,
+		}},
+	}
+	source := hc.AddTestTablet(cell, "1.1.1.1", 1001, ks, shard, tabletType, true, 0, nil)
+	tabletAlias := topoproto.TabletAliasString(source.Tablet().Alias)
+	addTabletToSandboxTopo(t, ctx, st, ks, shard, source.Tablet())
+	target := &querypb.Target{
+		Cell:       cell,
+		Keyspace:   ks,
+		Shard:      shard,
+		TabletType: tabletType,
+	}
+	highLag := uint32(discovery.GetLowReplicationLag().Seconds()) + 1
+
+	type testcase struct {
+		name    string
+		hcRes   *querypb.StreamHealthResponse
+		wantErr string
+	}
+	testcases := []testcase{
+		{
+			name: "all healthy", // Will hit the context timeout
+		},
+		{
+			name: "failure",
+			hcRes: &querypb.StreamHealthResponse{
+				TabletAlias: source.Tablet().Alias,
+				Target:      nil, // This is seen as a healthcheck stream failure
+			},
+			wantErr: fmt.Sprintf("health check failed on %s", tabletAlias),
+		},
+		{
+			name: "tablet type changed",
+			hcRes: &querypb.StreamHealthResponse{
+				TabletAlias: source.Tablet().Alias,
+				Target: &querypb.Target{
+					Cell:       cell,
+					Keyspace:   ks,
+					Shard:      shard,
+					TabletType: topodatapb.TabletType_PRIMARY,
+				},
+				PrimaryTermStartTimestamp: time.Now().Unix(),
+				RealtimeStats:             &querypb.RealtimeStats{},
+			},
+			wantErr: fmt.Sprintf("tablet %s type has changed from %s to %s",
+				tabletAlias, tabletType, topodatapb.TabletType_PRIMARY.String()),
+		},
+		{
+			name: "unhealthy",
+			hcRes: &querypb.StreamHealthResponse{
+				TabletAlias: source.Tablet().Alias,
+				Target:      target,
+				RealtimeStats: &querypb.RealtimeStats{
+					HealthError: "unhealthy",
+				},
+			},
+			wantErr: fmt.Sprintf("tablet %s is no longer healthy", tabletAlias),
+		},
+		{
+			name: "replication lag too high",
+			hcRes: &querypb.StreamHealthResponse{
+				TabletAlias: source.Tablet().Alias,
+				Target:      target,
+				RealtimeStats: &querypb.RealtimeStats{
+					ReplicationLagSeconds: highLag,
+				},
+			},
+			wantErr: fmt.Sprintf("%s has a replication lag of %d seconds which is beyond the value provided",
+				tabletAlias, highLag),
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			done := make(chan struct{})
+			go func() {
+				sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				defer cancel()
+				defer close(done)
+				// SandboxConn's VStream implementation always waits for the context to timeout.
+				err := vsm.VStream(sctx, tabletType, vgtid, nil, nil, func(events []*binlogdatapb.VEvent) error {
+					require.Fail(t, "unexpected event", "Received unexpected events: %v", events)
+					return nil
+				})
+				if tc.wantErr != "" { // Otherwise we simply expect the context to timeout
+					if !strings.Contains(logger.String(), tc.wantErr) {
+						require.Fail(t, "unexpected vstream error", "vstream ended with error: %v, which did not contain: %s", err, tc.wantErr)
+					}
+				}
+			}()
+			if tc.wantErr != "" {
+				source.SetStreamHealthResponse(tc.hcRes)
+			}
+			<-done
+			logger.Clear()
+		})
+	}
+}
+
+func newTestVStreamManager(ctx context.Context, hc discovery.HealthCheck, serv srvtopo.Server, cell string) *vstreamManager {
+	gw := NewTabletGateway(ctx, hc, serv, cell)
 	srvResolver := srvtopo.NewResolver(serv, gw, cell)
 	return newVStreamManager(srvResolver, serv, cell)
 }
 
 func startVStream(ctx context.Context, t *testing.T, vsm *vstreamManager, vgtid *binlogdatapb.VGtid, flags *vtgatepb.VStreamFlags) <-chan *binlogdatapb.VStreamResponse {
+	t.Helper()
 	if flags == nil {
 		flags = &vtgatepb.VStreamFlags{}
 	}
@@ -1091,7 +1708,8 @@ func startVStream(ctx context.Context, t *testing.T, vsm *vstreamManager, vgtid 
 func verifyEvents(t *testing.T, ch <-chan *binlogdatapb.VStreamResponse, wants ...*binlogdatapb.VStreamResponse) {
 	t.Helper()
 	for i, want := range wants {
-		got := <-ch
+		val := <-ch
+		got := val.CloneVT()
 		require.NotNil(t, got)
 		for _, event := range got.Events {
 			event.Timestamp = 0
@@ -1130,7 +1748,7 @@ func getVEvents(keyspace, shard string, count, idx int64) []*binlogdatapb.VEvent
 }
 
 func getSandboxTopo(ctx context.Context, cell string, keyspace string, shards []string) *sandboxTopo {
-	st := newSandboxForCells([]string{cell})
+	st := newSandboxForCells(ctx, []string{cell})
 	ts := st.topoServer
 	ts.CreateCellInfo(ctx, cell, &topodatapb.CellInfo{})
 	ts.CreateKeyspace(ctx, keyspace, &topodatapb.Keyspace{})
@@ -1140,7 +1758,23 @@ func getSandboxTopo(ctx context.Context, cell string, keyspace string, shards []
 	return st
 }
 
-func addTabletToSandboxTopo(t *testing.T, st *sandboxTopo, ks, shard string, tablet *topodatapb.Tablet) {
+func getSandboxTopoMultiCell(ctx context.Context, cells []string, keyspace string, shards []string) *sandboxTopo {
+	st := newSandboxForCells(ctx, cells)
+	ts := st.topoServer
+
+	for _, cell := range cells {
+		ts.CreateCellInfo(ctx, cell, &topodatapb.CellInfo{})
+	}
+
+	ts.CreateKeyspace(ctx, keyspace, &topodatapb.Keyspace{})
+
+	for _, shard := range shards {
+		ts.CreateShard(ctx, keyspace, shard)
+	}
+	return st
+}
+
+func addTabletToSandboxTopo(t *testing.T, ctx context.Context, st *sandboxTopo, ks, shard string, tablet *topodatapb.Tablet) {
 	_, err := st.topoServer.UpdateShardFields(ctx, ks, shard, func(si *topo.ShardInfo) error {
 		si.PrimaryAlias = tablet.Alias
 		return nil

@@ -17,12 +17,10 @@ limitations under the License.
 package schema
 
 import (
-	"fmt"
 	"regexp"
-	"strconv"
 	"strings"
 
-	"vitess.io/vitess/go/textutil"
+	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
@@ -51,39 +49,10 @@ var (
 		// ALTER TABLE tbl something
 		regexp.MustCompile(alterTableBasicPattern + `([\S]+)\s+(.*$)`),
 	}
-	createTableRegexp     = regexp.MustCompile(`(?s)(?i)(CREATE\s+TABLE\s+)` + "`" + `([^` + "`" + `]+)` + "`" + `(\s*[(].*$)`)
-	createViewRegexp      = regexp.MustCompile(`(?s)(?i)(CREATE\b.*?\bVIEW\s+)` + "`" + `([^` + "`" + `]+)` + "`" + `(\s*\bAS\b.*$)`)
-	revertStatementRegexp = regexp.MustCompile(`(?i)^revert\s+([\S]*)$`)
 
 	enumValuesRegexp = regexp.MustCompile("(?i)^enum[(](.*)[)]$")
 	setValuesRegexp  = regexp.MustCompile("(?i)^set[(](.*)[)]$")
 )
-
-// ReplaceTableNameInCreateTableStatement returns a modified CREATE TABLE statement, such that the table name is replaced with given name.
-// This intentionally string-replacement based, and not sqlparser.String() based, because the return statement has to be formatted _precisely_,
-// up to MySQL version nuances, like the original statement. That's in favor of tengo table comparison.
-// We expect a well formatted, no-qualifier statement in the form:
-// CREATE TABLE `some_table` ...
-func ReplaceTableNameInCreateTableStatement(createStatement string, replacementName string) (modifiedStatement string, err error) {
-	submatch := createTableRegexp.FindStringSubmatch(createStatement)
-	if len(submatch) == 0 {
-		return createStatement, fmt.Errorf("could not parse statement: %s", createStatement)
-	}
-	return fmt.Sprintf("%s`%s`%s", submatch[1], replacementName, submatch[3]), nil
-}
-
-// ReplaceViewNameInCreateViewStatement returns a modified CREATE VIEW statement, such that the view name is replaced with given name.
-// This intentionally string-replacement based, and not sqlparser.String() based, because the return statement has to be formatted _precisely_,
-// up to MySQL version nuances, like the original statement. That's in favor of tengo view comparison.
-// We expect a well formatted, no-qualifier statement in the form:
-// CREATE VIEW `some_table` ...
-func ReplaceViewNameInCreateViewStatement(createStatement string, replacementName string) (modifiedStatement string, err error) {
-	submatch := createViewRegexp.FindStringSubmatch(createStatement)
-	if len(submatch) == 0 {
-		return createStatement, fmt.Errorf("could not parse statement: %s", createStatement)
-	}
-	return fmt.Sprintf("%s`%s`%s", submatch[1], replacementName, submatch[3]), nil
-}
 
 // ParseAlterTableOptions parses a ALTER ... TABLE... statement into:
 // - explicit schema and table, if available
@@ -108,19 +77,6 @@ func ParseAlterTableOptions(alterStatement string) (explicitSchema, explicitTabl
 	return explicitSchema, explicitTable, alterOptions
 }
 
-// legacyParseRevertUUID expects a query like "revert 4e5dcf80_354b_11eb_82cd_f875a4d24e90" and returns the UUID value.
-func legacyParseRevertUUID(sql string) (uuid string, err error) {
-	submatch := revertStatementRegexp.FindStringSubmatch(sql)
-	if len(submatch) == 0 {
-		return "", fmt.Errorf("Not a Revert DDL: '%s'", sql)
-	}
-	uuid = submatch[1]
-	if !IsOnlineDDLUUID(uuid) {
-		return "", fmt.Errorf("Not an online DDL UUID: '%s'", uuid)
-	}
-	return uuid, nil
-}
-
 // ParseEnumValues parses the comma delimited part of an enum column definition
 func ParseEnumValues(enumColumnType string) string {
 	if submatch := enumValuesRegexp.FindStringSubmatch(enumColumnType); len(submatch) > 0 {
@@ -141,31 +97,71 @@ func ParseSetValues(setColumnType string) string {
 // returns the (unquoted) text values
 // Expected input: `'x-small','small','medium','large','x-large'`
 // Unexpected input: `enum('x-small','small','medium','large','x-large')`
-func parseEnumOrSetTokens(enumOrSetValues string) (tokens []string) {
-	if submatch := enumValuesRegexp.FindStringSubmatch(enumOrSetValues); len(submatch) > 0 {
-		// input should not contain `enum(...)` column definition, just the comma delimited list
-		return tokens
-	}
-	if submatch := setValuesRegexp.FindStringSubmatch(enumOrSetValues); len(submatch) > 0 {
-		// input should not contain `enum(...)` column definition, just the comma delimited list
-		return tokens
-	}
-	tokens = textutil.SplitDelimitedList(enumOrSetValues)
-	for i := range tokens {
-		if strings.HasPrefix(tokens[i], `'`) && strings.HasSuffix(tokens[i], `'`) {
-			tokens[i] = strings.Trim(tokens[i], `'`)
+func parseEnumOrSetTokens(enumOrSetValues string) []string {
+	// We need to track both the start of the current value and current
+	// position, since there might be quoted quotes inside the value
+	// which we need to handle.
+	start := 0
+	pos := 1
+	var tokens []string
+	for {
+		// If the input does not start with a quote, it's not a valid enum/set definition
+		if enumOrSetValues[start] != '\'' {
+			return nil
 		}
+		i := strings.IndexByte(enumOrSetValues[pos:], '\'')
+		// If there's no closing quote, we have invalid input
+		if i < 0 {
+			return nil
+		}
+		// We're at the end here of the last quoted value,
+		// so we add the last token and return them.
+		if i == len(enumOrSetValues[pos:])-1 {
+			tok, err := sqltypes.DecodeStringSQL(enumOrSetValues[start:])
+			if err != nil {
+				return nil
+			}
+			tokens = append(tokens, tok)
+			return tokens
+		}
+		// MySQL double quotes things as escape value, so if we see another
+		// single quote, we skip the character and remove it from the input.
+		if enumOrSetValues[pos+i+1] == '\'' {
+			pos = pos + i + 2
+			continue
+		}
+		// Next value needs to be a comma as a separator, otherwise
+		// the data is invalid so we return nil.
+		if enumOrSetValues[pos+i+1] != ',' {
+			return nil
+		}
+		// If we're at the end of the input here, it's invalid
+		// since we have a trailing comma which is not what MySQL
+		// returns.
+		if pos+i+1 == len(enumOrSetValues) {
+			return nil
+		}
+
+		tok, err := sqltypes.DecodeStringSQL(enumOrSetValues[start : pos+i+1])
+		if err != nil {
+			return nil
+		}
+
+		tokens = append(tokens, tok)
+		// We add 2 to the position to skip the closing quote & comma
+		start = pos + i + 2
+		pos = start + 1
 	}
-	return tokens
 }
 
 // ParseEnumOrSetTokensMap parses the comma delimited part of an enum column definition
-// and returns a map where ["1"] is the first token, and ["<n>"] is th elast token
-func ParseEnumOrSetTokensMap(enumOrSetValues string) map[string]string {
+// and returns a map where [1] is the first token, and [<n>] is the last.
+func ParseEnumOrSetTokensMap(enumOrSetValues string) map[int]string {
 	tokens := parseEnumOrSetTokens(enumOrSetValues)
-	tokensMap := map[string]string{}
+	tokensMap := map[int]string{}
 	for i, token := range tokens {
-		tokensMap[strconv.Itoa(i+1)] = token
+		// SET and ENUM values are 1 indexed.
+		tokensMap[i+1] = token
 	}
 	return tokensMap
 }

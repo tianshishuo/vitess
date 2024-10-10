@@ -17,7 +17,6 @@ limitations under the License.
 package uca
 
 import (
-	"reflect"
 	"sync"
 	"unsafe"
 )
@@ -72,7 +71,7 @@ func equalWeights900(table Weights, levels int, A, B rune) bool {
 	cA := int((*pageA)[offsetA])
 	cB := int((*pageB)[offsetB])
 
-	for l := 0; l < levels; l++ {
+	for l := range levels {
 		wA, wB := l*256, l*256
 		wA1, wB1 := wA+(cA*256*3), wB+(cB*256*3)
 
@@ -119,7 +118,7 @@ func (Layout_uca900) DebugWeights(table Weights, codepoint rune) (result []uint1
 	}
 
 	ceCount := int((*page)[offset])
-	for ce := 0; ce < ceCount; ce++ {
+	for ce := range ceCount {
 		result = append(result,
 			(*page)[256+(ce*3+0)*256+offset],
 			(*page)[256+(ce*3+1)*256+offset],
@@ -265,8 +264,8 @@ func (Layout_uca_legacy) allocPage(original *[]uint16, patches []Patch) []uint16
 	}
 
 	newPage := make([]uint16, minLenForPage)
-	for i := 0; i < CodepointsPerPage; i++ {
-		for j := 0; j < originalStride; j++ {
+	for i := range CodepointsPerPage {
+		for range originalStride {
 			newPage[1+i*newStride] = (*original)[1+i*originalStride]
 		}
 	}
@@ -287,29 +286,29 @@ func (Layout_uca_legacy) applyPatches(page []uint16, offset int, weights []uint1
 }
 
 type tableWithPatch struct {
-	tableptr uintptr
-	patchptr uintptr
+	tableptr unsafe.Pointer
+	patchptr unsafe.Pointer
 }
 
 var cachedTables = make(map[tableWithPatch]Weights)
 var cachedTablesMu sync.Mutex
 
 func lookupCachedTable(table Weights, patch []Patch) (Weights, bool) {
-	hdr1 := (*reflect.SliceHeader)(unsafe.Pointer(&table))
-	hdr2 := (*reflect.SliceHeader)(unsafe.Pointer(&patch))
+	data1 := unsafe.Pointer(unsafe.SliceData(table))
+	data2 := unsafe.Pointer(unsafe.SliceData(patch))
 
 	cachedTablesMu.Lock()
 	defer cachedTablesMu.Unlock()
-	tbl, ok := cachedTables[tableWithPatch{hdr1.Data, hdr2.Data}]
+	tbl, ok := cachedTables[tableWithPatch{tableptr: data1, patchptr: data2}]
 	return tbl, ok
 }
 
 func storeCachedTable(table Weights, patch []Patch, result Weights) {
-	hdr1 := (*reflect.SliceHeader)(unsafe.Pointer(&table))
-	hdr2 := (*reflect.SliceHeader)(unsafe.Pointer(&patch))
+	data1 := unsafe.Pointer(unsafe.SliceData(table))
+	data2 := unsafe.Pointer(unsafe.SliceData(patch))
 
 	cachedTablesMu.Lock()
-	cachedTables[tableWithPatch{hdr1.Data, hdr2.Data}] = result
+	cachedTables[tableWithPatch{tableptr: data1, patchptr: data2}] = result
 	cachedTablesMu.Unlock()
 }
 

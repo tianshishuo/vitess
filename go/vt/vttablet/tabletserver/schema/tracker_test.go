@@ -17,20 +17,22 @@ limitations under the License.
 package schema
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
-	"context"
-
 	"vitess.io/vitess/go/sqltypes"
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
+	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vtenv"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/throttle/throttlerapp"
 )
 
 func TestTracker(t *testing.T) {
 	initialSchemaInserted := false
-	se, db, cancel := getTestSchemaEngine(t)
+	se, db, cancel := getTestSchemaEngine(t, 0)
 	defer cancel()
 	gtid1 := "MySQL56/7b04699f-f5e9-11e9-bf88-9cb6d089e1c3:1-10"
 	ddl1 := "create table tracker_test (id int)"
@@ -75,9 +77,9 @@ func TestTracker(t *testing.T) {
 			},
 		}},
 	}
-	config := se.env.Config()
-	config.TrackSchemaVersions = true
-	env := tabletenv.NewEnv(config, "TrackerTest")
+	cfg := se.env.Config()
+	cfg.TrackSchemaVersions = true
+	env := tabletenv.NewEnv(vtenv.NewTestEnv(), cfg, "TrackerTest")
 	initial := env.Stats().ErrorCounters.Counts()["INTERNAL"]
 	tracker := NewTracker(env, vs, se)
 	tracker.Open()
@@ -91,7 +93,7 @@ func TestTracker(t *testing.T) {
 
 func TestTrackerShouldNotInsertInitialSchema(t *testing.T) {
 	initialSchemaInserted := false
-	se, db, cancel := getTestSchemaEngine(t)
+	se, db, cancel := getTestSchemaEngine(t, 0)
 	gtid1 := "MySQL56/7b04699f-f5e9-11e9-bf88-9cb6d089e1c3:1-10"
 
 	defer cancel()
@@ -119,9 +121,9 @@ func TestTrackerShouldNotInsertInitialSchema(t *testing.T) {
 			},
 		}},
 	}
-	config := se.env.Config()
-	config.TrackSchemaVersions = true
-	env := tabletenv.NewEnv(config, "TrackerTest")
+	cfg := se.env.Config()
+	cfg.TrackSchemaVersions = true
+	env := tabletenv.NewEnv(vtenv.NewTestEnv(), cfg, "TrackerTest")
 	tracker := NewTracker(env, vs, se)
 	tracker.Open()
 	<-vs.done
@@ -137,7 +139,8 @@ type fakeVstreamer struct {
 	events [][]*binlogdatapb.VEvent
 }
 
-func (f *fakeVstreamer) Stream(ctx context.Context, startPos string, tablePKs []*binlogdatapb.TableLastPK, filter *binlogdatapb.Filter, send func([]*binlogdatapb.VEvent) error) error {
+func (f *fakeVstreamer) Stream(ctx context.Context, startPos string, tablePKs []*binlogdatapb.TableLastPK,
+	filter *binlogdatapb.Filter, throttlerApp throttlerapp.Name, send func([]*binlogdatapb.VEvent) error, options *binlogdatapb.VStreamOptions) error {
 	for _, events := range f.events {
 		err := send(events)
 		if err != nil {
@@ -169,7 +172,7 @@ func TestMustReloadSchemaOnDDL(t *testing.T) {
 	}
 	for _, tc := range testcases {
 		t.Run("", func(t *testing.T) {
-			require.Equal(t, tc.want, MustReloadSchemaOnDDL(tc.query, tc.dbname))
+			require.Equal(t, tc.want, MustReloadSchemaOnDDL(tc.query, tc.dbname, sqlparser.NewTestParser()))
 		})
 	}
 }

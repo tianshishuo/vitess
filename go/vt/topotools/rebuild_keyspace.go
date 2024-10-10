@@ -64,7 +64,12 @@ func RebuildKeyspaceLocked(ctx context.Context, log logutil.Logger, ts *topo.Ser
 		}
 	}
 
-	shards, err := ts.FindAllShardsInKeyspace(ctx, keyspace)
+	shards, err := ts.FindAllShardsInKeyspace(ctx, keyspace, &topo.FindAllShardsInKeyspaceOptions{
+		// Fetch shard records concurrently to speed up the rebuild process.
+		// This call is invoked by the first tablet in a given keyspace or
+		// manually via vtctld, so there is little risk of a thundering herd.
+		Concurrency: 8,
+	})
 	if err != nil {
 		return err
 	}
@@ -94,9 +99,7 @@ func RebuildKeyspaceLocked(ctx context.Context, log logutil.Logger, ts *topo.Ser
 			return err
 		}
 		srvKeyspaceMap[cell] = &topodatapb.SrvKeyspace{
-			ShardingColumnName: ki.ShardingColumnName,
-			ShardingColumnType: ki.ShardingColumnType,
-			ServedFrom:         ki.ComputeCellServedFrom(cell),
+			ThrottlerConfig: ki.ThrottlerConfig,
 		}
 	}
 

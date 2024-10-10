@@ -17,7 +17,6 @@ limitations under the License.
 package cluster
 
 import (
-	"io/ioutil"
 	"os"
 	"testing"
 
@@ -216,7 +215,6 @@ name="devcluster"`,
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -225,7 +223,7 @@ name="devcluster"`,
 
 			t.Cleanup(func() { os.Remove(f.Name()) })
 
-			err = ioutil.WriteFile(f.Name(), []byte(tt.data), 0777)
+			err = os.WriteFile(f.Name(), []byte(tt.data), 0777)
 			require.NoError(t, err)
 
 			fc := FileConfig{}
@@ -381,8 +379,6 @@ func TestCombine(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
-
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 

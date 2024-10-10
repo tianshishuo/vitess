@@ -17,9 +17,10 @@ limitations under the License.
 package zk2topo
 
 import (
-	"path"
-
 	"context"
+	"fmt"
+	"path"
+	"time"
 
 	"github.com/z-division/go-zookeeper/zk"
 
@@ -39,7 +40,51 @@ type zkLockDescriptor struct {
 
 // Lock is part of the topo.Conn interface.
 func (zs *Server) Lock(ctx context.Context, dirPath, contents string) (topo.LockDescriptor, error) {
-	// Lock paths end in a trailing slash to that when we create
+	return zs.lock(ctx, dirPath, contents)
+}
+
+// LockWithTTL is part of the topo.Conn interface. It behaves the same as Lock
+// as TTLs are not supported in Zookeeper.
+func (zs *Server) LockWithTTL(ctx context.Context, dirPath, contents string, _ time.Duration) (topo.LockDescriptor, error) {
+	return zs.lock(ctx, dirPath, contents)
+}
+
+// LockName is part of the topo.Conn interface.
+func (zs *Server) LockName(ctx context.Context, dirPath, contents string) (topo.LockDescriptor, error) {
+	return zs.lock(ctx, dirPath, contents)
+}
+
+// TryLock is part of the topo.Conn interface.
+func (zs *Server) TryLock(ctx context.Context, dirPath, contents string) (topo.LockDescriptor, error) {
+	// We list all the entries under dirPath
+	entries, err := zs.ListDir(ctx, dirPath, true)
+	if err != nil {
+		// We need to return the right error codes, like
+		// topo.ErrNoNode and topo.ErrInterrupted, and the
+		// easiest way to do this is to return convertError(err).
+		// It may lose some of the context, if this is an issue,
+		// maybe logging the error would work here.
+		return nil, convertError(err, dirPath)
+	}
+
+	// If there is a folder '/locks' with some entries in it then we can assume that someone else already has a lock.
+	// Throw error in this case
+	for _, e := range entries {
+		// there is a bug where ListDir return ephemeral = false for locks. It is due
+		// https://github.com/vitessio/vitess/blob/main/go/vt/topo/zk2topo/utils.go#L55
+		// TODO: Fix/send ephemeral flag value recursively while creating ephemeral file
+		if e.Name == locksPath && e.Type == topo.TypeDirectory {
+			return nil, topo.NewError(topo.NodeExists, fmt.Sprintf("lock already exists at path %s", dirPath))
+		}
+	}
+
+	// everything is good let's acquire the lock.
+	return zs.lock(ctx, dirPath, contents)
+}
+
+// Lock is part of the topo.Conn interface.
+func (zs *Server) lock(ctx context.Context, dirPath, contents string) (topo.LockDescriptor, error) {
+	// Lock paths end in a trailing slash so that when we create
 	// sequential nodes, they are created as children, not siblings.
 	locksDir := path.Join(zs.root, dirPath, locksPath) + "/"
 
@@ -58,19 +103,22 @@ func (zs *Server) Lock(ctx context.Context, dirPath, contents string) (topo.Lock
 		case context.Canceled:
 			errToReturn = topo.NewError(topo.Interrupted, nodePath)
 		default:
-			errToReturn = vterrors.Wrapf(err, "failed to obtain action lock: %v", nodePath)
+			errToReturn = vterrors.Wrapf(err, "failed to obtain lock: %v", nodePath)
 		}
 
 		// Regardless of the reason, try to cleanup.
-		log.Warningf("Failed to obtain action lock: %v", err)
+		log.Warningf("Failed to obtain lock: %v", err)
 
-		if err := zs.conn.Delete(ctx, nodePath, -1); err != nil {
-			log.Warningf("Failed to close connection :%v", err)
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), baseTimeout)
+		defer cancel()
+
+		if err := zs.conn.Delete(cleanupCtx, nodePath, -1); err != nil {
+			log.Warningf("Failed to cleanup unsuccessful lock path %s: %v", nodePath, err)
 		}
 
 		// Show the other locks in the directory
 		dir := path.Dir(nodePath)
-		children, _, err := zs.conn.Children(ctx, dir)
+		children, _, err := zs.conn.Children(cleanupCtx, dir)
 		if err != nil {
 			log.Warningf("Failed to get children of %v: %v", dir, err)
 			return nil, errToReturn
@@ -82,7 +130,7 @@ func (zs *Server) Lock(ctx context.Context, dirPath, contents string) (topo.Lock
 		}
 
 		childPath := path.Join(dir, children[0])
-		data, _, err := zs.conn.Get(ctx, childPath)
+		data, _, err := zs.conn.Get(cleanupCtx, childPath)
 		if err != nil {
 			log.Warningf("Failed to get first locks node %v (may have just ended): %v", childPath, err)
 			return nil, errToReturn

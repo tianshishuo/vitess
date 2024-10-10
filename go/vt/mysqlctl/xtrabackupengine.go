@@ -20,7 +20,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -31,13 +30,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/klauspost/pgzip"
-	"github.com/planetscale/pargzip"
+	"github.com/spf13/pflag"
 
-	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/ioutil"
+	"vitess.io/vitess/go/mysql/replication"
 	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/mysqlctl/backupstorage"
+	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
 	"vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/servenv"
 	"vitess.io/vitess/go/vt/vterrors"
 )
 
@@ -50,29 +51,28 @@ type XtrabackupEngine struct {
 
 var (
 	// path where backup engine program is located
-	xtrabackupEnginePath = flag.String("xtrabackup_root_path", "", "directory location of the xtrabackup and xbstream executables, e.g., /usr/bin")
+	xtrabackupEnginePath string
 	// flags to pass through to backup phase
-	xtrabackupBackupFlags = flag.String("xtrabackup_backup_flags", "", "flags to pass to backup command. These should be space separated and will be added to the end of the command")
+	xtrabackupBackupFlags string
 	// flags to pass through to prepare phase of restore
-	xtrabackupPrepareFlags = flag.String("xtrabackup_prepare_flags", "", "flags to pass to prepare command. These should be space separated and will be added to the end of the command")
+	xtrabackupPrepareFlags string
 	// flags to pass through to extract phase of restore
-	xbstreamRestoreFlags = flag.String("xbstream_restore_flags", "", "flags to pass to xbstream command during restore. These should be space separated and will be added to the end of the command. These need to match the ones used for backup e.g. --compress / --decompress, --encrypt / --decrypt")
+	xbstreamRestoreFlags string
 	// streaming mode
-	xtrabackupStreamMode = flag.String("xtrabackup_stream_mode", "tar", "which mode to use if streaming, valid values are tar and xbstream")
-	xtrabackupUser       = flag.String("xtrabackup_user", "", "User that xtrabackup will use to connect to the database server. This user must have all necessary privileges. For details, please refer to xtrabackup documentation.")
+	xtrabackupStreamMode = "tar"
+	xtrabackupUser       string
 	// striping mode
-	xtrabackupStripes         = flag.Uint("xtrabackup_stripes", 0, "If greater than 0, use data striping across this many destination files to parallelize data transfer and decompression")
-	xtrabackupStripeBlockSize = flag.Uint("xtrabackup_stripe_block_size", 102400, "Size in bytes of each block that gets sent to a given stripe before rotating to the next stripe")
+	xtrabackupStripes         uint
+	xtrabackupStripeBlockSize = uint(102400)
 )
 
 const (
 	streamModeTar        = "tar"
+	writerBufferSize     = 2 * 1024 * 1024 /*2 MiB*/
 	xtrabackupBinaryName = "xtrabackup"
 	xtrabackupEngineName = "xtrabackup"
+	xtrabackupInfoFile   = "xtrabackup_info"
 	xbstream             = "xbstream"
-
-	// closeTimeout is the timeout for closing backup files after writing.
-	closeTimeout = 10 * time.Minute
 )
 
 // xtraBackupManifest represents a backup.
@@ -82,7 +82,11 @@ const (
 type xtraBackupManifest struct {
 	// BackupManifest is an anonymous embedding of the base manifest struct.
 	BackupManifest
-
+	// CompressionEngine stores which compression engine was originally provided
+	// to compress the files. Please note that if user has provided externalCompressorCmd
+	// then it will contain value 'external'. This field is used during restore routine to
+	// get a hint about what kind of compression was used.
+	CompressionEngine string `json:",omitempty"`
 	// Name of the backup file
 	FileName string
 	// Params are the parameters that backup was run with
@@ -99,16 +103,56 @@ type xtraBackupManifest struct {
 	// false for backups that were created before the field existed, and those
 	// backups all had compression enabled.
 	SkipCompress bool
+
+	// When CompressionEngine is "external", ExternalDecompressor may be
+	// consulted for the external decompressor command.
+	//
+	// When taking a backup with --compression-engine=external,
+	// ExternalDecompressor will be set to the value of
+	// --manifest-external-decompressor, if set, or else left as an empty
+	// string.
+	//
+	// When restoring from a backup with CompressionEngine "external",
+	// --external-decompressor will be consulted first and, if that is not set,
+	// ExternalDecompressor will be used. If neither are set, the restore will
+	// abort.
+	ExternalDecompressor string
+}
+
+func init() {
+	for _, cmd := range []string{"vtcombo", "vttablet", "vtbackup", "vttestserver", "vtctldclient"} {
+		servenv.OnParseFor(cmd, registerXtraBackupEngineFlags)
+	}
+}
+
+func registerXtraBackupEngineFlags(fs *pflag.FlagSet) {
+	fs.StringVar(&xtrabackupEnginePath, "xtrabackup_root_path", xtrabackupEnginePath, "Directory location of the xtrabackup and xbstream executables, e.g., /usr/bin")
+	fs.StringVar(&xtrabackupBackupFlags, "xtrabackup_backup_flags", xtrabackupBackupFlags, "Flags to pass to backup command. These should be space separated and will be added to the end of the command")
+	fs.StringVar(&xtrabackupPrepareFlags, "xtrabackup_prepare_flags", xtrabackupPrepareFlags, "Flags to pass to prepare command. These should be space separated and will be added to the end of the command")
+	fs.StringVar(&xbstreamRestoreFlags, "xbstream_restore_flags", xbstreamRestoreFlags, "Flags to pass to xbstream command during restore. These should be space separated and will be added to the end of the command. These need to match the ones used for backup e.g. --compress / --decompress, --encrypt / --decrypt")
+	fs.StringVar(&xtrabackupStreamMode, "xtrabackup_stream_mode", xtrabackupStreamMode, "Which mode to use if streaming, valid values are tar and xbstream. Please note that tar is not supported in XtraBackup 8.0")
+	fs.StringVar(&xtrabackupUser, "xtrabackup_user", xtrabackupUser, "User that xtrabackup will use to connect to the database server. This user must have all necessary privileges. For details, please refer to xtrabackup documentation.")
+	fs.UintVar(&xtrabackupStripes, "xtrabackup_stripes", xtrabackupStripes, "If greater than 0, use data striping across this many destination files to parallelize data transfer and decompression")
+	fs.UintVar(&xtrabackupStripeBlockSize, "xtrabackup_stripe_block_size", xtrabackupStripeBlockSize, "Size in bytes of each block that gets sent to a given stripe before rotating to the next stripe")
 }
 
 func (be *XtrabackupEngine) backupFileName() string {
 	fileName := "backup"
-	if *xtrabackupStreamMode != "" {
+	if xtrabackupStreamMode != "" {
 		fileName += "."
-		fileName += *xtrabackupStreamMode
+		fileName += xtrabackupStreamMode
 	}
-	if *backupStorageCompress {
-		fileName += ".gz"
+	if backupStorageCompress {
+		if ExternalDecompressorCmd != "" {
+			fileName += ExternalCompressorExt
+		} else {
+			if ext, err := getExtensionFromEngine(CompressionEngineName); err != nil {
+				// there is a check for this, but just in case that fails, we set a extension to the file
+				fileName += ".unknown"
+			} else {
+				fileName += ext
+			}
+		}
 	}
 	return fileName
 }
@@ -123,13 +167,31 @@ func closeFile(wc io.WriteCloser, fileName string, logger logutil.Logger, finalE
 	}
 }
 
-// ExecuteBackup returns a boolean that indicates if the backup is usable,
-// and an overall error.
-func (be *XtrabackupEngine) ExecuteBackup(ctx context.Context, params BackupParams, bh backupstorage.BackupHandle) (complete bool, finalErr error) {
+// ExecuteBackup runs a backup based on given params. This could be a full or incremental backup.
+// The function returns a BackupResult that indicates the usability of the backup, and an overall error.
+func (be *XtrabackupEngine) ExecuteBackup(ctx context.Context, params BackupParams, bh backupstorage.BackupHandle) (BackupResult, error) {
+	params.Logger.Infof("Executing Backup at %v for keyspace/shard %v/%v on tablet %v, concurrency: %v, compress: %v, incrementalFromPos: %v",
+		params.BackupTime, params.Keyspace, params.Shard, params.TabletAlias, params.Concurrency, backupStorageCompress, params.IncrementalFromPos)
 
-	if *xtrabackupUser == "" {
-		return false, vterrors.New(vtrpc.Code_INVALID_ARGUMENT, "xtrabackupUser must be specified.")
+	return be.executeFullBackup(ctx, params, bh)
+}
+
+// executeFullBackup returns a BackupResult that indicates the usability of the backup,
+// and an overall error.
+func (be *XtrabackupEngine) executeFullBackup(ctx context.Context, params BackupParams, bh backupstorage.BackupHandle) (backupResult BackupResult, finalErr error) {
+	if params.IncrementalFromPos != "" {
+		return BackupUnusable, vterrors.New(vtrpc.Code_INVALID_ARGUMENT, "incremental backups not supported in xtrabackup engine.")
 	}
+	if xtrabackupUser == "" {
+		return BackupUnusable, vterrors.New(vtrpc.Code_INVALID_ARGUMENT, "xtrabackupUser must be specified.")
+	}
+
+	// an extension is required when using an external compressor
+	if backupStorageCompress && ExternalCompressorCmd != "" && ExternalCompressorExt == "" {
+		return BackupUnusable, vterrors.New(vtrpc.Code_INVALID_ARGUMENT,
+			"flag --external-compressor-extension not provided when using an external compressor")
+	}
+
 	// use a mysql connection to detect flavor at runtime
 	conn, err := params.Mysqld.GetDbaConnection(ctx)
 	if conn != nil && err == nil {
@@ -137,17 +199,28 @@ func (be *XtrabackupEngine) ExecuteBackup(ctx context.Context, params BackupPara
 	}
 
 	if err != nil {
-		return false, vterrors.Wrap(err, "unable to obtain a connection to the database")
+		return BackupUnusable, vterrors.Wrap(err, "unable to obtain a connection to the database")
 	}
 	pos, err := conn.PrimaryPosition()
 	if err != nil {
-		return false, vterrors.Wrap(err, "unable to obtain primary position")
+		return BackupUnusable, vterrors.Wrap(err, "unable to obtain primary position")
 	}
+	serverUUID, err := conn.GetServerUUID()
+	if err != nil {
+		return BackupUnusable, vterrors.Wrap(err, "can't get server uuid")
+	}
+
+	mysqlVersion, err := params.Mysqld.GetVersionString(ctx)
+	if err != nil {
+		return BackupUnusable, vterrors.Wrap(err, "can't get MySQL version")
+	}
+
 	flavor := pos.GTIDSet.Flavor()
 	params.Logger.Infof("Detected MySQL flavor: %v", flavor)
 
 	backupFileName := be.backupFileName()
-	numStripes := int(*xtrabackupStripes)
+	params.Logger.Infof("backup file name: %s", backupFileName)
+	numStripes := int(xtrabackupStripes)
 
 	// Perform backups in a separate function, so deferred calls to Close() are
 	// all done before we continue to write the MANIFEST. This ensures that we
@@ -157,14 +230,14 @@ func (be *XtrabackupEngine) ExecuteBackup(ctx context.Context, params BackupPara
 	params.Logger.Infof("Starting backup with %v stripe(s)", numStripes)
 	replicationPosition, err := be.backupFiles(ctx, params, bh, backupFileName, numStripes, flavor)
 	if err != nil {
-		return false, err
+		return BackupUnusable, err
 	}
 
 	// open the MANIFEST
 	params.Logger.Infof("Writing backup MANIFEST")
 	mwc, err := bh.AddFile(ctx, backupManifestFileName, backupstorage.FileSizeUnknown)
 	if err != nil {
-		return false, vterrors.Wrapf(err, "cannot add %v to backup", backupManifestFileName)
+		return BackupUnusable, vterrors.Wrapf(err, "cannot add %v to backup", backupManifestFileName)
 	}
 	defer closeFile(mwc, backupManifestFileName, params.Logger, &finalErr)
 
@@ -172,48 +245,68 @@ func (be *XtrabackupEngine) ExecuteBackup(ctx context.Context, params BackupPara
 	bm := &xtraBackupManifest{
 		// Common base fields
 		BackupManifest: BackupManifest{
-			BackupMethod: xtrabackupEngineName,
-			Position:     replicationPosition,
-			BackupTime:   params.BackupTime.UTC().Format(time.RFC3339),
-			FinishedTime: time.Now().UTC().Format(time.RFC3339),
+			BackupName:     bh.Name(),
+			BackupMethod:   xtrabackupEngineName,
+			Position:       replicationPosition,
+			PurgedPosition: replicationPosition,
+			ServerUUID:     serverUUID,
+			TabletAlias:    params.TabletAlias,
+			Keyspace:       params.Keyspace,
+			Shard:          params.Shard,
+			BackupTime:     FormatRFC3339(params.BackupTime.UTC()),
+			FinishedTime:   FormatRFC3339(time.Now().UTC()),
+			MySQLVersion:   mysqlVersion,
+			// xtrabackup backups are always created such that they
+			// are safe to use for upgrades later on.
+			UpgradeSafe: true,
 		},
 
 		// XtraBackup-specific fields
 		FileName:        backupFileName,
-		StreamMode:      *xtrabackupStreamMode,
-		SkipCompress:    !*backupStorageCompress,
-		Params:          *xtrabackupBackupFlags,
+		StreamMode:      xtrabackupStreamMode,
+		SkipCompress:    !backupStorageCompress,
+		Params:          xtrabackupBackupFlags,
 		NumStripes:      int32(numStripes),
-		StripeBlockSize: int32(*xtrabackupStripeBlockSize),
+		StripeBlockSize: int32(xtrabackupStripeBlockSize),
+		// builtin specific field
+		CompressionEngine:    CompressionEngineName,
+		ExternalDecompressor: ManifestExternalDecompressorCmd,
 	}
 
 	data, err := json.MarshalIndent(bm, "", "  ")
 	if err != nil {
-		return false, vterrors.Wrapf(err, "cannot JSON encode %v", backupManifestFileName)
+		return BackupUnusable, vterrors.Wrapf(err, "cannot JSON encode %v", backupManifestFileName)
 	}
-	if _, err := mwc.Write([]byte(data)); err != nil {
-		return false, vterrors.Wrapf(err, "cannot write %v", backupManifestFileName)
+	if _, err := mwc.Write(data); err != nil {
+		return BackupUnusable, vterrors.Wrapf(err, "cannot write %v", backupManifestFileName)
 	}
 
 	params.Logger.Infof("Backup completed")
-	return true, nil
+	return BackupUsable, nil
 }
 
-func (be *XtrabackupEngine) backupFiles(ctx context.Context, params BackupParams, bh backupstorage.BackupHandle, backupFileName string, numStripes int, flavor string) (replicationPosition mysql.Position, finalErr error) {
-
-	backupProgram := path.Join(*xtrabackupEnginePath, xtrabackupBinaryName)
-	flagsToExec := []string{"--defaults-file=" + params.Cnf.path,
+func (be *XtrabackupEngine) backupFiles(
+	ctx context.Context,
+	params BackupParams,
+	bh backupstorage.BackupHandle,
+	backupFileName string,
+	numStripes int,
+	flavor string,
+) (replicationPosition replication.Position, finalErr error) {
+	backupProgram := path.Join(xtrabackupEnginePath, xtrabackupBinaryName)
+	flagsToExec := []string{"--defaults-file=" + params.Cnf.Path,
 		"--backup",
 		"--socket=" + params.Cnf.SocketFile,
 		"--slave-info",
-		"--user=" + *xtrabackupUser,
+		"--user=" + xtrabackupUser,
 		"--target-dir=" + params.Cnf.TmpDir,
+		"--extra-lsndir=" + params.Cnf.TmpDir,
 	}
-	if *xtrabackupStreamMode != "" {
-		flagsToExec = append(flagsToExec, "--stream="+*xtrabackupStreamMode)
+	if xtrabackupStreamMode != "" {
+		flagsToExec = append(flagsToExec, "--stream="+xtrabackupStreamMode)
 	}
-	if *xtrabackupBackupFlags != "" {
-		flagsToExec = append(flagsToExec, strings.Fields(*xtrabackupBackupFlags)...)
+	if xtrabackupBackupFlags != "" {
+		flagsToExec = append(flagsToExec, strings.Fields(xtrabackupBackupFlags)...)
 	}
 
 	// Create a cancellable Context for calls to bh.AddFile().
@@ -223,8 +316,15 @@ func (be *XtrabackupEngine) backupFiles(ctx context.Context, params BackupParams
 	// would impose a timeout that starts counting right now, so it would
 	// include the time spent uploading the file content. We only want to impose
 	// a timeout on the final Close() step.
+	// This context also allows us to immediately abort AddFiles if we encountered
+	// an error in this function.
 	addFilesCtx, cancelAddFiles := context.WithCancel(ctx)
-	defer cancelAddFiles()
+	defer func() {
+		if finalErr != nil {
+			cancelAddFiles()
+		}
+	}()
+
 	destFiles, err := addStripeFiles(addFilesCtx, params, bh, backupFileName, numStripes)
 	if err != nil {
 		return replicationPosition, vterrors.Wrapf(err, "cannot create backup file %v", backupFileName)
@@ -271,20 +371,27 @@ func (be *XtrabackupEngine) backupFiles(ctx context.Context, params BackupParams
 
 	destWriters := []io.Writer{}
 	destBuffers := []*bufio.Writer{}
-	destCompressors := []io.WriteCloser{}
+	destCompressors := []io.Closer{}
 	for _, file := range destFiles {
 		buffer := bufio.NewWriterSize(file, writerBufferSize)
 		destBuffers = append(destBuffers, buffer)
 		writer := io.Writer(buffer)
 
 		// Create the gzip compression pipe, if necessary.
-		if *backupStorageCompress {
-			compressor := pargzip.NewWriter(writer)
-			compressor.ChunkSize = *backupCompressBlockSize
-			compressor.Parallel = *backupCompressBlocks
-			compressor.CompressionLevel = pargzip.BestSpeed
+		if backupStorageCompress {
+			var compressor io.WriteCloser
+
+			if ExternalCompressorCmd != "" {
+				compressor, err = newExternalCompressor(ctx, ExternalCompressorCmd, writer, params.Logger)
+			} else {
+				compressor, err = newBuiltinCompressor(CompressionEngineName, writer, params.Logger)
+			}
+			if err != nil {
+				return replicationPosition, vterrors.Wrap(err, "can't create compressor")
+			}
+
 			writer = compressor
-			destCompressors = append(destCompressors, compressor)
+			destCompressors = append(destCompressors, ioutil.NewTimeoutCloser(ctx, compressor, closeTimeout))
 		}
 
 		destWriters = append(destWriters, writer)
@@ -299,27 +406,14 @@ func (be *XtrabackupEngine) backupFiles(ctx context.Context, params BackupParams
 	// the replication position. Note that if we don't read stderr as we go, the
 	// xtrabackup process gets blocked when the write buffer fills up.
 	stderrBuilder := &strings.Builder{}
-	posBuilder := &strings.Builder{}
 	stderrDone := make(chan struct{})
 	go func() {
 		defer close(stderrDone)
 
 		scanner := bufio.NewScanner(backupErr)
-		capture := false
 		for scanner.Scan() {
 			line := scanner.Text()
 			params.Logger.Infof("xtrabackup stderr: %s", line)
-
-			// Wait until we see the first line of the binlog position.
-			// Then capture all subsequent lines. We need multiple lines since
-			// the value we're looking for has newlines in it.
-			if !capture {
-				if !strings.Contains(line, "MySQL binlog position") {
-					continue
-				}
-				capture = true
-			}
-			fmt.Fprintln(posBuilder, line)
 		}
 		if err := scanner.Err(); err != nil {
 			params.Logger.Errorf("error reading from xtrabackup stderr: %v", err)
@@ -327,7 +421,7 @@ func (be *XtrabackupEngine) backupFiles(ctx context.Context, params BackupParams
 	}()
 
 	// Copy from the stream output to destination file (optional gzip)
-	blockSize := int64(*xtrabackupStripeBlockSize)
+	blockSize := int64(xtrabackupStripeBlockSize)
 	if blockSize < 1024 {
 		// Enforce minimum block size.
 		blockSize = 1024
@@ -343,7 +437,7 @@ func (be *XtrabackupEngine) backupFiles(ctx context.Context, params BackupParams
 	// Close compressor to flush it. After that all data is sent to the buffer.
 	for _, compressor := range destCompressors {
 		if err := compressor.Close(); err != nil {
-			return replicationPosition, vterrors.Wrap(err, "cannot close gzip compressor")
+			return replicationPosition, vterrors.Wrap(err, "cannot close compressor")
 		}
 	}
 
@@ -363,8 +457,7 @@ func (be *XtrabackupEngine) backupFiles(ctx context.Context, params BackupParams
 		return replicationPosition, vterrors.Wrap(err, fmt.Sprintf("xtrabackup failed with error. Output=%s", sterrOutput))
 	}
 
-	posOutput := posBuilder.String()
-	replicationPosition, rerr := findReplicationPosition(posOutput, flavor, params.Logger)
+	replicationPosition, rerr := findReplicationPositionFromXtrabackupInfo(params.Cnf.TmpDir, flavor, params.Logger)
 	if rerr != nil {
 		return replicationPosition, vterrors.Wrap(rerr, "backup failed trying to find replication position")
 	}
@@ -386,7 +479,7 @@ func (be *XtrabackupEngine) ExecuteRestore(ctx context.Context, params RestorePa
 		return nil, err
 	}
 
-	if err := prepareToRestore(ctx, params.Cnf, params.Mysqld, params.Logger); err != nil {
+	if err := prepareToRestore(ctx, params.Cnf, params.Mysqld, params.Logger, params.MysqlShutdownTimeout); err != nil {
 		return nil, err
 	}
 
@@ -405,7 +498,6 @@ func (be *XtrabackupEngine) ExecuteRestore(ctx context.Context, params RestorePa
 func (be *XtrabackupEngine) restoreFromBackup(ctx context.Context, cnf *Mycnf, bh backupstorage.BackupHandle, bm xtraBackupManifest, logger logutil.Logger) error {
 	// first download the file into a tmp dir
 	// and extract all the files
-
 	tempDir := fmt.Sprintf("%v/%v", cnf.TmpDir, time.Now().UTC().Format("xtrabackup-2006-01-02.150405"))
 	// create tempDir
 	if err := os.MkdirAll(tempDir, os.ModePerm); err != nil {
@@ -419,6 +511,16 @@ func (be *XtrabackupEngine) restoreFromBackup(ctx context.Context, cnf *Mycnf, b
 		}
 	}(tempDir, logger)
 
+	// For optimization, we are replacing pargzip with pgzip, so newBuiltinDecompressor doesn't have to compare and print warning for every file
+	// since newBuiltinDecompressor is helper method and does not hold any state, it was hard to do it in that method itself.
+	if bm.CompressionEngine == PargzipCompressor {
+		logger.Warningf(`engine "pargzip" doesn't support decompression, using "pgzip" instead`)
+		bm.CompressionEngine = PgzipCompressor
+		defer func() {
+			bm.CompressionEngine = PargzipCompressor
+		}()
+	}
+
 	if err := be.extractFiles(ctx, logger, bh, bm, tempDir); err != nil {
 		logger.Errorf("error extracting backup files: %v", err)
 		return err
@@ -427,13 +529,13 @@ func (be *XtrabackupEngine) restoreFromBackup(ctx context.Context, cnf *Mycnf, b
 	// copy / extract files
 	logger.Infof("Restore: Preparing the extracted files")
 	// prepare the backup
-	restoreProgram := path.Join(*xtrabackupEnginePath, xtrabackupBinaryName)
-	flagsToExec := []string{"--defaults-file=" + cnf.path,
+	restoreProgram := path.Join(xtrabackupEnginePath, xtrabackupBinaryName)
+	flagsToExec := []string{"--defaults-file=" + cnf.Path,
 		"--prepare",
 		"--target-dir=" + tempDir,
 	}
-	if *xtrabackupPrepareFlags != "" {
-		flagsToExec = append(flagsToExec, strings.Fields(*xtrabackupPrepareFlags)...)
+	if xtrabackupPrepareFlags != "" {
+		flagsToExec = append(flagsToExec, strings.Fields(xtrabackupPrepareFlags)...)
 	}
 	prepareCmd := exec.CommandContext(ctx, restoreProgram, flagsToExec...)
 	prepareOut, err := prepareCmd.StdoutPipe()
@@ -463,7 +565,7 @@ func (be *XtrabackupEngine) restoreFromBackup(ctx context.Context, cnf *Mycnf, b
 	// then move-back
 	logger.Infof("Restore: Move extracted and prepared files to final locations")
 
-	flagsToExec = []string{"--defaults-file=" + cnf.path,
+	flagsToExec = []string{"--defaults-file=" + cnf.Path,
 		"--move-back",
 		"--target-dir=" + tempDir,
 	}
@@ -503,13 +605,14 @@ func (be *XtrabackupEngine) extractFiles(ctx context.Context, logger logutil.Log
 	compressed := !bm.SkipCompress
 	streamMode := bm.StreamMode
 	if streamMode == "" {
-		streamMode = *xtrabackupStreamMode
+		streamMode = xtrabackupStreamMode
 	}
 	baseFileName := bm.FileName
 	if baseFileName == "" {
 		baseFileName = be.backupFileName()
 	}
 
+	logger.Infof("backup file name: %s", baseFileName)
 	// Open the source files for reading.
 	srcFiles, err := readStripeFiles(ctx, bh, baseFileName, int(bm.NumStripes), logger)
 	if err != nil {
@@ -522,17 +625,40 @@ func (be *XtrabackupEngine) extractFiles(ctx context.Context, logger logutil.Log
 	}()
 
 	srcReaders := []io.Reader{}
-	srcDecompressors := []io.ReadCloser{}
+	srcDecompressors := []io.Closer{}
 	for _, file := range srcFiles {
 		reader := io.Reader(file)
 
 		// Create the decompressor if needed.
 		if compressed {
-			decompressor, err := pgzip.NewReader(reader)
-			if err != nil {
-				return vterrors.Wrap(err, "can't create gzip decompressor")
+			var decompressor io.ReadCloser
+			var deCompressionEngine = bm.CompressionEngine
+			if deCompressionEngine == "" {
+				// For backward compatibility. Incase if Manifest is from N-1 binary
+				// then we assign the default value of compressionEngine.
+				deCompressionEngine = PgzipCompressor
 			}
-			srcDecompressors = append(srcDecompressors, decompressor)
+			externalDecompressorCmd := ExternalDecompressorCmd
+			if externalDecompressorCmd == "" && bm.ExternalDecompressor != "" {
+				externalDecompressorCmd = bm.ExternalDecompressor
+			}
+			if externalDecompressorCmd != "" {
+				if deCompressionEngine == ExternalCompressor {
+					deCompressionEngine = externalDecompressorCmd
+					decompressor, err = newExternalDecompressor(ctx, deCompressionEngine, reader, logger)
+				} else {
+					decompressor, err = newBuiltinDecompressor(deCompressionEngine, reader, logger)
+				}
+			} else {
+				if deCompressionEngine == ExternalCompressor {
+					return fmt.Errorf("%w %q", errUnsupportedCompressionEngine, ExternalCompressor)
+				}
+				decompressor, err = newBuiltinDecompressor(deCompressionEngine, reader, logger)
+			}
+			if err != nil {
+				return vterrors.Wrap(err, "can't create decompressor")
+			}
+			srcDecompressors = append(srcDecompressors, ioutil.NewTimeoutCloser(ctx, decompressor, closeTimeout))
 			reader = decompressor
 		}
 
@@ -541,7 +667,7 @@ func (be *XtrabackupEngine) extractFiles(ctx context.Context, logger logutil.Log
 	defer func() {
 		for _, decompressor := range srcDecompressors {
 			if cerr := decompressor.Close(); cerr != nil {
-				logger.Errorf("failed to close gzip decompressor: %v", cerr)
+				logger.Errorf("failed to close decompressor: %v", cerr)
 			}
 		}
 	}()
@@ -582,10 +708,10 @@ func (be *XtrabackupEngine) extractFiles(ctx context.Context, logger logutil.Log
 
 	case xbstream:
 		// now extract the files by running xbstream
-		xbstreamProgram := path.Join(*xtrabackupEnginePath, xbstream)
+		xbstreamProgram := path.Join(xtrabackupEnginePath, xbstream)
 		flagsToExec := []string{"-C", tempDir, "-xv"}
-		if *xbstreamRestoreFlags != "" {
-			flagsToExec = append(flagsToExec, strings.Fields(*xbstreamRestoreFlags)...)
+		if xbstreamRestoreFlags != "" {
+			flagsToExec = append(flagsToExec, strings.Fields(xbstreamRestoreFlags)...)
 		}
 		xbstreamCmd := exec.CommandContext(ctx, xbstreamProgram, flagsToExec...)
 		logger.Infof("Executing xbstream cmd: %v %v", xbstreamProgram, flagsToExec)
@@ -619,12 +745,28 @@ func (be *XtrabackupEngine) extractFiles(ctx context.Context, logger logutil.Log
 	return nil
 }
 
+func findReplicationPositionFromXtrabackupInfo(directory, flavor string, logger logutil.Logger) (replication.Position, error) {
+	f, err := os.Open(path.Join(directory, xtrabackupInfoFile))
+	if err != nil {
+		return replication.Position{}, vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT,
+			"couldn't open %q to read GTID position", path.Join(directory, xtrabackupInfoFile))
+	}
+	defer f.Close()
+
+	contents, err := io.ReadAll(f)
+	if err != nil {
+		return replication.Position{}, vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "couldn't read GTID position from %q", f.Name())
+	}
+
+	return findReplicationPosition(string(contents), flavor, logger)
+}
+
 var xtrabackupReplicationPositionRegexp = regexp.MustCompile(`GTID of the last change '([^']*)'`)
 
-func findReplicationPosition(input, flavor string, logger logutil.Logger) (mysql.Position, error) {
+func findReplicationPosition(input, flavor string, logger logutil.Logger) (replication.Position, error) {
 	match := xtrabackupReplicationPositionRegexp.FindStringSubmatch(input)
 	if match == nil || len(match) != 2 {
-		return mysql.Position{}, vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "couldn't find replication position in xtrabackup stderr output")
+		return replication.Position{}, vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "couldn't find replication position in xtrabackup stderr output")
 	}
 	position := match[1]
 	// Remove all spaces, tabs, and newlines.
@@ -633,32 +775,15 @@ func findReplicationPosition(input, flavor string, logger logutil.Logger) (mysql
 	position = strings.Replace(position, "\n", "", -1)
 	logger.Infof("Found position: %v", position)
 	if position == "" {
-		return mysql.Position{}, vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "empty replication position from xtrabackup")
+		return replication.Position{}, vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "empty replication position from xtrabackup")
 	}
 
 	// flavor is required to parse a string into a mysql.Position
-	replicationPosition, err := mysql.ParsePosition(flavor, position)
+	replicationPosition, err := replication.ParsePosition(flavor, position)
 	if err != nil {
-		return mysql.Position{}, vterrors.Wrapf(err, "can't parse replication position from xtrabackup: %v", position)
+		return replication.Position{}, vterrors.Wrapf(err, "can't parse replication position from xtrabackup: %v", position)
 	}
 	return replicationPosition, nil
-}
-
-// scanLinesToLogger scans full lines from the given Reader and sends them to
-// the given Logger until EOF.
-func scanLinesToLogger(prefix string, reader io.Reader, logger logutil.Logger, doneFunc func()) {
-	defer doneFunc()
-
-	scanner := bufio.NewScanner(reader)
-	for scanner.Scan() {
-		line := scanner.Text()
-		logger.Infof("%s: %s", prefix, line)
-	}
-	if err := scanner.Err(); err != nil {
-		// This is usually run in a background goroutine, so there's no point
-		// returning an error. Just log it.
-		logger.Warningf("error scanning lines from %s: %v", prefix, err)
-	}
 }
 
 func stripeFileName(baseFileName string, index int) string {
@@ -820,9 +945,16 @@ func stripeReader(readers []io.Reader, blockSize int64) io.Reader {
 
 // ShouldDrainForBackup satisfies the BackupEngine interface
 // xtrabackup can run while tablet is serving, hence false
-func (be *XtrabackupEngine) ShouldDrainForBackup() bool {
+func (be *XtrabackupEngine) ShouldDrainForBackup(req *tabletmanagerdatapb.BackupRequest) bool {
 	return false
 }
+
+// ShouldStartMySQLAfterRestore signifies if this backup engine needs to restart MySQL once the restore is completed.
+func (be *XtrabackupEngine) ShouldStartMySQLAfterRestore() bool {
+	return true
+}
+
+func (be *XtrabackupEngine) Name() string { return xtrabackupEngineName }
 
 func init() {
 	BackupRestoreEngineMap[xtrabackupEngineName] = &XtrabackupEngine{}

@@ -17,10 +17,10 @@ limitations under the License.
 package vindexes
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/sqltypes"
@@ -35,18 +35,21 @@ func TestLookupUniqueNew(t *testing.T) {
 		t.Errorf("Create(lookup, false): %v, want %v", got, want)
 	}
 
-	vindex, _ := CreateVindex("lookup_unique", "lookup_unique", map[string]string{
+	vindex, err := CreateVindex("lookup_unique", "lookup_unique", map[string]string{
 		"table":      "t",
 		"from":       "fromc",
 		"to":         "toc",
 		"write_only": "true",
 	})
+	require.NoError(t, err)
+	require.Empty(t, vindex.(ParamValidating).UnknownParams())
+
 	l = vindex.(SingleColumn)
 	if want, got := l.(*LookupUnique).writeOnly, true; got != want {
 		t.Errorf("Create(lookup, false): %v, want %v", got, want)
 	}
 
-	_, err := CreateVindex("lookup_unique", "lookup_unique", map[string]string{
+	_, err = CreateVindex("lookup_unique", "lookup_unique", map[string]string{
 		"table":      "t",
 		"from":       "fromc",
 		"to":         "toc",
@@ -58,18 +61,11 @@ func TestLookupUniqueNew(t *testing.T) {
 	}
 }
 
-func TestLookupUniqueInfo(t *testing.T) {
-	lookupUnique := createLookup(t, "lookup_unique", false)
-	assert.Equal(t, 10, lookupUnique.Cost())
-	assert.Equal(t, "lookup_unique", lookupUnique.String())
-	assert.True(t, lookupUnique.IsUnique())
-}
-
 func TestLookupUniqueMap(t *testing.T) {
 	lookupUnique := createLookup(t, "lookup_unique", false)
 	vc := &vcursor{numRows: 1}
 
-	got, err := lookupUnique.Map(vc, []sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewInt64(2)})
+	got, err := lookupUnique.Map(context.Background(), vc, []sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewInt64(2)})
 	require.NoError(t, err)
 	want := []key.Destination{
 		key.DestinationKeyspaceID([]byte("1")),
@@ -80,7 +76,7 @@ func TestLookupUniqueMap(t *testing.T) {
 	}
 
 	vc.numRows = 0
-	got, err = lookupUnique.Map(vc, []sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewInt64(2)})
+	got, err = lookupUnique.Map(context.Background(), vc, []sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewInt64(2)})
 	require.NoError(t, err)
 	want = []key.Destination{
 		key.DestinationNone{},
@@ -91,7 +87,7 @@ func TestLookupUniqueMap(t *testing.T) {
 	}
 
 	vc.numRows = 2
-	_, err = lookupUnique.Map(vc, []sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewInt64(2)})
+	_, err = lookupUnique.Map(context.Background(), vc, []sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewInt64(2)})
 	wantErr := "Lookup.Map: unexpected multiple results from vindex t: INT64(1)"
 	if err == nil || err.Error() != wantErr {
 		t.Errorf("lookupUnique(query fail) err: %v, want %s", err, wantErr)
@@ -99,7 +95,7 @@ func TestLookupUniqueMap(t *testing.T) {
 
 	// Test query fail.
 	vc.mustFail = true
-	_, err = lookupUnique.Map(vc, []sqltypes.Value{sqltypes.NewInt64(1)})
+	_, err = lookupUnique.Map(context.Background(), vc, []sqltypes.Value{sqltypes.NewInt64(1)})
 	wantErr = "lookup.Map: execute failed"
 	if err == nil || err.Error() != wantErr {
 		t.Errorf("lookupUnique(query fail) err: %v, want %s", err, wantErr)
@@ -111,7 +107,7 @@ func TestLookupUniqueMapWriteOnly(t *testing.T) {
 	lookupUnique := createLookup(t, "lookup_unique", true)
 	vc := &vcursor{numRows: 0}
 
-	got, err := lookupUnique.Map(vc, []sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewInt64(2)})
+	got, err := lookupUnique.Map(context.Background(), vc, []sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewInt64(2)})
 	require.NoError(t, err)
 	want := []key.Destination{
 		key.DestinationKeyRange{
@@ -130,7 +126,7 @@ func TestLookupUniqueVerify(t *testing.T) {
 	lookupUnique := createLookup(t, "lookup_unique", false)
 	vc := &vcursor{numRows: 1}
 
-	_, err := lookupUnique.Verify(vc, []sqltypes.Value{sqltypes.NewInt64(1)}, [][]byte{[]byte("test")})
+	_, err := lookupUnique.Verify(context.Background(), vc, []sqltypes.Value{sqltypes.NewInt64(1)}, [][]byte{[]byte("test")})
 	require.NoError(t, err)
 	if got, want := len(vc.queries), 1; got != want {
 		t.Errorf("vc.queries length: %v, want %v", got, want)
@@ -141,7 +137,7 @@ func TestLookupUniqueVerifyWriteOnly(t *testing.T) {
 	lookupUnique := createLookup(t, "lookup_unique", true)
 	vc := &vcursor{numRows: 0}
 
-	got, err := lookupUnique.Verify(vc, []sqltypes.Value{sqltypes.NewInt64(1)}, [][]byte{[]byte("test")})
+	got, err := lookupUnique.Verify(context.Background(), vc, []sqltypes.Value{sqltypes.NewInt64(1)}, [][]byte{[]byte("test")})
 	require.NoError(t, err)
 	want := []bool{true}
 	if !reflect.DeepEqual(got, want) {
@@ -162,9 +158,10 @@ func TestLookupUniqueCreate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	require.Empty(t, lookupUnique.(ParamValidating).UnknownParams())
 	vc := &vcursor{}
 
-	err = lookupUnique.(Lookup).Create(vc, [][]sqltypes.Value{{sqltypes.NewInt64(1)}}, [][]byte{[]byte("test")}, false /* ignoreMode */)
+	err = lookupUnique.(Lookup).Create(context.Background(), vc, [][]sqltypes.Value{{sqltypes.NewInt64(1)}}, [][]byte{[]byte("test")}, false /* ignoreMode */)
 	require.NoError(t, err)
 
 	wantqueries := []*querypb.BoundQuery{{
@@ -187,7 +184,7 @@ func TestLookupUniqueCreateAutocommit(t *testing.T) {
 	lookupUnique := createLookup(t, "lookup_unique", false)
 	vc := &vcursor{}
 
-	err := lookupUnique.(Lookup).Create(vc, [][]sqltypes.Value{{sqltypes.NewInt64(1)}}, [][]byte{[]byte("test")}, false /* ignoreMode */)
+	err := lookupUnique.(Lookup).Create(context.Background(), vc, [][]sqltypes.Value{{sqltypes.NewInt64(1)}}, [][]byte{[]byte("test")}, false /* ignoreMode */)
 	require.NoError(t, err)
 	if got, want := len(vc.queries), 1; got != want {
 		t.Errorf("vc.queries length: %v, want %v", got, want)
@@ -198,7 +195,7 @@ func TestLookupUniqueDelete(t *testing.T) {
 	lookupUnique := createLookup(t, "lookup_unique", false)
 	vc := &vcursor{}
 
-	err := lookupUnique.(Lookup).Delete(vc, [][]sqltypes.Value{{sqltypes.NewInt64(1)}}, []byte("test"))
+	err := lookupUnique.(Lookup).Delete(context.Background(), vc, [][]sqltypes.Value{{sqltypes.NewInt64(1)}}, []byte("test"))
 	require.NoError(t, err)
 	if got, want := len(vc.queries), 1; got != want {
 		t.Errorf("vc.queries length: %v, want %v", got, want)
@@ -209,7 +206,7 @@ func TestLookupUniqueUpdate(t *testing.T) {
 	lookupUnique := createLookup(t, "lookup_unique", false)
 	vc := &vcursor{}
 
-	err := lookupUnique.(Lookup).Update(vc, []sqltypes.Value{sqltypes.NewInt64(1)}, []byte("test"), []sqltypes.Value{sqltypes.NewInt64(2)})
+	err := lookupUnique.(Lookup).Update(context.Background(), vc, []sqltypes.Value{sqltypes.NewInt64(1)}, []byte("test"), []sqltypes.Value{sqltypes.NewInt64(2)})
 	require.NoError(t, err)
 	if got, want := len(vc.queries), 2; got != want {
 		t.Errorf("vc.queries length: %v, want %v", got, want)

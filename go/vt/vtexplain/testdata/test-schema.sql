@@ -4,6 +4,12 @@ create table t1 (
 	floatval float not null default 0,
 	primary key (id)
 );
+create table t2 (
+	id bigint(20) unsigned not null,
+	t1_id bigint(20) unsigned not null default 0,
+	c2 bigint(20) null,
+	primary key (id)
+);
 
 create table user (
 	id bigint,
@@ -81,3 +87,51 @@ create table user_region (
    email varchar(64),
    primary key (regionId,userId)
 ) Engine=InnoDB;
+
+create table member (
+    id bigint,
+    lkp binary(16) NOT NULL,
+    more_id int not null,
+    primary key (id)
+) Engine=InnoDB;
+
+create table lkp_idx (
+    lkp binary(16) NOT NULL,
+    id bigint,
+    primary key (lkp)
+) Engine=InnoDB;
+
+CREATE TABLE orders (
+  id bigint,
+	customer_id bigint
+);
+
+CREATE TABLE orders_id_lookup (
+  id int NOT NULL,
+  keyspace_id varbinary(128),
+  primary key(id)
+);
+
+CREATE TABLE orders_id_lookup_exclusive_read_lock (
+  id int NOT NULL,
+  keyspace_id varbinary(128),
+  primary key(id)
+);
+
+CREATE TABLE orders_id_lookup_shared_read_lock (
+  id int NOT NULL,
+  keyspace_id varbinary(128),
+  primary key(id)
+);
+
+CREATE TABLE orders_id_lookup_no_read_lock (
+  id int NOT NULL,
+  keyspace_id varbinary(128),
+  primary key(id)
+);
+
+CREATE TABLE orders_id_lookup_no_verify (
+  id int NOT NULL,
+  keyspace_id varbinary(128),
+  primary key(id)
+);

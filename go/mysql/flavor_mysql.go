@@ -17,100 +17,213 @@ limitations under the License.
 package mysql
 
 import (
+	"context"
 	"fmt"
 	"io"
+	"strconv"
+	"strings"
 	"time"
 
-	"context"
-
-	"vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/mysql/capabilities"
+	"vitess.io/vitess/go/mysql/replication"
+	"vitess.io/vitess/go/mysql/sqlerror"
+	"vitess.io/vitess/go/vt/proto/replicationdata"
 	"vitess.io/vitess/go/vt/vterrors"
+
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 )
 
-// mysqlFlavor implements the Flavor interface for Mysql.
-type mysqlFlavor struct{}
-type mysqlFlavor56 struct {
-	mysqlFlavor
+// mysqlFlavor implements the Flavor interface for Mysql. This is
+// the most up to date / recent flavor and uses the most modern
+// replication commands and semantics.
+type mysqlFlavor struct {
+	serverVersion string
 }
-type mysqlFlavor57 struct {
-	mysqlFlavor
-}
-type mysqlFlavor80 struct {
+
+// mysqlFlavor8 is for later MySQL 8.0 versions. It's the same as
+// the modern flavor, but overrides some specific commands that
+// are only available on MySQL 8.2.0 and later. This is specifically
+// commands like SHOW BINARY LOG STATUS.
+type mysqlFlavor8 struct {
 	mysqlFlavor
 }
 
-var _ flavor = (*mysqlFlavor56)(nil)
-var _ flavor = (*mysqlFlavor57)(nil)
-var _ flavor = (*mysqlFlavor80)(nil)
+// mysqlFlavor82 is for MySQL 8.2.0 and later. It's the most modern
+// flavor but has an explicit name so that it's clear it's explicitly
+// for MySQL 8.2.0 and later.
+type mysqlFlavor82 struct {
+	mysqlFlavor
+}
+
+var _ flavor = (*mysqlFlavor8)(nil)
+var _ flavor = (*mysqlFlavor82)(nil)
 
 // primaryGTIDSet is part of the Flavor interface.
-func (mysqlFlavor) primaryGTIDSet(c *Conn) (GTIDSet, error) {
+func (mysqlFlavor) primaryGTIDSet(c *Conn) (replication.GTIDSet, error) {
 	// keep @@global as lowercase, as some servers like the Ripple binlog server only honors a lowercase `global` value
 	qr, err := c.ExecuteFetch("SELECT @@global.gtid_executed", 1, false)
 	if err != nil {
 		return nil, err
 	}
 	if len(qr.Rows) != 1 || len(qr.Rows[0]) != 1 {
-		return nil, vterrors.Errorf(vtrpc.Code_INTERNAL, "unexpected result format for gtid_executed: %#v", qr)
+		return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "unexpected result format for gtid_executed: %#v", qr)
 	}
-	return parseMysql56GTIDSet(qr.Rows[0][0].ToString())
+	return replication.ParseMysql56GTIDSet(qr.Rows[0][0].ToString())
 }
 
-func (mysqlFlavor) startReplicationCommand() string {
-	return "START SLAVE"
+// purgedGTIDSet is part of the Flavor interface.
+func (mysqlFlavor) purgedGTIDSet(c *Conn) (replication.GTIDSet, error) {
+	// keep @@global as lowercase, as some servers like the Ripple binlog server only honors a lowercase `global` value
+	qr, err := c.ExecuteFetch("SELECT @@global.gtid_purged", 1, false)
+	if err != nil {
+		return nil, err
+	}
+	if len(qr.Rows) != 1 || len(qr.Rows[0]) != 1 {
+		return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "unexpected result format for gtid_purged: %#v", qr)
+	}
+	return replication.ParseMysql56GTIDSet(qr.Rows[0][0].ToString())
 }
 
-func (mysqlFlavor) restartReplicationCommands() []string {
+// serverUUID is part of the Flavor interface.
+func (mysqlFlavor) serverUUID(c *Conn) (string, error) {
+	// keep @@global as lowercase, as some servers like the Ripple binlog server only honors a lowercase `global` value
+	qr, err := c.ExecuteFetch("SELECT @@global.server_uuid", 1, false)
+	if err != nil {
+		return "", err
+	}
+	if len(qr.Rows) != 1 || len(qr.Rows[0]) != 1 {
+		return "", vterrors.Errorf(vtrpcpb.Code_INTERNAL, "unexpected result format for server_uuid: %#v", qr)
+	}
+	return qr.Rows[0][0].ToString(), nil
+}
+
+// gtidMode is part of the Flavor interface.
+func (mysqlFlavor) gtidMode(c *Conn) (string, error) {
+	qr, err := c.ExecuteFetch("select @@global.gtid_mode", 1, false)
+	if err != nil {
+		return "", err
+	}
+	if len(qr.Rows) != 1 || len(qr.Rows[0]) != 1 {
+		return "", vterrors.Errorf(vtrpcpb.Code_INTERNAL, "unexpected result format for gtid_mode: %#v", qr)
+	}
+	return qr.Rows[0][0].ToString(), nil
+}
+
+func (f mysqlFlavor) startReplicationCommand() string {
+	return "START REPLICA"
+}
+
+func (f mysqlFlavor) restartReplicationCommands() []string {
 	return []string{
-		"STOP SLAVE",
-		"RESET SLAVE",
-		"START SLAVE",
+		"STOP REPLICA",
+		"RESET REPLICA",
+		"START REPLICA",
 	}
 }
 
-func (mysqlFlavor) startReplicationUntilAfter(pos Position) string {
-	return fmt.Sprintf("START SLAVE UNTIL SQL_AFTER_GTIDS = '%s'", pos)
+func (f mysqlFlavor) startReplicationUntilAfter(pos replication.Position) string {
+	return fmt.Sprintf("START REPLICA UNTIL SQL_AFTER_GTIDS = '%s'", pos)
 }
 
-func (mysqlFlavor) stopReplicationCommand() string {
-	return "STOP SLAVE"
+func (f mysqlFlavor) startSQLThreadUntilAfter(pos replication.Position) string {
+	return fmt.Sprintf("START REPLICA SQL_THREAD UNTIL SQL_AFTER_GTIDS = '%s'", pos)
 }
 
-func (mysqlFlavor) stopIOThreadCommand() string {
-	return "STOP SLAVE IO_THREAD"
+func (f mysqlFlavor) stopReplicationCommand() string {
+	return "STOP REPLICA"
 }
 
-func (mysqlFlavor) startSQLThreadCommand() string {
-	return "START SLAVE SQL_THREAD"
+func (f mysqlFlavor) resetReplicationCommand() string {
+	return "RESET REPLICA ALL"
 }
 
-// sendBinlogDumpCommand is part of the Flavor interface.
-func (mysqlFlavor) sendBinlogDumpCommand(c *Conn, serverID uint32, startPos Position) error {
-	gtidSet, ok := startPos.GTIDSet.(Mysql56GTIDSet)
-	if !ok {
-		return vterrors.Errorf(vtrpc.Code_INTERNAL, "startPos.GTIDSet is wrong type - expected Mysql56GTIDSet, got: %#v", startPos.GTIDSet)
-	}
+func (f mysqlFlavor) stopIOThreadCommand() string {
+	return "STOP REPLICA IO_THREAD"
+}
 
-	// Build the command.
-	sidBlock := gtidSet.SIDBlock()
-	return c.WriteComBinlogDumpGTID(serverID, "", 4, 0, sidBlock)
+func (f mysqlFlavor) stopSQLThreadCommand() string {
+	return "STOP REPLICA SQL_THREAD"
+}
+
+func (f mysqlFlavor) startSQLThreadCommand() string {
+	return "START REPLICA SQL_THREAD"
 }
 
 // resetReplicationCommands is part of the Flavor interface.
 func (mysqlFlavor) resetReplicationCommands(c *Conn) []string {
 	resetCommands := []string{
-		"STOP SLAVE",
-		"RESET SLAVE ALL", // "ALL" makes it forget source host:port.
-		"RESET MASTER",    // This will also clear gtid_executed and gtid_purged.
+		"STOP REPLICA",
+		"RESET REPLICA ALL",           // "ALL" makes it forget source host:port.
+		"RESET BINARY LOGS AND GTIDS", // This will also clear gtid_executed and gtid_purged.
 	}
-	if c.SemiSyncExtensionLoaded() {
+	status, err := c.SemiSyncExtensionLoaded()
+	if err != nil {
+		return resetCommands
+	}
+	switch status {
+	case SemiSyncTypeSource:
+		resetCommands = append(resetCommands, "SET GLOBAL rpl_semi_sync_source_enabled = false, GLOBAL rpl_semi_sync_replica_enabled = false") // semi-sync will be enabled if needed when replica is started.
+	case SemiSyncTypeMaster:
 		resetCommands = append(resetCommands, "SET GLOBAL rpl_semi_sync_master_enabled = false, GLOBAL rpl_semi_sync_slave_enabled = false") // semi-sync will be enabled if needed when replica is started.
+	default:
+		// Nothing to do.
 	}
 	return resetCommands
 }
 
+func (mysqlFlavor) resetBinaryLogsCommand() string {
+	return "RESET BINARY LOGS AND GTIDS"
+}
+
+// resetReplicationCommands is part of the Flavor interface.
+func (mysqlFlavor8) resetReplicationCommands(c *Conn) []string {
+	resetCommands := []string{
+		"STOP REPLICA",
+		"RESET REPLICA ALL", // "ALL" makes it forget source host:port.
+		"RESET MASTER",      // This will also clear gtid_executed and gtid_purged.
+	}
+	status, err := c.SemiSyncExtensionLoaded()
+	if err != nil {
+		return resetCommands
+	}
+	switch status {
+	case SemiSyncTypeSource:
+		resetCommands = append(resetCommands, "SET GLOBAL rpl_semi_sync_source_enabled = false, GLOBAL rpl_semi_sync_replica_enabled = false") // semi-sync will be enabled if needed when replica is started.
+	case SemiSyncTypeMaster:
+		resetCommands = append(resetCommands, "SET GLOBAL rpl_semi_sync_master_enabled = false, GLOBAL rpl_semi_sync_slave_enabled = false") // semi-sync will be enabled if needed when replica is started.
+	default:
+		// Nothing to do.
+	}
+	return resetCommands
+}
+
+// resetReplicationCommands is part of the Flavor interface.
+func (mysqlFlavor8) resetBinaryLogsCommand() string {
+	return "RESET MASTER"
+}
+
+// resetReplicationParametersCommands is part of the Flavor interface.
+func (mysqlFlavor) resetReplicationParametersCommands(c *Conn) []string {
+	resetCommands := []string{
+		"RESET REPLICA ALL", // "ALL" makes it forget source host:port.
+	}
+	return resetCommands
+}
+
+// sendBinlogDumpCommand is part of the Flavor interface.
+func (mysqlFlavor) sendBinlogDumpCommand(c *Conn, serverID uint32, binlogFilename string, startPos replication.Position) error {
+	gtidSet, ok := startPos.GTIDSet.(replication.Mysql56GTIDSet)
+	if !ok {
+		return vterrors.Errorf(vtrpcpb.Code_INTERNAL, "startPos.GTIDSet is wrong type - expected Mysql56GTIDSet, got: %#v", startPos.GTIDSet)
+	}
+
+	// Build the command.
+	sidBlock := gtidSet.SIDBlock()
+	return c.WriteComBinlogDumpGTID(serverID, binlogFilename, 4, 0, sidBlock)
+}
+
 // setReplicationPositionCommands is part of the Flavor interface.
-func (mysqlFlavor) setReplicationPositionCommands(pos Position) []string {
+func (mysqlFlavor8) setReplicationPositionCommands(pos replication.Position) []string {
 	return []string{
 		"RESET MASTER", // We must clear gtid_executed before setting gtid_purged.
 		fmt.Sprintf("SET GLOBAL gtid_purged = '%s'", pos),
@@ -118,99 +231,117 @@ func (mysqlFlavor) setReplicationPositionCommands(pos Position) []string {
 }
 
 // setReplicationPositionCommands is part of the Flavor interface.
-func (mysqlFlavor) changeReplicationSourceArg() string {
-	return "MASTER_AUTO_POSITION = 1"
+func (mysqlFlavor) setReplicationPositionCommands(pos replication.Position) []string {
+	return []string{
+		"RESET BINARY LOGS AND GTIDS", // We must clear gtid_executed before setting gtid_purged.
+		fmt.Sprintf("SET GLOBAL gtid_purged = '%s'", pos),
+	}
+}
+
+// primaryStatus is part of the Flavor interface.
+func (mysqlFlavor8) primaryStatus(c *Conn) (replication.PrimaryStatus, error) {
+	qr, err := c.ExecuteFetch("SHOW MASTER STATUS", 100, true /* wantfields */)
+	if err != nil {
+		return replication.PrimaryStatus{}, err
+	}
+	if len(qr.Rows) == 0 {
+		// The query returned no data. We don't know how this could happen.
+		return replication.PrimaryStatus{}, ErrNoPrimaryStatus
+	}
+
+	resultMap, err := resultToMap(qr)
+	if err != nil {
+		return replication.PrimaryStatus{}, err
+	}
+
+	return replication.ParseMysqlPrimaryStatus(resultMap)
+}
+
+// primaryStatus is part of the Flavor interface.
+func (mysqlFlavor) primaryStatus(c *Conn) (replication.PrimaryStatus, error) {
+	qr, err := c.ExecuteFetch("SHOW BINARY LOG STATUS", 100, true /* wantfields */)
+	if err != nil {
+		return replication.PrimaryStatus{}, err
+	}
+	if len(qr.Rows) == 0 {
+		// The query returned no data. We don't know how this could happen.
+		return replication.PrimaryStatus{}, ErrNoPrimaryStatus
+	}
+
+	resultMap, err := resultToMap(qr)
+	if err != nil {
+		return replication.PrimaryStatus{}, err
+	}
+
+	return replication.ParseMysqlPrimaryStatus(resultMap)
+}
+
+// replicationConfiguration is part of the Flavor interface.
+func (mysqlFlavor) replicationConfiguration(c *Conn) (*replicationdata.Configuration, error) {
+	qr, err := c.ExecuteFetch(readReplicationConnectionConfiguration, 100, true /* wantfields */)
+	if err != nil {
+		return nil, err
+	}
+	if len(qr.Rows) == 0 {
+		// The query returned no data. This is not a replica.
+		return nil, ErrNotReplica
+	}
+
+	resultMap, err := resultToMap(qr)
+	if err != nil {
+		return nil, err
+	}
+
+	heartbeatInterval, err := strconv.ParseFloat(resultMap["HEARTBEAT_INTERVAL"], 64)
+	if err != nil {
+		return nil, err
+	}
+
+	return &replicationdata.Configuration{
+		HeartbeatInterval: heartbeatInterval,
+	}, nil
+}
+
+// replicationNetTimeout is part of the Flavor interface.
+func (mysqlFlavor) replicationNetTimeout(c *Conn) (int32, error) {
+	qr, err := c.ExecuteFetch("select @@global.replica_net_timeout", 1, false)
+	if err != nil {
+		return 0, err
+	}
+	if len(qr.Rows) != 1 || len(qr.Rows[0]) != 1 {
+		return 0, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "unexpected result format for replica_net_timeout: %#v", qr)
+	}
+	return qr.Rows[0][0].ToInt32()
 }
 
 // status is part of the Flavor interface.
-func (mysqlFlavor) status(c *Conn) (ReplicationStatus, error) {
-	qr, err := c.ExecuteFetch("SHOW SLAVE STATUS", 100, true /* wantfields */)
+func (mysqlFlavor) status(c *Conn) (replication.ReplicationStatus, error) {
+	qr, err := c.ExecuteFetch("SHOW REPLICA STATUS", 100, true /* wantfields */)
 	if err != nil {
-		return ReplicationStatus{}, err
+		return replication.ReplicationStatus{}, err
 	}
 	if len(qr.Rows) == 0 {
 		// The query returned no data, meaning the server
 		// is not configured as a replica.
-		return ReplicationStatus{}, ErrNotReplica
+		return replication.ReplicationStatus{}, ErrNotReplica
 	}
 
 	resultMap, err := resultToMap(qr)
 	if err != nil {
-		return ReplicationStatus{}, err
+		return replication.ReplicationStatus{}, err
 	}
 
-	return parseMysqlReplicationStatus(resultMap)
+	return replication.ParseMysqlReplicationStatus(resultMap, true)
 }
 
-func parseMysqlReplicationStatus(resultMap map[string]string) (ReplicationStatus, error) {
-	status := parseReplicationStatus(resultMap)
-	uuidString := resultMap["Master_UUID"]
-	if uuidString != "" {
-		sid, err := ParseSID(uuidString)
-		if err != nil {
-			return ReplicationStatus{}, vterrors.Wrapf(err, "cannot decode SourceUUID")
-		}
-		status.SourceUUID = sid
-	}
-
-	var err error
-	status.Position.GTIDSet, err = parseMysql56GTIDSet(resultMap["Executed_Gtid_Set"])
-	if err != nil {
-		return ReplicationStatus{}, vterrors.Wrapf(err, "ReplicationStatus can't parse MySQL 5.6 GTID (Executed_Gtid_Set: %#v)", resultMap["Executed_Gtid_Set"])
-	}
-	relayLogGTIDSet, err := parseMysql56GTIDSet(resultMap["Retrieved_Gtid_Set"])
-	if err != nil {
-		return ReplicationStatus{}, vterrors.Wrapf(err, "ReplicationStatus can't parse MySQL 5.6 GTID (Retrieved_Gtid_Set: %#v)", resultMap["Retrieved_Gtid_Set"])
-	}
-	// We take the union of the executed and retrieved gtidset, because the retrieved gtidset only represents GTIDs since
-	// the relay log has been reset. To get the full Position, we need to take a union of executed GTIDSets, since these would
-	// have been in the relay log's GTIDSet in the past, prior to a reset.
-	status.RelayLogPosition.GTIDSet = status.Position.GTIDSet.Union(relayLogGTIDSet)
-
-	return status, nil
-}
-
-// primaryStatus is part of the Flavor interface.
-func (mysqlFlavor) primaryStatus(c *Conn) (PrimaryStatus, error) {
-	qr, err := c.ExecuteFetch("SHOW MASTER STATUS", 100, true /* wantfields */)
-	if err != nil {
-		return PrimaryStatus{}, err
-	}
-	if len(qr.Rows) == 0 {
-		// The query returned no data. We don't know how this could happen.
-		return PrimaryStatus{}, ErrNoPrimaryStatus
-	}
-
-	resultMap, err := resultToMap(qr)
-	if err != nil {
-		return PrimaryStatus{}, err
-	}
-
-	return parseMysqlPrimaryStatus(resultMap)
-}
-
-func parseMysqlPrimaryStatus(resultMap map[string]string) (PrimaryStatus, error) {
-	status := parsePrimaryStatus(resultMap)
-
-	var err error
-	status.Position.GTIDSet, err = parseMysql56GTIDSet(resultMap["Executed_Gtid_Set"])
-	if err != nil {
-		return PrimaryStatus{}, vterrors.Wrapf(err, "PrimaryStatus can't parse MySQL 5.6 GTID (Executed_Gtid_Set: %#v)", resultMap["Executed_Gtid_Set"])
-	}
-
-	return status, nil
-}
-
-// waitUntilPositionCommand is part of the Flavor interface.
-
-// waitUntilPositionCommand is part of the Flavor interface.
-func (mysqlFlavor) waitUntilPositionCommand(ctx context.Context, pos Position) (string, error) {
+// waitUntilPosition is part of the Flavor interface.
+func (mysqlFlavor) waitUntilPosition(ctx context.Context, c *Conn, pos replication.Position) error {
 	// A timeout of 0 means wait indefinitely.
 	timeoutSeconds := 0
 	if deadline, ok := ctx.Deadline(); ok {
 		timeout := time.Until(deadline)
 		if timeout <= 0 {
-			return "", vterrors.Errorf(vtrpc.Code_DEADLINE_EXCEEDED, "timed out waiting for position %v", pos)
+			return vterrors.Errorf(vtrpcpb.Code_DEADLINE_EXCEEDED, "timed out waiting for position %v", pos)
 		}
 
 		// Only whole numbers of seconds are supported.
@@ -221,7 +352,30 @@ func (mysqlFlavor) waitUntilPositionCommand(ctx context.Context, pos Position) (
 		}
 	}
 
-	return fmt.Sprintf("SELECT WAIT_UNTIL_SQL_THREAD_AFTER_GTIDS('%s', %v)", pos, timeoutSeconds), nil
+	query := fmt.Sprintf("SELECT WAIT_FOR_EXECUTED_GTID_SET('%s', %v)", pos, timeoutSeconds)
+	result, err := c.ExecuteFetch(query, 1, false)
+	if err != nil {
+		return err
+	}
+
+	// For WAIT_FOR_EXECUTED_GTID_SET(), the return value is the state of the query, where
+	// 0 represents success, and 1 represents timeout. Any other failures generate an error.
+	if len(result.Rows) != 1 || len(result.Rows[0]) != 1 {
+		return vterrors.Errorf(vtrpcpb.Code_INTERNAL, "invalid results: %#v", result)
+	}
+	val := result.Rows[0][0]
+	state, err := val.ToInt64()
+	if err != nil {
+		return vterrors.Errorf(vtrpcpb.Code_INTERNAL, "invalid result of %#v", val)
+	}
+	switch state {
+	case 0:
+		return nil
+	case 1:
+		return vterrors.Errorf(vtrpcpb.Code_DEADLINE_EXCEEDED, "timed out waiting for position %v", pos)
+	default:
+		return vterrors.Errorf(vtrpcpb.Code_INTERNAL, "invalid result of %d", state)
+	}
 }
 
 // readBinlogEvent is part of the Flavor interface.
@@ -232,7 +386,7 @@ func (mysqlFlavor) readBinlogEvent(c *Conn) (BinlogEvent, error) {
 	}
 	switch result[0] {
 	case EOFPacket:
-		return nil, NewSQLError(CRServerLost, SSUnknownSQLState, "%v", io.EOF)
+		return nil, sqlerror.NewSQLErrorf(sqlerror.CRServerLost, sqlerror.SSUnknownSQLState, "%v", io.EOF)
 	case ErrPacket:
 		return nil, ParseErrorPacket(result)
 	}
@@ -244,78 +398,122 @@ func (mysqlFlavor) readBinlogEvent(c *Conn) (BinlogEvent, error) {
 	return ev, nil
 }
 
-// enableBinlogPlaybackCommand is part of the Flavor interface.
-func (mysqlFlavor) enableBinlogPlaybackCommand() string {
-	return ""
+// baseShowTables is part of the Flavor interface.
+func (mysqlFlavor) baseShowTables() string {
+	return BaseShowTables
 }
 
-// disableBinlogPlaybackCommand is part of the Flavor interface.
-func (mysqlFlavor) disableBinlogPlaybackCommand() string {
-	return ""
-}
-
-// TablesWithSize56 is a query to select table along with size for mysql 5.6
-const TablesWithSize56 = `SELECT table_name, table_type, unix_timestamp(create_time), table_comment, SUM( data_length + index_length), SUM( data_length + index_length) 
-		FROM information_schema.tables WHERE table_schema = database() group by table_name`
-
-// TablesWithSize57 is a query to select table along with size for mysql 5.7.
-//
-// It's a little weird, because the JOIN predicate only works if the table and databases do not contain weird characters.
-// If the join does not return any data, we fall back to the same fields as used in the mysql 5.6 query.
-//
-// We join with a subquery that materializes the data from `information_schema.innodb_sys_tablespaces`
-// early for performance reasons. This effectively causes only a single read of `information_schema.innodb_sys_tablespaces`
-// per query.
-const TablesWithSize57 = `SELECT t.table_name,
-	t.table_type,
-	UNIX_TIMESTAMP(t.create_time),
-	t.table_comment,
-	IFNULL(SUM(i.file_size), SUM(t.data_length + t.index_length)),
-	IFNULL(SUM(i.allocated_size), SUM(t.data_length + t.index_length))
-FROM information_schema.tables t
-LEFT OUTER JOIN (
-	SELECT space, file_size, allocated_size, name
-	FROM information_schema.innodb_sys_tablespaces
-	WHERE name LIKE CONCAT(database(), '/%')
-	GROUP BY space, file_size, allocated_size, name
-) i ON i.name = CONCAT(t.table_schema, '/', t.table_name) or i.name LIKE CONCAT(t.table_schema, '/', t.table_name, '#p#%')
-WHERE t.table_schema = database()
-GROUP BY t.table_name, t.table_type, t.create_time, t.table_comment
+const BaseShowTables = `SELECT t.table_name,
+		t.table_type,
+		UNIX_TIMESTAMP(t.create_time),
+		t.table_comment
+	FROM information_schema.tables t
+	WHERE
+		t.table_schema = database()
 `
 
 // TablesWithSize80 is a query to select table along with size for mysql 8.0
-const TablesWithSize80 = `SELECT t.table_name, t.table_type, unix_timestamp(t.create_time), t.table_comment, sum(i.file_size), sum(i.allocated_size) 
-		FROM information_schema.tables t, information_schema.innodb_tablespaces i 
-		WHERE t.table_schema = database() and 
-		(i.name = concat(t.table_schema,'/',t.table_name) or i.name like concat(t.table_schema,'/',t.table_name, '#p#%')) 
-		group by t.table_name, t.table_type, t.create_time, t.table_comment, i.file_size`
-
-// baseShowTablesWithSizes is part of the Flavor interface.
-func (mysqlFlavor56) baseShowTablesWithSizes() string {
-	return TablesWithSize56
-}
-
-// supportsFastDropTable is part of the Flavor interface.
-func (mysqlFlavor56) supportsFastDropTable(c *Conn) (bool, error) {
-	return false, nil
-}
+//
+// Note the following:
+//   - We use a single query to fetch both partitioned and non-partitioned tables. This is because
+//     accessing `information_schema.innodb_tablespaces` is expensive on servers with many tablespaces,
+//     and every query that loads the table needs to perform full table scans on it. Doing a single
+//     table scan is more efficient than doing more than one.
+//   - We utilize `INFORMATION_SCHEMA`.`TABLES`.`CREATE_OPTIONS` column to do early pruning before the JOIN.
+//   - `TABLES`.`TABLE_NAME` has `utf8mb4_0900_ai_ci` collation.  `INNODB_TABLESPACES`.`NAME` has `utf8mb3_general_ci`.
+//     We normalize the collation to get better query performance (we force the casting at the time of our choosing)
+const TablesWithSize80 = `SELECT t.table_name,
+		t.table_type,
+		UNIX_TIMESTAMP(t.create_time),
+		t.table_comment,
+		SUM(i.file_size),
+		SUM(i.allocated_size)
+	FROM information_schema.tables t
+		LEFT JOIN information_schema.innodb_tablespaces i
+	ON i.name LIKE CONCAT(t.table_schema, '/', t.table_name, IF(t.create_options <=> 'partitioned', '#p#%', '')) COLLATE utf8mb3_general_ci
+	WHERE
+		t.table_schema = database()
+	GROUP BY
+		t.table_schema, t.table_name, t.table_type, t.create_time, t.table_comment
+`
 
 // baseShowTablesWithSizes is part of the Flavor interface.
 func (mysqlFlavor57) baseShowTablesWithSizes() string {
 	return TablesWithSize57
 }
 
-// supportsFastDropTable is part of the Flavor interface.
-func (mysqlFlavor57) supportsFastDropTable(c *Conn) (bool, error) {
-	return false, nil
+// supportsCapability is part of the Flavor interface.
+func (f mysqlFlavor) supportsCapability(capability capabilities.FlavorCapability) (bool, error) {
+	return capabilities.MySQLVersionHasCapability(f.serverVersion, capability)
 }
 
 // baseShowTablesWithSizes is part of the Flavor interface.
-func (mysqlFlavor80) baseShowTablesWithSizes() string {
+func (mysqlFlavor) baseShowTablesWithSizes() string {
 	return TablesWithSize80
 }
 
-// supportsFastDropTable is part of the Flavor interface.
-func (mysqlFlavor80) supportsFastDropTable(c *Conn) (bool, error) {
-	return c.ServerVersionAtLeast(8, 0, 23)
+func (mysqlFlavor) setReplicationSourceCommand(params *ConnParams, host string, port int32, heartbeatInterval float64, connectRetry int) string {
+	args := []string{
+		fmt.Sprintf("SOURCE_HOST = '%s'", host),
+		fmt.Sprintf("SOURCE_PORT = %d", port),
+		fmt.Sprintf("SOURCE_USER = '%s'", params.Uname),
+		fmt.Sprintf("SOURCE_PASSWORD = '%s'", params.Pass),
+		fmt.Sprintf("SOURCE_CONNECT_RETRY = %d", connectRetry),
+	}
+	if params.SslEnabled() {
+		args = append(args, "SOURCE_SSL = 1")
+	}
+	if params.SslCa != "" {
+		args = append(args, fmt.Sprintf("SOURCE_SSL_CA = '%s'", params.SslCa))
+	}
+	if params.SslCaPath != "" {
+		args = append(args, fmt.Sprintf("SOURCE_SSL_CAPATH = '%s'", params.SslCaPath))
+	}
+	if params.SslCert != "" {
+		args = append(args, fmt.Sprintf("SOURCE_SSL_CERT = '%s'", params.SslCert))
+	}
+	if params.SslKey != "" {
+		args = append(args, fmt.Sprintf("SOURCE_SSL_KEY = '%s'", params.SslKey))
+	}
+	if heartbeatInterval != 0 {
+		args = append(args, fmt.Sprintf("SOURCE_HEARTBEAT_PERIOD = %v", heartbeatInterval))
+	}
+	args = append(args, "SOURCE_AUTO_POSITION = 1")
+	return "CHANGE REPLICATION SOURCE TO\n  " + strings.Join(args, ",\n  ")
+}
+
+func (mysqlFlavor) catchupToGTIDCommands(params *ConnParams, replPos replication.Position) []string {
+	cmds := []string{
+		"STOP REPLICA FOR CHANNEL '' ",
+		"STOP REPLICA IO_THREAD FOR CHANNEL ''",
+	}
+
+	if params.SslCa != "" || params.SslCert != "" {
+		// We need to use TLS
+		cmd := fmt.Sprintf("CHANGE REPLICATION SOURCE TO SOURCE_HOST='%s', SOURCE_PORT=%d, SOURCE_USER='%s', SOURCE_PASSWORD='%s', SOURCE_AUTO_POSITION=1, SOURCE_SSL=1", params.Host, params.Port, params.Uname, params.Pass)
+		if params.SslCa != "" {
+			cmd += fmt.Sprintf(", SOURCE_SSL_CA='%s'", params.SslCa)
+		}
+		if params.SslCert != "" {
+			cmd += fmt.Sprintf(", SOURCE_SSL_CERT='%s'", params.SslCert)
+		}
+		if params.SslKey != "" {
+			cmd += fmt.Sprintf(", SOURCE_SSL_KEY='%s'", params.SslKey)
+		}
+		cmds = append(cmds, cmd+";")
+	} else {
+		// No TLS
+		cmds = append(cmds, fmt.Sprintf("CHANGE REPLICATION SOURCE TO SOURCE_HOST='%s', SOURCE_PORT=%d, SOURCE_USER='%s', SOURCE_PASSWORD='%s', SOURCE_AUTO_POSITION=1;", params.Host, params.Port, params.Uname, params.Pass))
+	}
+
+	if replPos.IsZero() { // when the there is no afterPos, that means need to replicate completely
+		cmds = append(cmds, "START REPLICA")
+	} else {
+		cmds = append(cmds, fmt.Sprintf("START REPLICA UNTIL SQL_BEFORE_GTIDS = '%s'", replPos.GTIDSet.Last()))
+	}
+	return cmds
+}
+
+func (mysqlFlavor) binlogReplicatedUpdates() string {
+	return "@@global.log_replica_updates"
 }

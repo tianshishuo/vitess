@@ -17,24 +17,24 @@ limitations under the License.
 package tabletserver
 
 import (
+	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"google.golang.org/protobuf/proto"
-
-	"vitess.io/vitess/go/mysql/fakesqldb"
-
-	"context"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 
-	"vitess.io/vitess/go/sync2"
+	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vtenv"
+
 	"vitess.io/vitess/go/vt/log"
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/schema"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
 )
 
@@ -67,14 +67,14 @@ func TestStateManagerStateByName(t *testing.T) {
 }
 
 func TestStateManagerServePrimary(t *testing.T) {
-	sm := newTestStateManager(t)
+	sm := newTestStateManager()
 	defer sm.StopService()
 	sm.EnterLameduck()
 	err := sm.SetServingType(topodatapb.TabletType_PRIMARY, testNow, StateServing, "")
 	require.NoError(t, err)
 
 	assert.Equal(t, false, sm.lameduck)
-	assert.Equal(t, testNow, sm.terTimestamp)
+	assert.Equal(t, testNow, sm.ptsTimestamp)
 
 	verifySubcomponent(t, 1, sm.watcher, testStateClosed)
 
@@ -98,7 +98,7 @@ func TestStateManagerServePrimary(t *testing.T) {
 }
 
 func TestStateManagerServeNonPrimary(t *testing.T) {
-	sm := newTestStateManager(t)
+	sm := newTestStateManager()
 	defer sm.StopService()
 	err := sm.SetServingType(topodatapb.TabletType_REPLICA, testNow, StateServing, "")
 	require.NoError(t, err)
@@ -123,7 +123,7 @@ func TestStateManagerServeNonPrimary(t *testing.T) {
 }
 
 func TestStateManagerUnservePrimary(t *testing.T) {
-	sm := newTestStateManager(t)
+	sm := newTestStateManager()
 	defer sm.StopService()
 	err := sm.SetServingType(topodatapb.TabletType_PRIMARY, testNow, StateNotServing, "")
 	require.NoError(t, err)
@@ -148,7 +148,7 @@ func TestStateManagerUnservePrimary(t *testing.T) {
 }
 
 func TestStateManagerUnserveNonPrimary(t *testing.T) {
-	sm := newTestStateManager(t)
+	sm := newTestStateManager()
 	defer sm.StopService()
 	err := sm.SetServingType(topodatapb.TabletType_RDONLY, testNow, StateNotServing, "")
 	require.NoError(t, err)
@@ -175,7 +175,7 @@ func TestStateManagerUnserveNonPrimary(t *testing.T) {
 }
 
 func TestStateManagerClose(t *testing.T) {
-	sm := newTestStateManager(t)
+	sm := newTestStateManager()
 	defer sm.StopService()
 	err := sm.SetServingType(topodatapb.TabletType_RDONLY, testNow, StateNotConnected, "")
 	require.NoError(t, err)
@@ -199,7 +199,7 @@ func TestStateManagerClose(t *testing.T) {
 }
 
 func TestStateManagerStopService(t *testing.T) {
-	sm := newTestStateManager(t)
+	sm := newTestStateManager()
 	defer sm.StopService()
 	err := sm.SetServingType(topodatapb.TabletType_REPLICA, testNow, StateServing, "")
 	require.NoError(t, err)
@@ -213,7 +213,7 @@ func TestStateManagerStopService(t *testing.T) {
 }
 
 func TestStateManagerGracePeriod(t *testing.T) {
-	sm := newTestStateManager(t)
+	sm := newTestStateManager()
 	defer sm.StopService()
 	sm.transitionGracePeriod = 10 * time.Millisecond
 
@@ -267,7 +267,7 @@ func (te *testWatcher) Close() {
 func TestStateManagerSetServingTypeRace(t *testing.T) {
 	// We don't call StopService because that in turn
 	// will call Close again on testWatcher.
-	sm := newTestStateManager(t)
+	sm := newTestStateManager()
 	te := &testWatcher{
 		t:  t,
 		sm: sm,
@@ -286,7 +286,7 @@ func TestStateManagerSetServingTypeRace(t *testing.T) {
 
 func TestStateManagerSetServingTypeNoChange(t *testing.T) {
 	log.Infof("starting")
-	sm := newTestStateManager(t)
+	sm := newTestStateManager()
 	defer sm.StopService()
 	err := sm.SetServingType(topodatapb.TabletType_REPLICA, testNow, StateServing, "")
 	require.NoError(t, err)
@@ -317,7 +317,7 @@ func TestStateManagerTransitionFailRetry(t *testing.T) {
 	defer func(saved time.Duration) { transitionRetryInterval = saved }(transitionRetryInterval)
 	transitionRetryInterval = 10 * time.Millisecond
 
-	sm := newTestStateManager(t)
+	sm := newTestStateManager()
 	defer sm.StopService()
 	sm.se.(*testSchemaEngine).failMySQL = true
 
@@ -330,9 +330,9 @@ func TestStateManagerTransitionFailRetry(t *testing.T) {
 	// Steal the lock and wait long enough for the retry
 	// to fail, and then release it. The retry will have
 	// to keep retrying.
-	sm.transitioning.Acquire()
+	sm.transitioning.Acquire(context.Background(), 1)
 	time.Sleep(30 * time.Millisecond)
-	sm.transitioning.Release()
+	sm.transitioning.Release(1)
 
 	for {
 		sm.mu.Lock()
@@ -349,7 +349,7 @@ func TestStateManagerTransitionFailRetry(t *testing.T) {
 }
 
 func TestStateManagerNotConnectedType(t *testing.T) {
-	sm := newTestStateManager(t)
+	sm := newTestStateManager()
 	defer sm.StopService()
 	sm.EnterLameduck()
 	err := sm.SetServingType(topodatapb.TabletType_RESTORE, testNow, StateNotServing, "")
@@ -379,9 +379,12 @@ func (te *delayedTxEngine) Close() {
 	time.Sleep(50 * time.Millisecond)
 }
 
+func (te *delayedTxEngine) RollbackPrepared() {
+}
+
 type killableConn struct {
 	id     int64
-	killed sync2.AtomicBool
+	killed atomic.Bool
 }
 
 func (k *killableConn) Current() string {
@@ -393,38 +396,44 @@ func (k *killableConn) ID() int64 {
 }
 
 func (k *killableConn) Kill(message string, elapsed time.Duration) error {
-	k.killed.Set(true)
+	k.killed.Store(true)
 	return nil
 }
 
+func (k *killableConn) SQLParser() *sqlparser.Parser {
+	return sqlparser.NewTestParser()
+}
+
 func TestStateManagerShutdownGracePeriod(t *testing.T) {
-	sm := newTestStateManager(t)
+	sm := newTestStateManager()
 	defer sm.StopService()
 
 	sm.te = &delayedTxEngine{}
 	kconn1 := &killableConn{id: 1}
-	sm.statelessql.Add(&QueryDetail{
+	err := sm.statelessql.Add(&QueryDetail{
 		conn:   kconn1,
 		connID: kconn1.id,
 	})
+	require.NoError(t, err)
 	kconn2 := &killableConn{id: 2}
-	sm.statefulql.Add(&QueryDetail{
+	err = sm.statefulql.Add(&QueryDetail{
 		conn:   kconn2,
 		connID: kconn2.id,
 	})
+	require.NoError(t, err)
 
 	// Transition to replica with no shutdown grace period should kill kconn2 but not kconn1.
-	err := sm.SetServingType(topodatapb.TabletType_PRIMARY, testNow, StateServing, "")
+	err = sm.SetServingType(topodatapb.TabletType_PRIMARY, testNow, StateServing, "")
 	require.NoError(t, err)
-	assert.False(t, kconn1.killed.Get())
-	assert.True(t, kconn2.killed.Get())
+	assert.False(t, kconn1.killed.Load())
+	assert.True(t, kconn2.killed.Load())
 
 	// Transition without grace period. No conns should be killed.
-	kconn2.killed.Set(false)
+	kconn2.killed.Store(false)
 	err = sm.SetServingType(topodatapb.TabletType_REPLICA, testNow, StateServing, "")
 	require.NoError(t, err)
-	assert.False(t, kconn1.killed.Get())
-	assert.False(t, kconn2.killed.Get())
+	assert.False(t, kconn1.killed.Load())
+	assert.False(t, kconn2.killed.Load())
 
 	// Transition to primary with a short shutdown grace period should kill both conns.
 	err = sm.SetServingType(topodatapb.TabletType_PRIMARY, testNow, StateServing, "")
@@ -432,41 +441,47 @@ func TestStateManagerShutdownGracePeriod(t *testing.T) {
 	sm.shutdownGracePeriod = 10 * time.Millisecond
 	err = sm.SetServingType(topodatapb.TabletType_REPLICA, testNow, StateServing, "")
 	require.NoError(t, err)
-	assert.True(t, kconn1.killed.Get())
-	assert.True(t, kconn2.killed.Get())
+	assert.True(t, kconn1.killed.Load())
+	assert.True(t, kconn2.killed.Load())
 
 	// Primary non-serving should also kill the conn.
 	err = sm.SetServingType(topodatapb.TabletType_PRIMARY, testNow, StateServing, "")
 	require.NoError(t, err)
 	sm.shutdownGracePeriod = 10 * time.Millisecond
-	kconn1.killed.Set(false)
-	kconn2.killed.Set(false)
+	kconn1.killed.Store(false)
+	kconn2.killed.Store(false)
 	err = sm.SetServingType(topodatapb.TabletType_PRIMARY, testNow, StateNotServing, "")
 	require.NoError(t, err)
-	assert.True(t, kconn1.killed.Get())
-	assert.True(t, kconn2.killed.Get())
+	assert.True(t, kconn1.killed.Load())
+	assert.True(t, kconn2.killed.Load())
 }
 
 func TestStateManagerCheckMySQL(t *testing.T) {
 	defer func(saved time.Duration) { transitionRetryInterval = saved }(transitionRetryInterval)
 	transitionRetryInterval = 10 * time.Millisecond
 
-	sm := newTestStateManager(t)
+	sm := newTestStateManager()
 	defer sm.StopService()
 
 	err := sm.SetServingType(topodatapb.TabletType_PRIMARY, testNow, StateServing, "")
 	require.NoError(t, err)
 
+	sm.te = &delayedTxEngine{}
 	sm.qe.(*testQueryEngine).failMySQL = true
-	order.Set(0)
-	sm.CheckMySQL()
+	order.Store(0)
+	sm.checkMySQL()
+	// We know checkMySQL will take atleast 50 milliseconds since txEngine.Close has a sleep in the test code
+	time.Sleep(10 * time.Millisecond)
+	assert.EqualValues(t, 1, sm.isCheckMySQLRunning())
+	// When we are in CheckMySQL state, we should not be accepting any new requests which aren't transactional
+	assert.False(t, sm.IsServing())
 
 	// Rechecking immediately should be a no-op:
-	sm.CheckMySQL()
+	sm.checkMySQL()
 
 	// Wait for closeAll to get under way.
 	for {
-		if order.Get() >= 1 {
+		if order.Load() >= 1 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -491,15 +506,31 @@ func TestStateManagerCheckMySQL(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
+	assert.True(t, sm.IsServing())
 	assert.Equal(t, topodatapb.TabletType_PRIMARY, sm.Target().TabletType)
 	assert.Equal(t, StateServing, sm.State())
+
+	// Wait for checkMySQL to finish.
+	timeout := time.After(2 * time.Second)
+	for {
+		select {
+		case <-timeout:
+			t.Fatalf("Timedout waiting for checkMySQL to finish")
+		default:
+			if sm.isCheckMySQLRunning() == 0 {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
 }
 
 func TestStateManagerValidations(t *testing.T) {
-	sm := newTestStateManager(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sm := newTestStateManager()
 	target := &querypb.Target{TabletType: topodatapb.TabletType_PRIMARY}
-	sm.target = proto.Clone(target).(*querypb.Target)
-
+	sm.target = target.CloneVT()
 	err := sm.StartRequest(ctx, target, false)
 	assert.Contains(t, err.Error(), "operation not allowed")
 
@@ -558,7 +589,9 @@ func TestStateManagerValidations(t *testing.T) {
 }
 
 func TestStateManagerWaitForRequests(t *testing.T) {
-	sm := newTestStateManager(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sm := newTestStateManager()
 	defer sm.StopService()
 	target := &querypb.Target{TabletType: topodatapb.TabletType_PRIMARY}
 	sm.target = target
@@ -598,7 +631,7 @@ func TestStateManagerWaitForRequests(t *testing.T) {
 }
 
 func TestStateManagerNotify(t *testing.T) {
-	sm := newTestStateManager(t)
+	sm := newTestStateManager()
 	defer sm.StopService()
 
 	blpFunc = testBlpFunc
@@ -632,12 +665,12 @@ func TestStateManagerNotify(t *testing.T) {
 		TabletAlias: &topodatapb.TabletAlias{},
 	}
 	sm.hcticks.Stop()
-	assert.Equal(t, wantshr, gotshr)
+	assert.Truef(t, proto.Equal(gotshr, wantshr), "got: %v, want: %v", gotshr, wantshr)
 	sm.StopService()
 }
 
 func TestRefreshReplHealthLocked(t *testing.T) {
-	sm := newTestStateManager(t)
+	sm := newTestStateManager()
 	defer sm.StopService()
 	rt := sm.rt.(*testReplTracker)
 
@@ -671,21 +704,45 @@ func TestRefreshReplHealthLocked(t *testing.T) {
 	assert.False(t, sm.replHealthy)
 }
 
-func verifySubcomponent(t *testing.T, order int64, component interface{}, state testState) {
+// TestPanicInWait tests that we don't panic when we wait for requests if more StartRequest calls come up after we start waiting.
+func TestPanicInWait(t *testing.T) {
+	sm := newTestStateManager()
+	sm.wantState = StateServing
+	sm.state = StateServing
+	sm.replHealthy = true
+	ctx := context.Background()
+	// Simulate an Execute RPC running
+	err := sm.StartRequest(ctx, sm.target, false)
+	require.NoError(t, err)
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		// Simulate the previous RPC finishing after some delay
+		sm.EndRequest()
+		// Simulate a COMMIT call arriving right afterwards
+		_ = sm.StartRequest(ctx, sm.target, true)
+	}()
+
+	// Simulate going to a not serving state and calling unserveCommon that waits on requests.
+	sm.wantState = StateNotServing
+	sm.rw.WaitToBeEmpty()
+}
+
+func verifySubcomponent(t *testing.T, order int64, component any, state testState) {
 	tos := component.(orderState)
 	assert.Equal(t, order, tos.Order())
 	assert.Equal(t, state, tos.State())
 }
 
-func newTestStateManager(t *testing.T) *stateManager {
-	order.Set(0)
-	config := tabletenv.NewDefaultConfig()
-	env := tabletenv.NewEnv(config, "StateManagerTest")
+func newTestStateManager() *stateManager {
+	order.Store(0)
+	cfg := tabletenv.NewDefaultConfig()
+	parser := sqlparser.NewTestParser()
+	env := tabletenv.NewEnv(vtenv.NewTestEnv(), cfg, "StateManagerTest")
 	sm := &stateManager{
-		statelessql: NewQueryList("stateless"),
-		statefulql:  NewQueryList("stateful"),
-		olapql:      NewQueryList("olap"),
-		hs:          newHealthStreamer(env, &topodatapb.TabletAlias{}),
+		statelessql: NewQueryList("stateless", parser),
+		statefulql:  NewQueryList("stateful", parser),
+		olapql:      NewQueryList("olap", parser),
+		hs:          newHealthStreamer(env, &topodatapb.TabletAlias{}, schema.NewEngine(env)),
 		se:          &testSchemaEngine{},
 		rt:          &testReplTracker{lag: 1 * time.Second},
 		vstreamer:   &testSubcomponent{},
@@ -698,22 +755,23 @@ func newTestStateManager(t *testing.T) *stateManager {
 		ddle:        &testOnlineDDLExecutor{},
 		throttler:   &testLagThrottler{},
 		tableGC:     &testTableGC{},
+		rw:          newRequestsWaiter(),
 	}
 	sm.Init(env, &querypb.Target{})
-	sm.hs.InitDBConfig(&querypb.Target{}, fakesqldb.New(t).ConnParams())
+	sm.hs.InitDBConfig(&querypb.Target{})
 	log.Infof("returning sm: %p", sm)
 	return sm
 }
 
 func (sm *stateManager) isTransitioning() bool {
-	if sm.transitioning.TryAcquire() {
-		sm.transitioning.Release()
+	if sm.transitioning.TryAcquire(1) {
+		sm.transitioning.Release(1)
 		return false
 	}
 	return true
 }
 
-var order sync2.AtomicInt64
+var order atomic.Int64
 
 type testState int
 
@@ -768,6 +826,10 @@ func (te *testSchemaEngine) Open() error {
 
 func (te *testSchemaEngine) MakeNonPrimary() {
 	te.nonPrimary = true
+}
+
+func (te *testSchemaEngine) MakePrimary(serving bool) {
+	te.nonPrimary = false
 }
 
 func (te *testSchemaEngine) Close() {
@@ -843,6 +905,8 @@ func (te *testTxEngine) Close() {
 	te.order = order.Add(1)
 	te.state = testStateClosed
 }
+
+func (te *testTxEngine) RollbackPrepared() {}
 
 type testSubcomponent struct {
 	testOrderState

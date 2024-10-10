@@ -20,28 +20,6 @@ type failover func(buf *Buffer, tablet *topodatapb.Tablet, keyspace, shard strin
 func testAllImplementations(t *testing.T, runTest func(t *testing.T, fail failover)) {
 	t.Helper()
 
-	t.Run("HealthCheck", func(t *testing.T) {
-		t.Helper()
-		runTest(t, func(buf *Buffer, tablet *topodatapb.Tablet, keyspace, shard string, now time.Time) {
-			buf.ProcessPrimaryHealth(&discovery.TabletHealth{
-				Tablet:               tablet,
-				Target:               &query.Target{Keyspace: keyspace, Shard: shard, TabletType: topodatapb.TabletType_PRIMARY},
-				PrimaryTermStartTime: now.Unix(),
-			})
-		})
-	})
-
-	t.Run("LegacyHealthCheck", func(t *testing.T) {
-		t.Helper()
-		runTest(t, func(buf *Buffer, tablet *topodatapb.Tablet, keyspace, shard string, now time.Time) {
-			buf.StatsUpdate(&discovery.LegacyTabletStats{
-				Tablet:                              tablet,
-				Target:                              &query.Target{Keyspace: keyspace, Shard: shard, TabletType: topodatapb.TabletType_PRIMARY},
-				TabletExternallyReparentedTimestamp: now.Unix(),
-			})
-		})
-	})
-
 	t.Run("KeyspaceEvent", func(t *testing.T) {
 		t.Helper()
 		runTest(t, func(buf *Buffer, tablet *topodatapb.Tablet, keyspace, shard string, now time.Time) {
@@ -132,7 +110,7 @@ func waitForState(b *Buffer, want bufferState) error {
 func waitForPoolSlots(b *Buffer, want int) error {
 	start := time.Now()
 	for {
-		got := b.bufferSizeSema.Size()
+		got := b.bufferSize
 		if got == want {
 			return nil
 		}

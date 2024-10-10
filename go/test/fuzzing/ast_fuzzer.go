@@ -36,11 +36,11 @@ func FuzzEqualsSQLNode(data []byte) int {
 	if err != nil {
 		return 0
 	}
-	inA, err := sqlparser.Parse(query1)
+	inA, err := sqlparser.NewTestParser().Parse(query1)
 	if err != nil {
 		return 0
 	}
-	inB, err := sqlparser.Parse(query2)
+	inB, err := sqlparser.NewTestParser().Parse(query2)
 	if err != nil {
 		return 0
 	}
@@ -61,7 +61,7 @@ func FuzzEqualsSQLNode(data []byte) int {
 	}
 
 	// Target 2:
-	newSQLNode := sqlparser.CloneSQLNode(inA)
+	newSQLNode := sqlparser.Clone(inA)
 	if !sqlparser.EqualsSQLNode(inA, newSQLNode) {
 		panic("These two nodes should be identical")
 	}

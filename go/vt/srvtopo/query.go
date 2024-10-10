@@ -39,13 +39,12 @@ type queryEntry struct {
 
 	insertionTime time.Time
 	lastQueryTime time.Time
-	value         interface{}
+	value         any
 	lastError     error
-	lastErrorCtx  context.Context
 }
 
 type resilientQuery struct {
-	query func(ctx context.Context, entry *queryEntry) (interface{}, error)
+	query func(ctx context.Context, entry *queryEntry) (any, error)
 
 	counts               *stats.CountersWithSingleLabel
 	cacheRefreshInterval time.Duration
@@ -55,7 +54,7 @@ type resilientQuery struct {
 	entries map[string]*queryEntry
 }
 
-func (q *resilientQuery) getCurrentValue(ctx context.Context, wkey fmt.Stringer, staleOK bool) (interface{}, error) {
+func (q *resilientQuery) getCurrentValue(ctx context.Context, wkey fmt.Stringer, staleOK bool) (any, error) {
 	q.counts.Add(queryCategory, 1)
 
 	// find the entry in the cache, add it if not there
@@ -87,7 +86,12 @@ func (q *resilientQuery) getCurrentValue(ctx context.Context, wkey fmt.Stringer,
 
 	// If it is not time to check again, then return either the cached
 	// value or the cached error but don't ask topo again.
-	if !shouldRefresh {
+	// Here we have to be careful with the part where we haven't gotten even the first result.
+	// In that case, a refresh is already in progress, but the cache is empty! So, we can't use the cache.
+	// We have to wait for the query's results.
+	// We know the query has run at least once if the insertionTime is non-zero, or if we have an error.
+	queryRanAtLeastOnce := !entry.insertionTime.IsZero() || entry.lastError != nil
+	if !shouldRefresh && queryRanAtLeastOnce {
 		if cacheValid {
 			return entry.value, nil
 		}
@@ -109,7 +113,7 @@ func (q *resilientQuery) getCurrentValue(ctx context.Context, wkey fmt.Stringer,
 				}
 			}()
 
-			newCtx, cancel := context.WithTimeout(ctx, *srvTopoTimeout)
+			newCtx, cancel := context.WithTimeout(ctx, srvTopoTimeout)
 			defer cancel()
 
 			result, err := q.query(newCtx, entry)
@@ -144,7 +148,6 @@ func (q *resilientQuery) getCurrentValue(ctx context.Context, wkey fmt.Stringer,
 			}
 
 			entry.lastError = err
-			entry.lastErrorCtx = newCtx
 		}()
 	}
 

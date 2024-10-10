@@ -17,6 +17,7 @@ limitations under the License.
 package timer
 
 import (
+	"context"
 	"sync/atomic"
 	"time"
 )
@@ -28,53 +29,75 @@ type SuspendableTicker struct {
 	// C is user facing
 	C chan time.Time
 
-	suspended int64
+	suspended atomic.Bool
+	cancel    context.CancelFunc
 }
 
 // NewSuspendableTicker creates a new suspendable ticker, indicating whether the ticker should start
 // suspendable or running
 func NewSuspendableTicker(d time.Duration, initiallySuspended bool) *SuspendableTicker {
+	ctx, cancel := context.WithCancel(context.Background())
 	s := &SuspendableTicker{
 		ticker: time.NewTicker(d),
 		C:      make(chan time.Time),
+		cancel: cancel,
 	}
 	if initiallySuspended {
-		s.suspended = 1
+		s.suspended.Store(true)
 	}
-	go s.loop()
+	go s.loop(ctx)
 	return s
 }
 
 // Suspend stops sending time events on the channel C
 // time events sent during suspended time are lost
 func (s *SuspendableTicker) Suspend() {
-	atomic.StoreInt64(&s.suspended, 1)
+	s.suspended.Store(true)
 }
 
 // Resume re-enables time events on channel C
 func (s *SuspendableTicker) Resume() {
-	atomic.StoreInt64(&s.suspended, 0)
+	s.suspended.Store(false)
 }
 
 // Stop completely stops the timer, like time.Timer
 func (s *SuspendableTicker) Stop() {
-	s.ticker.Stop()
+	s.cancel()
 }
 
 // TickNow generates a tick at this point in time. It may block
 // if nothing consumes the tick.
 func (s *SuspendableTicker) TickNow() {
-	if atomic.LoadInt64(&s.suspended) == 0 {
+	if !s.suspended.Load() {
 		// not suspended
 		s.C <- time.Now()
 	}
 }
 
-func (s *SuspendableTicker) loop() {
-	for t := range s.ticker.C {
-		if atomic.LoadInt64(&s.suspended) == 0 {
-			// not suspended
-			s.C <- t
+// TickAfter generates a tick after given duration has passed.
+// It runs asynchronously and returns immediately.
+func (s *SuspendableTicker) TickAfter(d time.Duration) {
+	time.AfterFunc(d, func() {
+		s.TickNow()
+	})
+}
+
+func (s *SuspendableTicker) loop(ctx context.Context) {
+	defer s.ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case t := <-s.ticker.C:
+			if !s.suspended.Load() {
+				// not suspended
+				select {
+				case <-ctx.Done():
+					return
+				case s.C <- t:
+				}
+			}
 		}
 	}
 }

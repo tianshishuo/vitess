@@ -17,13 +17,13 @@ limitations under the License.
 package tabletconntest
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"testing"
 
 	"vitess.io/vitess/go/vt/vttablet/queryservice"
-
-	"context"
 
 	"google.golang.org/protobuf/proto"
 
@@ -43,10 +43,11 @@ type FakeQueryService struct {
 	TestingGateway bool
 
 	// these fields are used to simulate and synchronize on errors
-	HasError      bool
-	HasBeginError bool
-	TabletError   error
-	ErrorWait     chan struct{}
+	HasError        bool
+	HasBeginError   bool
+	HasReserveError bool
+	TabletError     error
+	ErrorWait       chan struct{}
 
 	// these fields are used to simulate and synchronize on panics
 	Panics                   bool
@@ -140,9 +141,9 @@ func (f *FakeQueryService) checkTargetCallerID(ctx context.Context, name string,
 const beginTransactionID int64 = 9990
 
 // Begin is part of the queryservice.QueryService interface
-func (f *FakeQueryService) Begin(ctx context.Context, target *querypb.Target, options *querypb.ExecuteOptions) (int64, *topodatapb.TabletAlias, error) {
+func (f *FakeQueryService) Begin(ctx context.Context, target *querypb.Target, options *querypb.ExecuteOptions) (queryservice.TransactionState, error) {
 	if f.HasBeginError {
-		return 0, nil, f.TabletError
+		return queryservice.TransactionState{}, f.TabletError
 	}
 	if f.Panics {
 		panic(fmt.Errorf("test-triggered panic"))
@@ -151,7 +152,7 @@ func (f *FakeQueryService) Begin(ctx context.Context, target *querypb.Target, op
 	if !proto.Equal(options, TestExecuteOptions) {
 		f.t.Errorf("invalid Execute.ExecuteOptions: got %v expected %v", options, TestExecuteOptions)
 	}
-	return beginTransactionID, TestAlias, nil
+	return queryservice.TransactionState{TransactionID: beginTransactionID, TabletAlias: TestAlias}, nil
 }
 
 // commitTransactionID is a test transaction id for Commit.
@@ -172,7 +173,7 @@ func (f *FakeQueryService) Commit(ctx context.Context, target *querypb.Target, t
 	return 0, nil
 }
 
-// rollbackTransactionID is a test transactin id for Rollback.
+// rollbackTransactionID is a test transaction id for Rollback.
 const rollbackTransactionID int64 = 999044
 
 // Rollback is part of the queryservice.QueryService interface
@@ -356,6 +357,18 @@ func (f *FakeQueryService) ReadTransaction(ctx context.Context, target *querypb.
 		f.t.Errorf("ReadTransaction: invalid dtid: got %s expected %s", dtid, Dtid)
 	}
 	return Metadata, nil
+}
+
+// UnresolvedTransactions is part of the queryservice.QueryService interface
+func (f *FakeQueryService) UnresolvedTransactions(ctx context.Context, target *querypb.Target, abandonAgeSeconds int64) ([]*querypb.TransactionMetadata, error) {
+	if f.HasError {
+		return nil, f.TabletError
+	}
+	if f.Panics {
+		panic(fmt.Errorf("test-triggered panic"))
+	}
+	f.checkTargetCallerID(ctx, "UnresolvedTransactions", target)
+	return []*querypb.TransactionMetadata{Metadata}, nil
 }
 
 // ExecuteQuery is a fake test query.
@@ -554,20 +567,33 @@ var ExecuteBatchQueryResultList = []sqltypes.Result{
 }
 
 // BeginExecute combines Begin and Execute.
-func (f *FakeQueryService) BeginExecute(ctx context.Context, target *querypb.Target, _ []string, sql string, bindVariables map[string]*querypb.BindVariable, reservedID int64, options *querypb.ExecuteOptions) (*sqltypes.Result, int64, *topodatapb.TabletAlias, error) {
-	transactionID, _, err := f.Begin(ctx, target, options)
+func (f *FakeQueryService) BeginExecute(ctx context.Context, target *querypb.Target, _ []string, sql string, bindVariables map[string]*querypb.BindVariable, reservedID int64, options *querypb.ExecuteOptions) (queryservice.TransactionState, *sqltypes.Result, error) {
+	state, err := f.Begin(ctx, target, options)
 	if err != nil {
-		return nil, 0, nil, err
+		return state, nil, err
 	}
 
 	// TODO(deepthi): what alias should we actually return here?
-	result, err := f.Execute(ctx, target, sql, bindVariables, transactionID, reservedID, options)
-	return result, transactionID, nil, err
+	result, err := f.Execute(ctx, target, sql, bindVariables, state.TransactionID, reservedID, options)
+	return state, result, err
 }
 
 // BeginStreamExecute combines Begin and StreamExecute.
-func (f *FakeQueryService) BeginStreamExecute(ctx context.Context, target *querypb.Target, preQueries []string, sql string, bindVariables map[string]*querypb.BindVariable, reservedID int64, options *querypb.ExecuteOptions, callback func(*sqltypes.Result) error) (int64, *topodatapb.TabletAlias, error) {
-	panic("FakeQueryService does not implement BeginStreamExecute")
+func (f *FakeQueryService) BeginStreamExecute(ctx context.Context, target *querypb.Target, preQueries []string, sql string, bindVariables map[string]*querypb.BindVariable, reservedID int64, options *querypb.ExecuteOptions, callback func(*sqltypes.Result) error) (queryservice.TransactionState, error) {
+	state, err := f.Begin(ctx, target, options)
+	if err != nil {
+		return state, err
+	}
+
+	for _, preQuery := range preQueries {
+		_, err := f.Execute(ctx, target, preQuery, nil, state.TransactionID, reservedID, options)
+		if err != nil {
+			return state, err
+		}
+	}
+
+	err = f.StreamExecute(ctx, target, sql, bindVariables, state.TransactionID, reservedID, options, callback)
+	return state, err
 }
 
 var (
@@ -642,7 +668,7 @@ var TestStreamHealthStreamHealthResponse = &querypb.StreamHealthResponse{
 	},
 	Serving: true,
 
-	TabletExternallyReparentedTimestamp: 1234589,
+	PrimaryTermStartTimestamp: 1234589,
 
 	RealtimeStats: &querypb.RealtimeStats{
 		CpuUsage:                      1.0,
@@ -668,19 +694,24 @@ func (f *FakeQueryService) StreamHealth(ctx context.Context, callback func(*quer
 	if shr == nil {
 		shr = TestStreamHealthStreamHealthResponse
 	}
-	if err := callback(shr); err != nil {
+	if err := callback(shr); err != nil && err != io.EOF {
 		f.t.Logf("StreamHealth callback failed: %v", err)
 	}
 	return nil
 }
 
 // VStream is part of the queryservice.QueryService interface
-func (f *FakeQueryService) VStream(ctx context.Context, target *querypb.Target, position string, tablePKs []*binlogdatapb.TableLastPK, filter *binlogdatapb.Filter, send func([]*binlogdatapb.VEvent) error) error {
+func (f *FakeQueryService) VStream(ctx context.Context, request *binlogdatapb.VStreamRequest, send func([]*binlogdatapb.VEvent) error) error {
 	panic("not implemented")
 }
 
 // VStreamRows is part of the QueryService interface.
-func (f *FakeQueryService) VStreamRows(ctx context.Context, target *querypb.Target, query string, lastpk *querypb.QueryResult, send func(*binlogdatapb.VStreamRowsResponse) error) error {
+func (f *FakeQueryService) VStreamRows(ctx context.Context, request *binlogdatapb.VStreamRowsRequest, send func(*binlogdatapb.VStreamRowsResponse) error) error {
+	panic("not implemented")
+}
+
+// VStreamTables is part of the QueryService interface.
+func (f *FakeQueryService) VStreamTables(ctx context.Context, request *binlogdatapb.VStreamTablesRequest, send func(*binlogdatapb.VStreamTablesResponse) error) error {
 	panic("not implemented")
 }
 
@@ -690,32 +721,59 @@ func (f *FakeQueryService) VStreamResults(ctx context.Context, target *querypb.T
 }
 
 // QueryServiceByAlias satisfies the Gateway interface
-func (f *FakeQueryService) QueryServiceByAlias(_ *topodatapb.TabletAlias, _ *querypb.Target) (queryservice.QueryService, error) {
+func (f *FakeQueryService) QueryServiceByAlias(_ context.Context, _ *topodatapb.TabletAlias, _ *querypb.Target) (queryservice.QueryService, error) {
+	panic("not implemented")
+}
+
+// GetServingKeyspaces returns list of serving keyspaces.
+func (f *FakeQueryService) GetServingKeyspaces() []string {
 	panic("not implemented")
 }
 
 // ReserveBeginExecute satisfies the Gateway interface
-func (f *FakeQueryService) ReserveBeginExecute(ctx context.Context, target *querypb.Target, preQueries []string, postBeginQueries []string, sql string, bindVariables map[string]*querypb.BindVariable, options *querypb.ExecuteOptions) (*sqltypes.Result, int64, int64, *topodatapb.TabletAlias, error) {
+func (f *FakeQueryService) ReserveBeginExecute(ctx context.Context, target *querypb.Target, preQueries []string, postBeginQueries []string, sql string, bindVariables map[string]*querypb.BindVariable, options *querypb.ExecuteOptions) (queryservice.ReservedTransactionState, *sqltypes.Result, error) {
 	panic("implement me")
 }
 
 // ReserveBeginStreamExecute satisfies the Gateway interface
-func (f *FakeQueryService) ReserveBeginStreamExecute(ctx context.Context, target *querypb.Target, preQueries []string, postBeginQueries []string, sql string, bindVariables map[string]*querypb.BindVariable, options *querypb.ExecuteOptions, callback func(*sqltypes.Result) error) (int64, int64, *topodatapb.TabletAlias, error) {
+func (f *FakeQueryService) ReserveBeginStreamExecute(ctx context.Context, target *querypb.Target, preQueries []string, postBeginQueries []string, sql string, bindVariables map[string]*querypb.BindVariable, options *querypb.ExecuteOptions, callback func(*sqltypes.Result) error) (queryservice.ReservedTransactionState, error) {
 	panic("implement me")
 }
 
 // ReserveExecute implements the QueryService interface
-func (f *FakeQueryService) ReserveExecute(ctx context.Context, target *querypb.Target, preQueries []string, sql string, bindVariables map[string]*querypb.BindVariable, transactionID int64, options *querypb.ExecuteOptions) (*sqltypes.Result, int64, *topodatapb.TabletAlias, error) {
+func (f *FakeQueryService) ReserveExecute(ctx context.Context, target *querypb.Target, preQueries []string, sql string, bindVariables map[string]*querypb.BindVariable, transactionID int64, options *querypb.ExecuteOptions) (queryservice.ReservedState, *sqltypes.Result, error) {
 	panic("implement me")
 }
 
 // ReserveStreamExecute satisfies the Gateway interface
-func (f *FakeQueryService) ReserveStreamExecute(ctx context.Context, target *querypb.Target, preQueries []string, sql string, bindVariables map[string]*querypb.BindVariable, transactionID int64, options *querypb.ExecuteOptions, callback func(*sqltypes.Result) error) (int64, *topodatapb.TabletAlias, error) {
-	panic("implement me")
+func (f *FakeQueryService) ReserveStreamExecute(ctx context.Context, target *querypb.Target, preQueries []string, sql string, bindVariables map[string]*querypb.BindVariable, transactionID int64, options *querypb.ExecuteOptions, callback func(*sqltypes.Result) error) (queryservice.ReservedState, error) {
+	state, err := f.reserve(transactionID)
+	if err != nil {
+		return state, err
+	}
+	err = f.StreamExecute(ctx, target, sql, bindVariables, transactionID, state.ReservedID, options, callback)
+	return state, err
+}
+
+func (f *FakeQueryService) reserve(transactionID int64) (queryservice.ReservedState, error) {
+	reserveID := transactionID
+	if reserveID == 0 {
+		reserveID = beginTransactionID
+	}
+	if f.HasReserveError {
+		return queryservice.ReservedState{}, f.TabletError
+	}
+	state := queryservice.ReservedState{ReservedID: reserveID, TabletAlias: TestAlias}
+	return state, nil
 }
 
 // Release implements the QueryService interface
 func (f *FakeQueryService) Release(ctx context.Context, target *querypb.Target, transactionID, reservedID int64) error {
+	panic("implement me")
+}
+
+// GetSchema implements the QueryService interface
+func (f *FakeQueryService) GetSchema(ctx context.Context, target *querypb.Target, tableType querypb.SchemaTableType, tableNames []string, callback func(schemaRes *querypb.GetSchemaResponse) error) error {
 	panic("implement me")
 }
 

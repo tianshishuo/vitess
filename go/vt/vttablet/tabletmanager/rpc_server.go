@@ -38,24 +38,16 @@ import (
 // lock is used at the beginning of an RPC call, to acquire the
 // action semaphore. It returns ctx.Err() if the context expires.
 func (tm *TabletManager) lock(ctx context.Context) error {
-	if tm.actionSema.AcquireContext(ctx) {
-		return nil
-	}
-	return ctx.Err()
-}
-
-// tryLock will return immediately, true on success and false on failure.
-func (tm *TabletManager) tryLock() bool {
-	return tm.actionSema.TryAcquire()
+	return tm.actionSema.Acquire(ctx, 1)
 }
 
 // unlock is the symmetrical action to lock.
 func (tm *TabletManager) unlock() {
-	tm.actionSema.Release()
+	tm.actionSema.Release(1)
 }
 
 // HandleRPCPanic is part of the RPCTM interface.
-func (tm *TabletManager) HandleRPCPanic(ctx context.Context, name string, args, reply interface{}, verbose bool, err *error) {
+func (tm *TabletManager) HandleRPCPanic(ctx context.Context, name string, args, reply any, verbose bool, err *error) {
 	// panic handling
 	if x := recover(); x != nil {
 		log.Errorf("TabletManager.%v(%v) on %v panic: %v\n%s", name, args, topoproto.TabletAliasString(tm.tabletAlias), x, tb.Stack(4))
@@ -78,14 +70,13 @@ func (tm *TabletManager) HandleRPCPanic(ctx context.Context, name string, args, 
 	if *err != nil {
 		// error case
 		log.Warningf("TabletManager.%v(%v)(on %v from %v) error: %v", name, args, topoproto.TabletAliasString(tm.tabletAlias), from, (*err).Error())
-		*err = vterrors.Wrapf(*err, "TabletManager.%v on %v error: %v", name, topoproto.TabletAliasString(tm.tabletAlias), (*err).Error())
+		*err = vterrors.Wrapf(*err, "TabletManager.%v on %v", name, topoproto.TabletAliasString(tm.tabletAlias))
 	} else {
 		// success case
 		log.Infof("TabletManager.%v(%v)(on %v from %v): %#v", name, args, topoproto.TabletAliasString(tm.tabletAlias), from, reply)
 	}
 }
 
-//
 // RegisterTabletManager is used to delay registration of RPC servers until we have all the objects.
 type RegisterTabletManager func(*TabletManager)
 

@@ -17,6 +17,7 @@ limitations under the License.
 package engine
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -43,22 +44,23 @@ func TestSubqueryExecute(t *testing.T) {
 	}
 
 	sq := &SimpleProjection{
-		Cols:  []int{0, 2},
-		Input: prim,
+		Cols:     []int{0, 2},
+		ColNames: []string{"", ""},
+		Input:    prim,
 	}
 
 	bv := map[string]*querypb.BindVariable{
 		"a": sqltypes.Int64BindVariable(1),
 	}
 
-	r, err := sq.TryExecute(&noopVCursor{}, bv, true)
+	r, err := sq.TryExecute(context.Background(), &noopVCursor{}, bv, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	prim.ExpectLog(t, []string{
 		`Execute a: type:INT64 value:"1" true`,
 	})
-	expectResult(t, "sq.Execute", r, sqltypes.MakeTestResult(
+	expectResult(t, r, sqltypes.MakeTestResult(
 		sqltypes.MakeTestFields(
 			"col1|col3",
 			"int64|varchar",
@@ -72,7 +74,7 @@ func TestSubqueryExecute(t *testing.T) {
 	sq.Input = &fakePrimitive{
 		sendErr: errors.New("err"),
 	}
-	_, err = sq.TryExecute(&noopVCursor{}, bv, true)
+	_, err = sq.TryExecute(context.Background(), &noopVCursor{}, bv, true)
 	require.EqualError(t, err, `err`)
 }
 
@@ -92,8 +94,9 @@ func TestSubqueryStreamExecute(t *testing.T) {
 	}
 
 	sq := &SimpleProjection{
-		Cols:  []int{0, 2},
-		Input: prim,
+		Cols:     []int{0, 2},
+		ColNames: []string{"", ""},
+		Input:    prim,
 	}
 
 	bv := map[string]*querypb.BindVariable{
@@ -107,7 +110,7 @@ func TestSubqueryStreamExecute(t *testing.T) {
 	prim.ExpectLog(t, []string{
 		`StreamExecute a: type:INT64 value:"1" true`,
 	})
-	expectResult(t, "sq.Execute", r, sqltypes.MakeTestResult(
+	expectResult(t, r, sqltypes.MakeTestResult(
 		sqltypes.MakeTestFields(
 			"col1|col3",
 			"int64|varchar",
@@ -141,15 +144,16 @@ func TestSubqueryGetFields(t *testing.T) {
 	}
 
 	sq := &SimpleProjection{
-		Cols:  []int{0, 2},
-		Input: prim,
+		Cols:     []int{0, 2},
+		ColNames: []string{"", ""},
+		Input:    prim,
 	}
 
 	bv := map[string]*querypb.BindVariable{
 		"a": sqltypes.Int64BindVariable(1),
 	}
 
-	r, err := sq.GetFields(nil, bv)
+	r, err := sq.GetFields(context.Background(), nil, bv)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +161,7 @@ func TestSubqueryGetFields(t *testing.T) {
 		`GetFields a: type:INT64 value:"1"`,
 		`Execute a: type:INT64 value:"1" true`,
 	})
-	expectResult(t, "sq.Execute", r, sqltypes.MakeTestResult(
+	expectResult(t, r, sqltypes.MakeTestResult(
 		sqltypes.MakeTestFields(
 			"col1|col3",
 			"int64|varchar",
@@ -168,6 +172,6 @@ func TestSubqueryGetFields(t *testing.T) {
 	sq.Input = &fakePrimitive{
 		sendErr: errors.New("err"),
 	}
-	_, err = sq.GetFields(nil, bv)
+	_, err = sq.GetFields(context.Background(), nil, bv)
 	require.EqualError(t, err, `err`)
 }

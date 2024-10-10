@@ -17,12 +17,14 @@ limitations under the License.
 package throttler
 
 import (
-	"fmt"
-	"html/template"
 	"net/http"
+	"slices"
 	"strings"
 
+	"github.com/google/safehtml/template"
+
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/servenv"
 )
 
 const listHTML = `<!DOCTYPE html>
@@ -49,7 +51,7 @@ var (
 )
 
 func init() {
-	http.HandleFunc("/throttlerz/", func(w http.ResponseWriter, r *http.Request) {
+	servenv.HTTPHandleFunc("/throttlerz/", func(w http.ResponseWriter, r *http.Request) {
 		throttlerzHandler(w, r, GlobalManager)
 	})
 }
@@ -59,14 +61,18 @@ func throttlerzHandler(w http.ResponseWriter, r *http.Request, m *managerImpl) {
 	parts := strings.SplitN(r.URL.Path, "/", 3)
 
 	if len(parts) != 3 {
-		errMsg := fmt.Sprintf("invalid /throttlerz path: %q expected paths: /throttlerz or /throttlerz/<throttler name>", r.URL.Path)
-		http.Error(w, errMsg, http.StatusInternalServerError)
+		http.Error(w, "invalid /throttlerz path", http.StatusNotFound)
 		return
 	}
 
 	name := parts[2]
 	if name == "" {
 		listThrottlers(w, m)
+		return
+	}
+
+	if !slices.Contains(m.Throttlers(), name) {
+		http.Error(w, "throttler not found", http.StatusNotFound)
 		return
 	}
 
@@ -77,7 +83,7 @@ func listThrottlers(w http.ResponseWriter, m *managerImpl) {
 	throttlers := m.Throttlers()
 
 	// Log error
-	if err := listTemplate.Execute(w, map[string]interface{}{
+	if err := listTemplate.Execute(w, map[string]any{
 		"Throttlers": throttlers,
 	}); err != nil {
 		log.Errorf("listThrottlers failed :%v", err)

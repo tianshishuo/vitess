@@ -26,9 +26,9 @@ import (
 	"sync"
 	"time"
 
+	"vitess.io/vitess/go/mysql/replication"
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 
-	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/vt/dbconfigs"
 	"vitess.io/vitess/go/vt/key"
 	"vitess.io/vitess/go/vt/log"
@@ -37,6 +37,7 @@ import (
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/schema"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/throttle/throttlerapp"
 )
 
 var uvstreamerTestMode = false // Only used for testing
@@ -51,13 +52,18 @@ type uvstreamer struct {
 	cancel func()
 
 	// input parameters
-	vse        *Engine
-	send       func([]*binlogdatapb.VEvent) error
-	cp         dbconfigs.Connector
-	se         *schema.Engine
-	startPos   string
-	filter     *binlogdatapb.Filter
-	inTablePKs []*binlogdatapb.TableLastPK
+	vse      *Engine
+	send     func([]*binlogdatapb.VEvent) error
+	cp       dbconfigs.Connector
+	se       *schema.Engine
+	startPos string
+	// Are we currently in an explicit transaction?
+	// If we are not, and we're about to send ROW
+	// events, then we need to send a BEGIN event first.
+	inTransaction bool
+	filter        *binlogdatapb.Filter
+	inTablePKs    []*binlogdatapb.TableLastPK
+	throttlerApp  throttlerapp.Name
 
 	vschema *localVSchema
 
@@ -70,10 +76,10 @@ type uvstreamer struct {
 	pkfields []*querypb.Field
 
 	// current position in the binlog for this streamer
-	pos mysql.Position
+	pos replication.Position
 
 	// fast forward uses this to stop replicating upto the point of the last snapshot
-	stopPos mysql.Position
+	stopPos replication.Position
 
 	// lastTimestampNs is the last timestamp seen so far.
 	lastTimestampNs       int64
@@ -82,7 +88,8 @@ type uvstreamer struct {
 
 	config *uvstreamerConfig
 
-	vs *vstreamer //last vstreamer created in uvstreamer
+	vs      *vstreamer // last vstreamer created in uvstreamer
+	options *binlogdatapb.VStreamOptions
 }
 
 type uvstreamerConfig struct {
@@ -90,7 +97,10 @@ type uvstreamerConfig struct {
 	CatchupRetryTime  time.Duration
 }
 
-func newUVStreamer(ctx context.Context, vse *Engine, cp dbconfigs.Connector, se *schema.Engine, startPos string, tablePKs []*binlogdatapb.TableLastPK, filter *binlogdatapb.Filter, vschema *localVSchema, send func([]*binlogdatapb.VEvent) error) *uvstreamer {
+func newUVStreamer(ctx context.Context, vse *Engine, cp dbconfigs.Connector, se *schema.Engine, startPos string,
+	tablePKs []*binlogdatapb.TableLastPK, filter *binlogdatapb.Filter, vschema *localVSchema,
+	throttlerApp throttlerapp.Name, send func([]*binlogdatapb.VEvent) error, options *binlogdatapb.VStreamOptions) *uvstreamer {
+
 	ctx, cancel := context.WithCancel(ctx)
 	config := &uvstreamerConfig{
 		MaxReplicationLag: 1 * time.Nanosecond,
@@ -105,17 +115,19 @@ func newUVStreamer(ctx context.Context, vse *Engine, cp dbconfigs.Connector, se 
 		return send(evs)
 	}
 	uvs := &uvstreamer{
-		ctx:        ctx,
-		cancel:     cancel,
-		vse:        vse,
-		send:       send2,
-		cp:         cp,
-		se:         se,
-		startPos:   startPos,
-		filter:     filter,
-		vschema:    vschema,
-		config:     config,
-		inTablePKs: tablePKs,
+		ctx:          ctx,
+		cancel:       cancel,
+		vse:          vse,
+		send:         send2,
+		cp:           cp,
+		se:           se,
+		startPos:     startPos,
+		filter:       filter,
+		vschema:      vschema,
+		config:       config,
+		inTablePKs:   tablePKs,
+		throttlerApp: throttlerApp,
+		options:      options,
 	}
 
 	return uvs
@@ -124,12 +136,16 @@ func newUVStreamer(ctx context.Context, vse *Engine, cp dbconfigs.Connector, se 
 // buildTablePlan identifies the tables for the copy phase and creates the plans which consist of the lastPK seen
 // for a table and its Rule (for filtering purposes by the vstreamer engine)
 // it can be called
-//		the first time, with just the filter and an empty pos
-//		during a restart, with both the filter and list of TableLastPK from the vgtid
+//
+//	the first time, with just the filter and an empty pos
+//	during a restart, with both the filter and list of TableLastPK from the vgtid
 func (uvs *uvstreamer) buildTablePlan() error {
 	uvs.plans = make(map[string]*tablePlan)
 	tableLastPKs := make(map[string]*binlogdatapb.TableLastPK)
 	for _, tablePK := range uvs.inTablePKs {
+		if tablePK != nil && tablePK.Lastpk != nil && len(tablePK.Lastpk.Fields) == 0 {
+			return fmt.Errorf("lastpk for table %s has no fields defined", tablePK.TableName)
+		}
 		tableLastPKs[tablePK.TableName] = tablePK
 	}
 	tables := uvs.se.GetSchema()
@@ -213,11 +229,12 @@ func getQuery(tableName string, filter string) string {
 	switch {
 	case filter == "":
 		buf := sqlparser.NewTrackedBuffer(nil)
-		buf.Myprintf("select * from %v", sqlparser.NewTableIdent(tableName))
+		buf.Myprintf("select * from %v", sqlparser.NewIdentifierCS(tableName))
 		query = buf.String()
-	case key.IsKeyRange(filter):
+	case key.IsValidKeyRange(filter):
 		buf := sqlparser.NewTrackedBuffer(nil)
-		buf.Myprintf("select * from %v where in_keyrange(%v)", sqlparser.NewTableIdent(tableName), sqlparser.NewStrLiteral(filter))
+		buf.Myprintf("select * from %v where in_keyrange(%v)",
+			sqlparser.NewIdentifierCS(tableName), sqlparser.NewStrLiteral(filter))
 		query = buf.String()
 	}
 	return query
@@ -228,7 +245,40 @@ func (uvs *uvstreamer) Cancel() {
 	uvs.cancel()
 }
 
-// during copy phase only send streaming events (during catchup/fastforward) for pks already seen
+// We have not yet implemented the logic to check if an event is for a row that is already copied,
+// so we always return true so that we send all events for this table and so we don't miss events.
+func (uvs *uvstreamer) isRowCopied(tableName string, ev *binlogdatapb.VEvent) bool {
+	return true
+}
+
+// Only send catchup/fastforward events for tables whose copy phase is complete or in progress.
+// This ensures we fulfill the at-least-once delivery semantics for events.
+// TODO: filter out events for rows not yet copied. Note that we can only do this as a best-effort
+// for comparable PKs.
+func (uvs *uvstreamer) shouldSendEventForTable(tableName string, ev *binlogdatapb.VEvent) bool {
+	table, ok := uvs.plans[tableName]
+	// Event is for a table which is not in its copy phase.
+	if !ok {
+		return true
+	}
+
+	// if table copy was not started and no tablePK was specified we can ignore catchup/fastforward events for it
+	if table.tablePK == nil || table.tablePK.Lastpk == nil {
+		return false
+	}
+
+	// Table is currently in its copy phase. We have not yet implemented the logic to
+	// check if an event is for a row that is already copied, so we always return true
+	// there so that we don't miss events.
+	// We may send duplicate insert events or update/delete events for rows not yet seen
+	// to the client for the table being copied. This is ok as the client is expected to be
+	// idempotent: we only promise at-least-once semantics for VStream API (not exactly-once).
+	// Aside: vreplication workflows handle at-least-once by adding where clauses that render
+	// DML queries, related to events for rows not yet copied, as no-ops.
+	return uvs.isRowCopied(tableName, ev)
+}
+
+// Do not send internal heartbeat events. Filter out events for tables whose copy has not been started.
 func (uvs *uvstreamer) filterEvents(evs []*binlogdatapb.VEvent) []*binlogdatapb.VEvent {
 	if len(uvs.plans) == 0 {
 		return evs
@@ -238,25 +288,21 @@ func (uvs *uvstreamer) filterEvents(evs []*binlogdatapb.VEvent) []*binlogdatapb.
 	var shouldSend bool
 
 	for _, ev := range evs {
-		shouldSend = false
-		tableName = ""
 		switch ev.Type {
 		case binlogdatapb.VEventType_ROW:
 			tableName = ev.RowEvent.TableName
 		case binlogdatapb.VEventType_FIELD:
 			tableName = ev.FieldEvent.TableName
+		default:
+			tableName = ""
+		}
+		switch ev.Type {
 		case binlogdatapb.VEventType_HEARTBEAT:
 			shouldSend = false
 		default:
-			shouldSend = true
+			shouldSend = uvs.shouldSendEventForTable(tableName, ev)
 		}
-		if !shouldSend && tableName != "" {
-			shouldSend = true
-			_, ok := uvs.plans[tableName]
-			if ok {
-				shouldSend = false
-			}
-		}
+
 		if shouldSend {
 			evs2 = append(evs2, ev)
 		}
@@ -275,7 +321,6 @@ func (uvs *uvstreamer) send2(evs []*binlogdatapb.VEvent) error {
 	}
 	behind := time.Now().UnixNano() - uvs.lastTimestampNs
 	uvs.setReplicationLagSeconds(behind / 1e9)
-	//log.Infof("sbm set to %d", uvs.ReplicationLagSeconds)
 	var evs2 []*binlogdatapb.VEvent
 	if len(uvs.plans) > 0 {
 		evs2 = uvs.filterEvents(evs)
@@ -286,7 +331,7 @@ func (uvs *uvstreamer) send2(evs []*binlogdatapb.VEvent) error {
 	}
 	for _, ev := range evs2 {
 		if ev.Type == binlogdatapb.VEventType_GTID {
-			uvs.pos, _ = mysql.DecodePosition(ev.Gtid)
+			uvs.pos, _ = replication.DecodePosition(ev.Gtid)
 			if !uvs.stopPos.IsZero() && uvs.pos.AtLeast(uvs.stopPos) {
 				err = io.EOF
 			}
@@ -302,7 +347,7 @@ func (uvs *uvstreamer) sendEventsForCurrentPos() error {
 	log.Infof("sendEventsForCurrentPos")
 	evs := []*binlogdatapb.VEvent{{
 		Type: binlogdatapb.VEventType_GTID,
-		Gtid: mysql.EncodePosition(uvs.pos),
+		Gtid: replication.EncodePosition(uvs.pos),
 	}, {
 		Type: binlogdatapb.VEventType_OTHER,
 	}}
@@ -324,38 +369,45 @@ func (uvs *uvstreamer) setStreamStartPosition() error {
 		}
 		return nil
 	}
-	pos, err := mysql.DecodePosition(uvs.startPos)
+	pos, err := replication.DecodePosition(uvs.startPos)
 	if err != nil {
 		return vterrors.Wrap(err, "could not decode position")
 	}
 	if !curPos.AtLeast(pos) {
 		uvs.vse.errorCounts.Add("GTIDSet Mismatch", 1)
-		return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "GTIDSet Mismatch: requested source position:%v, current target vrep position: %v", mysql.EncodePosition(pos), mysql.EncodePosition(curPos))
+		return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT,
+			"GTIDSet Mismatch: requested source position:%v, current target vrep position: %v",
+			replication.EncodePosition(pos), replication.EncodePosition(curPos))
 	}
 	uvs.pos = pos
 	return nil
 }
 
-func (uvs *uvstreamer) currentPosition() (mysql.Position, error) {
+func (uvs *uvstreamer) currentPosition() (replication.Position, error) {
 	conn, err := uvs.cp.Connect(uvs.ctx)
 	if err != nil {
-		return mysql.Position{}, err
+		return replication.Position{}, err
 	}
 	defer conn.Close()
 	return conn.PrimaryPosition()
 }
 
+// Possible states:
+// 1. TablePKs nil, startPos set to gtid or "current" => start replicating from pos
+// 2. TablePKs nil, startPos empty => full table copy of tables matching filter
+// 3. TablePKs not nil, startPos empty => table copy (for pks > lastPK)
+// 4. TablePKs not nil, startPos set => run catchup from startPos, then table copy  (for pks > lastPK)
 func (uvs *uvstreamer) init() error {
-	if uvs.startPos != "" {
-		if err := uvs.setStreamStartPosition(); err != nil {
-			return err
-		}
-	} else if uvs.startPos == "" || len(uvs.inTablePKs) > 0 {
+	if uvs.startPos == "" /* full copy */ || len(uvs.inTablePKs) > 0 /* resume copy */ {
 		if err := uvs.buildTablePlan(); err != nil {
 			return err
 		}
 	}
-
+	if uvs.startPos != "" {
+		if err := uvs.setStreamStartPosition(); err != nil {
+			return err
+		}
+	}
 	if uvs.pos.IsZero() && (len(uvs.plans) == 0) {
 		return fmt.Errorf("stream needs a position or a table to copy")
 	}
@@ -375,9 +427,12 @@ func (uvs *uvstreamer) Stream() error {
 			uvs.vse.errorCounts.Add("Copy", 1)
 			return err
 		}
-		uvs.sendTestEvent("Copy Done")
+		if err := uvs.allCopyComplete(); err != nil {
+			return err
+		}
 	}
-	vs := newVStreamer(uvs.ctx, uvs.cp, uvs.se, mysql.EncodePosition(uvs.pos), mysql.EncodePosition(uvs.stopPos), uvs.filter, uvs.getVSchema(), uvs.send, "replicate", uvs.vse)
+	vs := newVStreamer(uvs.ctx, uvs.cp, uvs.se, replication.EncodePosition(uvs.pos), replication.EncodePosition(uvs.stopPos),
+		uvs.filter, uvs.getVSchema(), uvs.throttlerApp, uvs.send, "replicate", uvs.vse, uvs.options)
 
 	uvs.setVs(vs)
 	return vs.Stream()
@@ -415,6 +470,17 @@ func (uvs *uvstreamer) getVSchema() *localVSchema {
 
 func (uvs *uvstreamer) setCopyState(tableName string, qr *querypb.QueryResult) {
 	uvs.plans[tableName].tablePK.Lastpk = qr
+}
+
+func (uvs *uvstreamer) allCopyComplete() error {
+	ev := &binlogdatapb.VEvent{
+		Type: binlogdatapb.VEventType_COPY_COMPLETED,
+	}
+
+	if err := uvs.send([]*binlogdatapb.VEvent{ev}); err != nil {
+		return err
+	}
+	return nil
 }
 
 // dummy event sent only in test mode
@@ -460,7 +526,7 @@ func (uvs *uvstreamer) setPosition(gtid string, isInTx bool) error {
 	if gtid == "" {
 		return fmt.Errorf("empty gtid passed to setPosition")
 	}
-	pos, err := mysql.DecodePosition(gtid)
+	pos, err := replication.DecodePosition(gtid)
 	if err != nil {
 		return err
 	}

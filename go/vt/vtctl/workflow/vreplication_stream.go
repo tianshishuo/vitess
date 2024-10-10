@@ -21,24 +21,34 @@ import (
 	"sort"
 	"strings"
 
-	"google.golang.org/protobuf/proto"
-
-	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/mysql/replication"
 
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 )
 
 // VReplicationStream represents a single stream of a vreplication workflow.
 type VReplicationStream struct {
-	ID           uint32
-	Workflow     string
-	BinlogSource *binlogdatapb.BinlogSource
-	Position     mysql.Position
+	ID                 int32
+	Workflow           string
+	BinlogSource       *binlogdatapb.BinlogSource
+	Position           replication.Position
+	WorkflowType       binlogdatapb.VReplicationWorkflowType
+	WorkflowSubType    binlogdatapb.VReplicationWorkflowSubType
+	DeferSecondaryKeys bool
 }
 
 // VReplicationStreams wraps a slice of VReplicationStream objects to provide
 // some aggregate functionality.
 type VReplicationStreams []*VReplicationStream
+
+// IDs returns the IDs of the VReplicationStreams.
+func (streams VReplicationStreams) IDs() []int32 {
+	ids := make([]int32, len(streams))
+	for i := range streams {
+		ids[i] = streams[i].ID
+	}
+	return ids
+}
 
 // Values returns a string representing the IDs of the VReplicationStreams for
 // use in an IN clause.
@@ -86,7 +96,7 @@ func (streams VReplicationStreams) Copy() VReplicationStreams {
 		out[i] = &VReplicationStream{
 			ID:           vrs.ID,
 			Workflow:     vrs.Workflow,
-			BinlogSource: proto.Clone(vrs.BinlogSource).(*binlogdatapb.BinlogSource),
+			BinlogSource: vrs.BinlogSource.CloneVT(),
 			Position:     vrs.Position,
 		}
 	}

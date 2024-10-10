@@ -20,13 +20,11 @@ func TestKeywordTable(t *testing.T) {
 }
 
 var vitessReserved = map[string]bool{
-	"ESCAPE":        true,
-	"NEXT":          true,
-	"OFF":           true,
-	"SAVEPOINT":     true,
-	"SQL_NO_CACHE":  true,
-	"TIMESTAMPADD":  true,
-	"TIMESTAMPDIFF": true,
+	"ESCAPE":       true,
+	"NEXT":         true,
+	"OFF":          true,
+	"SAVEPOINT":    true,
+	"SQL_NO_CACHE": true,
 }
 
 func TestCompatibility(t *testing.T) {
@@ -34,6 +32,7 @@ func TestCompatibility(t *testing.T) {
 	require.NoError(t, err)
 	defer file.Close()
 
+	parser := NewTestParser()
 	scanner := bufio.NewScanner(file)
 	skipStep := 4
 	for scanner.Scan() {
@@ -48,7 +47,7 @@ func TestCompatibility(t *testing.T) {
 			word = "`" + word + "`"
 		}
 		sql := fmt.Sprintf("create table %s(c1 int)", word)
-		_, err := ParseStrictDDL(sql)
+		_, err := parser.ParseStrictDDL(sql)
 		if err != nil {
 			t.Errorf("%s is not compatible with mysql", word)
 		}

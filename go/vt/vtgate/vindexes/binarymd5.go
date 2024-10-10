@@ -18,6 +18,7 @@ package vindexes
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 
 	"vitess.io/vitess/go/sqltypes"
@@ -25,18 +26,23 @@ import (
 )
 
 var (
-	_ SingleColumn = (*BinaryMD5)(nil)
-	_ Hashing      = (*BinaryMD5)(nil)
+	_ SingleColumn    = (*BinaryMD5)(nil)
+	_ Hashing         = (*BinaryMD5)(nil)
+	_ ParamValidating = (*BinaryMD5)(nil)
 )
 
 // BinaryMD5 is a vindex that hashes binary bits to a keyspace id.
 type BinaryMD5 struct {
-	name string
+	name          string
+	unknownParams []string
 }
 
-// NewBinaryMD5 creates a new BinaryMD5.
-func NewBinaryMD5(name string, _ map[string]string) (Vindex, error) {
-	return &BinaryMD5{name: name}, nil
+// newBinaryMD5 creates a new BinaryMD5.
+func newBinaryMD5(name string, params map[string]string) (Vindex, error) {
+	return &BinaryMD5{
+		name:          name,
+		unknownParams: FindUnknownParams(params, nil),
+	}, nil
 }
 
 // String returns the name of the vindex.
@@ -60,7 +66,7 @@ func (vind *BinaryMD5) NeedsVCursor() bool {
 }
 
 // Verify returns true if ids maps to ksids.
-func (vind *BinaryMD5) Verify(_ VCursor, ids []sqltypes.Value, ksids [][]byte) ([]bool, error) {
+func (vind *BinaryMD5) Verify(ctx context.Context, vcursor VCursor, ids []sqltypes.Value, ksids [][]byte) ([]bool, error) {
 	out := make([]bool, 0, len(ids))
 	for i, id := range ids {
 		ksid, err := vind.Hash(id)
@@ -73,7 +79,7 @@ func (vind *BinaryMD5) Verify(_ VCursor, ids []sqltypes.Value, ksids [][]byte) (
 }
 
 // Map can map ids to key.Destination objects.
-func (vind *BinaryMD5) Map(_ VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
+func (vind *BinaryMD5) Map(ctx context.Context, vcursor VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
 	out := make([]key.Destination, 0, len(ids))
 	for _, id := range ids {
 		ksid, err := vind.Hash(id)
@@ -93,11 +99,16 @@ func (vind *BinaryMD5) Hash(id sqltypes.Value) ([]byte, error) {
 	return vMD5Hash(idBytes), nil
 }
 
+// UnknownParams implements the ParamValidating interface.
+func (vind *BinaryMD5) UnknownParams() []string {
+	return vind.unknownParams
+}
+
 func vMD5Hash(source []byte) []byte {
 	sum := md5.Sum(source)
 	return sum[:]
 }
 
 func init() {
-	Register("binary_md5", NewBinaryMD5)
+	Register("binary_md5", newBinaryMD5)
 }

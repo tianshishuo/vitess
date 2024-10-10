@@ -18,15 +18,15 @@ limitations under the License.
 package grpcvtgateconn
 
 import (
-	"flag"
-
-	"google.golang.org/grpc"
-
 	"context"
+
+	"github.com/spf13/pflag"
+	"google.golang.org/grpc"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/callerid"
 	"vitess.io/vitess/go/vt/grpcclient"
+	"vitess.io/vitess/go/vt/servenv"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/vtgateconn"
 
@@ -38,15 +38,33 @@ import (
 )
 
 var (
-	cert = flag.String("vtgate_grpc_cert", "", "the cert to use to connect")
-	key  = flag.String("vtgate_grpc_key", "", "the key to use to connect")
-	ca   = flag.String("vtgate_grpc_ca", "", "the server ca to use to validate servers when connecting")
-	crl  = flag.String("vtgate_grpc_crl", "", "the server crl to use to validate server certificates when connecting")
-	name = flag.String("vtgate_grpc_server_name", "", "the server name to use to validate server certificate")
+	cert string
+	key  string
+	ca   string
+	crl  string
+	name string
 )
 
 func init() {
 	vtgateconn.RegisterDialer("grpc", dial)
+
+	for _, cmd := range []string{
+		"vtbench",
+		"vtclient",
+		"vtcombo",
+		"vtctl",
+		"vttestserver",
+	} {
+		servenv.OnParseFor(cmd, registerFlags)
+	}
+}
+
+func registerFlags(fs *pflag.FlagSet) {
+	fs.StringVar(&cert, "vtgate_grpc_cert", "", "the cert to use to connect")
+	fs.StringVar(&key, "vtgate_grpc_key", "", "the key to use to connect")
+	fs.StringVar(&ca, "vtgate_grpc_ca", "", "the server ca to use to validate servers when connecting")
+	fs.StringVar(&crl, "vtgate_grpc_crl", "", "the server crl to use to validate server certificates when connecting")
+	fs.StringVar(&name, "vtgate_grpc_server_name", "", "the server name to use to validate server certificate")
 }
 
 type vtgateConn struct {
@@ -55,20 +73,20 @@ type vtgateConn struct {
 }
 
 func dial(ctx context.Context, addr string) (vtgateconn.Impl, error) {
-	return DialWithOpts(ctx)(ctx, addr)
+	return Dial()(ctx, addr)
 }
 
-// DialWithOpts allows for custom dial options to be set on a vtgateConn.
-func DialWithOpts(ctx context.Context, opts ...grpc.DialOption) vtgateconn.DialerFunc {
+// Dial produces a vtgateconn.DialerFunc with custom options.
+func Dial(opts ...grpc.DialOption) vtgateconn.DialerFunc {
 	return func(ctx context.Context, address string) (vtgateconn.Impl, error) {
-		opt, err := grpcclient.SecureDialOption(*cert, *key, *ca, *crl, *name)
+		opt, err := grpcclient.SecureDialOption(cert, key, ca, crl, name)
 		if err != nil {
 			return nil, err
 		}
 
 		opts = append(opts, opt)
 
-		cc, err := grpcclient.Dial(address, grpcclient.FailFast(false), opts...)
+		cc, err := grpcclient.DialContext(ctx, address, grpcclient.FailFast(false), opts...)
 		if err != nil {
 			return nil, err
 		}
@@ -79,6 +97,14 @@ func DialWithOpts(ctx context.Context, opts ...grpc.DialOption) vtgateconn.Diale
 			c:  c,
 		}, nil
 	}
+}
+
+// DialWithOpts allows for custom dial options to be set on a vtgateConn.
+//
+// Deprecated: the context parameter cannot be used by the returned
+// vtgateconn.DialerFunc and thus has no effect. Use Dial instead.
+func DialWithOpts(_ context.Context, opts ...grpc.DialOption) vtgateconn.DialerFunc {
+	return Dial(opts...)
 }
 
 func (conn *vtgateConn) Execute(ctx context.Context, session *vtgatepb.Session, query string, bindVars map[string]*querypb.BindVariable) (*vtgatepb.Session, *sqltypes.Result, error) {
@@ -130,7 +156,16 @@ type streamExecuteAdapter struct {
 }
 
 func (a *streamExecuteAdapter) Recv() (*sqltypes.Result, error) {
-	qr, err := a.recv()
+	var qr *querypb.QueryResult
+	var err error
+	for {
+		qr, err = a.recv()
+		if qr != nil || err != nil {
+			break
+		}
+		// we reach here, only when it is the last packet.
+		// as in the last packet we receive the session and there is no result
+	}
 	if err != nil {
 		return nil, vterrors.FromGRPC(err)
 	}
@@ -140,7 +175,7 @@ func (a *streamExecuteAdapter) Recv() (*sqltypes.Result, error) {
 	return sqltypes.CustomProto3ToResult(a.fields, qr), nil
 }
 
-func (conn *vtgateConn) StreamExecute(ctx context.Context, session *vtgatepb.Session, query string, bindVars map[string]*querypb.BindVariable) (sqltypes.ResultStream, error) {
+func (conn *vtgateConn) StreamExecute(ctx context.Context, session *vtgatepb.Session, query string, bindVars map[string]*querypb.BindVariable, processResponse func(response *vtgatepb.StreamExecuteResponse)) (sqltypes.ResultStream, error) {
 	req := &vtgatepb.StreamExecuteRequest{
 		CallerId: callerid.EffectiveCallerIDFromContext(ctx),
 		Query: &querypb.BoundQuery{
@@ -159,6 +194,7 @@ func (conn *vtgateConn) StreamExecute(ctx context.Context, session *vtgatepb.Ses
 			if err != nil {
 				return nil, err
 			}
+			processResponse(ser)
 			return ser.Result, nil
 		},
 	}, nil
@@ -196,15 +232,6 @@ func (conn *vtgateConn) CloseSession(ctx context.Context, session *vtgatepb.Sess
 		return vterrors.FromVTRPC(response.Error)
 	}
 	return nil
-}
-
-func (conn *vtgateConn) ResolveTransaction(ctx context.Context, dtid string) error {
-	request := &vtgatepb.ResolveTransactionRequest{
-		CallerId: callerid.EffectiveCallerIDFromContext(ctx),
-		Dtid:     dtid,
-	}
-	_, err := conn.c.ResolveTransaction(ctx, request)
-	return vterrors.FromGRPC(err)
 }
 
 type vstreamAdapter struct {

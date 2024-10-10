@@ -20,26 +20,24 @@ import (
 	"strconv"
 	"strings"
 
-	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
-
 	"vitess.io/vitess/go/vt/key"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
-	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/engine"
+	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
 )
 
 const defaultLimit = 100
 
-func buildVStreamPlan(stmt *sqlparser.VStream, vschema plancontext.VSchema) (engine.Primitive, error) {
+func buildVStreamPlan(stmt *sqlparser.VStream, vschema plancontext.VSchema) (*planResult, error) {
 	table, _, destTabletType, dest, err := vschema.FindTable(stmt.Table)
 	if err != nil {
 		return nil, err
 	}
 	// TODO: do we need this restriction?
 	if destTabletType != topodatapb.TabletType_PRIMARY {
-		return nil, vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "vstream is supported only for primary tablet type, current type: %v", destTabletType)
+		return nil, vterrors.VT09009(destTabletType)
 	}
 	if dest == nil {
 		dest = key.DestinationAllShards{}
@@ -59,16 +57,14 @@ func buildVStreamPlan(stmt *sqlparser.VStream, vschema plancontext.VSchema) (eng
 		}
 	}
 
-	return &engine.VStream{
+	return newPlanResult(&engine.VStream{
 		Keyspace:          table.Keyspace,
 		TargetDestination: dest,
 		TableName:         table.Name.CompliantName(),
 		Position:          pos,
 		Limit:             limit,
-	}, nil
+	}), nil
 }
-
-const errWhereFormat = "where clause can only be of the type 'pos > <value>'"
 
 func getVStreamStartPos(stmt *sqlparser.VStream) (string, error) {
 	var colName, pos string
@@ -84,14 +80,14 @@ func getVStreamStartPos(stmt *sqlparser.VStream) (string, error) {
 					}
 					colName = strings.ToLower(c.Name.String())
 					if colName != "pos" {
-						return "", vterrors.NewErrorf(vtrpcpb.Code_INVALID_ARGUMENT, vterrors.SyntaxError, errWhereFormat)
+						return "", vterrors.VT03017()
 					}
 				}
 			} else {
-				return "", vterrors.NewErrorf(vtrpcpb.Code_INVALID_ARGUMENT, vterrors.SyntaxError, errWhereFormat)
+				return "", vterrors.VT03017()
 			}
 		default:
-			return "", vterrors.NewErrorf(vtrpcpb.Code_INVALID_ARGUMENT, vterrors.SyntaxError, errWhereFormat)
+			return "", vterrors.VT03017()
 		}
 	}
 	return pos, nil

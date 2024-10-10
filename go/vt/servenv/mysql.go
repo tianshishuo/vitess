@@ -16,9 +16,45 @@ limitations under the License.
 
 package servenv
 
-import "flag"
+import (
+	"fmt"
 
-// MySQLServerVersion is what Vitess will present as it's version during the connection handshake,
+	"github.com/spf13/pflag"
+
+	"vitess.io/vitess/go/mysql/config"
+)
+
+// mySQLServerVersion is what Vitess will present as it's version during the connection handshake,
 // and as the value to the @@version system variable. If nothing is provided, Vitess will report itself as
 // a specific MySQL version with the vitess version appended to it
-var MySQLServerVersion = flag.String("mysql_server_version", "", "MySQL server version to advertise.")
+var mySQLServerVersion = fmt.Sprintf("%s-Vitess", config.DefaultMySQLVersion)
+
+// RegisterMySQLServerFlags installs the flags needed to specify or expose a
+// particular MySQL server version from Vitess.
+func RegisterMySQLServerFlags(fs *pflag.FlagSet) {
+	fs.StringVar(&mySQLServerVersion, "mysql_server_version", mySQLServerVersion, "MySQL server version to advertise.")
+}
+
+// MySQLServerVersion returns the value of the `--mysql_server_version` flag.
+func MySQLServerVersion() string {
+	return mySQLServerVersion
+}
+
+func init() {
+	for _, cmd := range []string{
+		"mysqlctl",
+		"mysqlctld",
+		"vtbackup",
+		"vtcombo",
+		"vtctl",
+		"vtctld",
+		"vtctldclient",
+		"vtexplain",
+		"vtgate",
+		"vtgateclienttest",
+		"vttablet",
+		"vttestserver",
+	} {
+		OnParseFor(cmd, RegisterMySQLServerFlags)
+	}
+}

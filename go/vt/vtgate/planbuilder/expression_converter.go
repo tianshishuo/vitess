@@ -20,16 +20,18 @@ import (
 	"fmt"
 	"strings"
 
-	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
-
 	"vitess.io/vitess/go/mysql/collations"
 	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vtenv"
 	"vitess.io/vitess/go/vt/vtgate/engine"
 	"vitess.io/vitess/go/vt/vtgate/evalengine"
+	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
 )
 
 type expressionConverter struct {
 	tabletExpressions []sqlparser.Expr
+	env               *vtenv.Environment
+	collation         collations.ID
 }
 
 func booleanValues(astExpr sqlparser.Expr) evalengine.Expr {
@@ -39,7 +41,7 @@ func booleanValues(astExpr sqlparser.Expr) evalengine.Expr {
 	)
 	switch node := astExpr.(type) {
 	case *sqlparser.Literal:
-		//set autocommit = 'on'
+		// set autocommit = 'on'
 		if node.Type == sqlparser.StrVal {
 			switch strings.ToLower(node.Val) {
 			case "on":
@@ -49,14 +51,12 @@ func booleanValues(astExpr sqlparser.Expr) evalengine.Expr {
 			}
 		}
 	case *sqlparser.ColName:
-		//set autocommit = on
-		if node.Name.AtCount() == sqlparser.NoAt {
-			switch node.Name.Lowered() {
-			case "on":
-				return ON
-			case "off":
-				return OFF
-			}
+		// set autocommit = on
+		switch node.Name.Lowered() {
+		case "on":
+			return ON
+		case "off":
+			return OFF
 		}
 	}
 	return nil
@@ -65,8 +65,7 @@ func booleanValues(astExpr sqlparser.Expr) evalengine.Expr {
 func identifierAsStringValue(astExpr sqlparser.Expr) evalengine.Expr {
 	colName, isColName := astExpr.(*sqlparser.ColName)
 	if isColName {
-		// TODO@collations: proper collation for column name
-		return evalengine.NewLiteralString([]byte(colName.Name.Lowered()), collations.TypedCollation{})
+		return evalengine.NewLiteralString([]byte(colName.Name.Lowered()), collations.SystemCollation)
 	}
 	return nil
 }
@@ -84,12 +83,15 @@ func (ec *expressionConverter) convert(astExpr sqlparser.Expr, boolean, identifi
 			return evalExpr, nil
 		}
 	}
-	evalExpr, err := evalengine.Translate(astExpr, nil)
+	evalExpr, err := evalengine.Translate(astExpr, &evalengine.Config{
+		Collation:   ec.collation,
+		Environment: ec.env,
+	})
 	if err != nil {
 		if !strings.Contains(err.Error(), evalengine.ErrTranslateExprNotSupported) {
 			return nil, err
 		}
-		evalExpr = &evalengine.Column{Offset: len(ec.tabletExpressions)}
+		evalExpr = evalengine.NewColumn(len(ec.tabletExpressions), evalengine.Type{}, nil)
 		ec.tabletExpressions = append(ec.tabletExpressions, astExpr)
 	}
 	return evalExpr, nil

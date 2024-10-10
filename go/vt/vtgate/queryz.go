@@ -18,15 +18,15 @@ package vtgate
 
 import (
 	"fmt"
-	"html/template"
 	"net/http"
 	"sort"
 	"time"
 
+	"github.com/google/safehtml/template"
+
 	"vitess.io/vitess/go/acl"
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/logz"
-	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vtgate/engine"
 )
 
@@ -142,10 +142,9 @@ func queryzHandler(e *Executor, w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	e.plans.ForEach(func(value interface{}) bool {
-		plan := value.(*engine.Plan)
+	e.ForEachPlan(func(plan *engine.Plan) bool {
 		Value := &queryzRow{
-			Query: logz.Wrappable(sqlparser.TruncateForUI(plan.Original)),
+			Query: logz.Wrappable(e.env.Parser().TruncateForUI(plan.Original)),
 		}
 		Value.Count, Value.tm, Value.ShardQueries, Value.RowsAffected, Value.RowsReturned, Value.Errors = plan.Stats()
 		var timepq time.Duration

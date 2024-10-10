@@ -18,22 +18,19 @@ package engine
 
 import (
 	"context"
-	"encoding/json"
-	"sync/atomic"
 	"time"
-
-	"golang.org/x/sync/errgroup"
 
 	"vitess.io/vitess/go/mysql/collations"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
-	"vitess.io/vitess/go/vt/schema"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/srvtopo"
+	"vitess.io/vitess/go/vt/vtenv"
 	"vitess.io/vitess/go/vt/vtgate/vindexes"
 
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 	querypb "vitess.io/vitess/go/vt/proto/query"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
 )
 
@@ -50,9 +47,6 @@ type (
 	// VCursor defines the interface the engine will use
 	// to execute routes.
 	VCursor interface {
-		// Context returns the context of the current request.
-		Context() context.Context
-
 		GetKeyspace() string
 		// MaxMemoryRows returns the maxMemoryRows flag value.
 		MaxMemoryRows() int
@@ -62,43 +56,43 @@ type (
 		// if the max memory rows override directive is set to true
 		ExceedsMaxMemoryRows(numRows int) bool
 
-		// SetContextTimeout updates the context and sets a timeout.
-		SetContextTimeout(timeout time.Duration) context.CancelFunc
-
-		// ErrorGroupCancellableContext updates context that can be cancelled.
-		ErrorGroupCancellableContext() (*errgroup.Group, func())
-
-		// V3 functions.
-		Execute(method string, query string, bindvars map[string]*querypb.BindVariable, rollbackOnError bool, co vtgatepb.CommitOrder) (*sqltypes.Result, error)
+		Execute(ctx context.Context, method string, query string, bindVars map[string]*querypb.BindVariable, rollbackOnError bool, co vtgatepb.CommitOrder) (*sqltypes.Result, error)
 		AutocommitApproval() bool
 
-		// Primitive functions
-		ExecutePrimitive(primitive Primitive, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error)
-		StreamExecutePrimitive(primitive Primitive, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error
+		// Execute the given primitive
+		ExecutePrimitive(ctx context.Context, primitive Primitive, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error)
+		// Execute the given primitive in a new autocommit session
+		ExecutePrimitiveStandalone(ctx context.Context, primitive Primitive, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error)
+
+		// Execute the given primitive
+		StreamExecutePrimitive(ctx context.Context, primitive Primitive, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error
+		// Execute the given primitive in a new autocommit session
+		StreamExecutePrimitiveStandalone(ctx context.Context, primitive Primitive, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(result *sqltypes.Result) error) error
 
 		// Shard-level functions.
-		ExecuteMultiShard(rss []*srvtopo.ResolvedShard, queries []*querypb.BoundQuery, rollbackOnError, canAutocommit bool) (*sqltypes.Result, []error)
-		ExecuteStandalone(query string, bindvars map[string]*querypb.BindVariable, rs *srvtopo.ResolvedShard) (*sqltypes.Result, error)
-		StreamExecuteMulti(query string, rss []*srvtopo.ResolvedShard, bindVars []map[string]*querypb.BindVariable, rollbackOnError bool, autocommit bool, callback func(reply *sqltypes.Result) error) []error
+		ExecuteMultiShard(ctx context.Context, primitive Primitive, rss []*srvtopo.ResolvedShard, queries []*querypb.BoundQuery, rollbackOnError, canAutocommit bool) (*sqltypes.Result, []error)
+		ExecuteStandalone(ctx context.Context, primitive Primitive, query string, bindVars map[string]*querypb.BindVariable, rs *srvtopo.ResolvedShard) (*sqltypes.Result, error)
+		StreamExecuteMulti(ctx context.Context, primitive Primitive, query string, rss []*srvtopo.ResolvedShard, bindVars []map[string]*querypb.BindVariable, rollbackOnError bool, autocommit bool, callback func(reply *sqltypes.Result) error) []error
 
 		// Keyspace ID level functions.
-		ExecuteKeyspaceID(keyspace string, ksid []byte, query string, bindVars map[string]*querypb.BindVariable, rollbackOnError, autocommit bool) (*sqltypes.Result, error)
+		ExecuteKeyspaceID(ctx context.Context, keyspace string, ksid []byte, query string, bindVars map[string]*querypb.BindVariable, rollbackOnError, autocommit bool) (*sqltypes.Result, error)
 
 		// Resolver methods, from key.Destination to srvtopo.ResolvedShard.
 		// Will replace all of the Topo functions.
-		ResolveDestinations(keyspace string, ids []*querypb.Value, destinations []key.Destination) ([]*srvtopo.ResolvedShard, [][]*querypb.Value, error)
+		ResolveDestinations(ctx context.Context, keyspace string, ids []*querypb.Value, destinations []key.Destination) ([]*srvtopo.ResolvedShard, [][]*querypb.Value, error)
 
-		ResolveDestinationsMultiCol(keyspace string, ids [][]sqltypes.Value, destinations []key.Destination) ([]*srvtopo.ResolvedShard, [][][]sqltypes.Value, error)
+		ResolveDestinationsMultiCol(ctx context.Context, keyspace string, ids [][]sqltypes.Value, destinations []key.Destination) ([]*srvtopo.ResolvedShard, [][][]sqltypes.Value, error)
 
-		ExecuteVSchema(keyspace string, vschemaDDL *sqlparser.AlterVschema) error
-
-		SubmitOnlineDDL(onlineDDl *schema.OnlineDDL) error
+		ExecuteVSchema(ctx context.Context, keyspace string, vschemaDDL *sqlparser.AlterVschema) error
 
 		Session() SessionActions
 
 		ConnCollation() collations.ID
+		Environment() *vtenv.Environment
+		TimeZone() *time.Location
+		SQLMode() string
 
-		ExecuteLock(rs *srvtopo.ResolvedShard, query *querypb.BoundQuery) (*sqltypes.Result, error)
+		ExecuteLock(ctx context.Context, rs *srvtopo.ResolvedShard, query *querypb.BoundQuery, lockFuncType sqlparser.LockingFuncType) (*sqltypes.Result, error)
 
 		InTransactionAndIsDML() bool
 
@@ -112,19 +106,58 @@ type (
 		// KeyspaceAvailable returns true when a keyspace is visible from vtgate
 		KeyspaceAvailable(ks string) bool
 
-		MessageStream(rss []*srvtopo.ResolvedShard, tableName string, callback func(*sqltypes.Result) error) error
+		MessageStream(ctx context.Context, rss []*srvtopo.ResolvedShard, tableName string, callback func(*sqltypes.Result) error) error
 
-		VStream(rss []*srvtopo.ResolvedShard, filter *binlogdatapb.Filter, gtid string, callback func(evs []*binlogdatapb.VEvent) error) error
+		VStream(ctx context.Context, rss []*srvtopo.ResolvedShard, filter *binlogdatapb.Filter, gtid string, callback func(evs []*binlogdatapb.VEvent) error) error
+
+		// ShowExec takes in show command and use executor to execute the query, they are used when topo access is involved.
+		ShowExec(ctx context.Context, command sqlparser.ShowCommandType, filter *sqlparser.ShowFilter) (*sqltypes.Result, error)
+		// SetExec takes in k,v pair and use executor to set them in topo metadata.
+		SetExec(ctx context.Context, name string, value string) error
+		// ThrottleApp sets a ThrottlerappRule in topo
+		ThrottleApp(ctx context.Context, throttleAppRule *topodatapb.ThrottledAppRule) error
+
+		// CanUseSetVar returns true if system_settings can use SET_VAR hint.
+		CanUseSetVar() bool
+
+		// ReleaseLock releases all the held advisory locks.
+		ReleaseLock(ctx context.Context) error
+
+		// GetWarmingReadsPercent gets the percentage of queries to clone to replicas for bufferpool warming
+		GetWarmingReadsPercent() int
+
+		// GetWarmingReadsChannel returns the channel for executing warming reads against replicas
+		GetWarmingReadsChannel() chan bool
+
+		// CloneForReplicaWarming clones the VCursor for re-use in warming queries to replicas
+		CloneForReplicaWarming(ctx context.Context) VCursor
+
+		// CloneForMirroring clones the VCursor for re-use in mirroring queries to other keyspaces
+		CloneForMirroring(ctx context.Context) VCursor
+		//
+		// ReadTransaction reads the state of the given transaction from the metadata manager
+		ReadTransaction(ctx context.Context, transactionID string) (*querypb.TransactionMetadata, error)
+
+		// UnresolvedTransactions reads the state of all the unresolved atomic transactions in the given keyspace.
+		UnresolvedTransactions(ctx context.Context, keyspace string) ([]*querypb.TransactionMetadata, error)
+
+		// StartPrimitiveTrace starts a trace for the given primitive,
+		// and returns a function to get the trace logs after the primitive execution.
+		StartPrimitiveTrace() func() Stats
+
+		// RecordMirrorStats is used to record stats about a mirror query.
+		RecordMirrorStats(time.Duration, time.Duration, error)
 	}
 
-	//SessionActions gives primitives ability to interact with the session state
+	// SessionActions gives primitives ability to interact with the session state
 	SessionActions interface {
 		// RecordWarning stores the given warning in the current session
 		RecordWarning(warning *querypb.QueryWarning)
 
 		SetTarget(target string) error
 
-		SetUDV(key string, value interface{}) error
+		SetUDV(key string, value any) error
+		GetUDV(key string) *querypb.BindVariable
 
 		SetSysVar(name string, expr string)
 
@@ -137,23 +170,28 @@ type (
 		// ShardSession returns shard info about open connections
 		ShardSession() []*srvtopo.ResolvedShard
 
-		SetAutocommit(bool) error
-		SetClientFoundRows(bool) error
-		SetSkipQueryPlanCache(bool) error
+		SetAutocommit(ctx context.Context, autocommit bool) error
+		SetClientFoundRows(context.Context, bool) error
+		SetSkipQueryPlanCache(context.Context, bool) error
 		SetSQLSelectLimit(int64) error
 		SetTransactionMode(vtgatepb.TransactionMode)
 		SetWorkload(querypb.ExecuteOptions_Workload)
 		SetPlannerVersion(querypb.ExecuteOptions_PlannerVersion)
+		SetConsolidator(querypb.ExecuteOptions_Consolidator)
+		SetWorkloadName(string)
+		SetPriority(string)
+		SetExecQueryTimeout(timeout *int)
 		SetFoundRows(uint64)
 
 		SetDDLStrategy(string)
 		GetDDLStrategy() string
+		SetMigrationContext(string)
+		GetMigrationContext() string
 
 		GetSessionUUID() string
 
-		SetSessionEnableSystemSettings(bool) error
+		SetSessionEnableSystemSettings(context.Context, bool) error
 		GetSessionEnableSystemSettings() bool
-		GetEnableSetVar() bool
 
 		GetSystemVariables(func(k string, v string))
 		HasSystemVariables() bool
@@ -166,26 +204,33 @@ type (
 		// HasCreatedTempTable will mark the session as having created temp tables
 		HasCreatedTempTable()
 		GetWarnings() []*querypb.QueryWarning
-	}
 
-	// Plan represents the execution strategy for a given query.
-	// For now it's a simple wrapper around the real instructions.
-	// An instruction (aka Primitive) is typically a tree where
-	// each node does its part by combining the results of the
-	// sub-nodes.
-	Plan struct {
-		Type         sqlparser.StatementType // The type of query we have
-		Original     string                  // Original is the original query.
-		Instructions Primitive               // Instructions contains the instructions needed to fulfil the query.
-		BindVarNeeds *sqlparser.BindVarNeeds // Stores BindVars needed to be provided as part of expression rewriting
-		Warnings     []*querypb.QueryWarning // Warnings that need to be yielded every time this query runs
+		// AnyAdvisoryLockTaken returns true of any advisory lock is taken
+		AnyAdvisoryLockTaken() bool
+		// AddAdvisoryLock adds advisory lock to the session
+		AddAdvisoryLock(name string)
+		// RemoveAdvisoryLock removes advisory lock from the session
+		RemoveAdvisoryLock(name string)
 
-		ExecCount    uint64 // Count of times this plan was executed
-		ExecTime     uint64 // Total execution time
-		ShardQueries uint64 // Total number of shard queries
-		RowsReturned uint64 // Total number of rows
-		RowsAffected uint64 // Total number of rows
-		Errors       uint64 // Total number of errors
+		// VExplainLogging enables logging of all interactions to the tablets so
+		// VEXPLAIN QUERIES/ALL can report what's being done
+		VExplainLogging()
+
+		// GetVExplainLogs retrieves the vttablet interaction logs
+		GetVExplainLogs() []ExecuteEntry
+
+		// SetCommitOrder sets the commit order for the shard session in respect of the type of vindex lookup.
+		// This is used to select the right shard session to perform the vindex lookup query.
+		SetCommitOrder(co vtgatepb.CommitOrder)
+
+		// SetQueryTimeout sets the query timeout
+		SetQueryTimeout(queryTimeout int64)
+
+		// InTransaction returns true if the session has already opened transaction or
+		// will start a transaction on the query execution.
+		InTransaction() bool
+
+		Commit(ctx context.Context) error
 	}
 
 	// Match is used to check if a Primitive matches
@@ -199,14 +244,15 @@ type (
 		RouteType() string
 		GetKeyspaceName() string
 		GetTableName() string
-		GetFields(vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error)
+		GetFields(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error)
 		NeedsTransaction() bool
 
-		TryExecute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error)
-		TryStreamExecute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error
+		TryExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error)
+		TryStreamExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error
 
-		// Inputs is a slice containing the inputs to this Primitive
-		Inputs() []Primitive
+		// Inputs is a slice containing the inputs to this Primitive.
+		// The returned map has additional information about the inputs, that is used in the description.
+		Inputs() ([]Primitive, []map[string]any)
 
 		// description is the description, sans the inputs, of this Primitive.
 		// to get the plan description with all children, use PrimitiveToPlanDescription()
@@ -221,41 +267,15 @@ type (
 
 	// txNeeded is a default implementation for Primitives that need transaction handling
 	txNeeded struct{}
-
-	// Gen4Comparer interfaces all Primitive used to compare Gen4 with other planners (V3, MySQL, ...).
-	Gen4Comparer interface {
-		Primitive
-		GetGen4Primitive() Primitive
-	}
 )
-
-// AddStats updates the plan execution statistics
-func (p *Plan) AddStats(execCount uint64, execTime time.Duration, shardQueries, rowsAffected, rowsReturned, errors uint64) {
-	atomic.AddUint64(&p.ExecCount, execCount)
-	atomic.AddUint64(&p.ExecTime, uint64(execTime))
-	atomic.AddUint64(&p.ShardQueries, shardQueries)
-	atomic.AddUint64(&p.RowsAffected, rowsAffected)
-	atomic.AddUint64(&p.RowsReturned, rowsReturned)
-	atomic.AddUint64(&p.Errors, errors)
-}
-
-// Stats returns a copy of the plan execution statistics
-func (p *Plan) Stats() (execCount uint64, execTime time.Duration, shardQueries, rowsAffected, rowsReturned, errors uint64) {
-	execCount = atomic.LoadUint64(&p.ExecCount)
-	execTime = time.Duration(atomic.LoadUint64(&p.ExecTime))
-	shardQueries = atomic.LoadUint64(&p.ShardQueries)
-	rowsAffected = atomic.LoadUint64(&p.RowsAffected)
-	rowsReturned = atomic.LoadUint64(&p.RowsReturned)
-	errors = atomic.LoadUint64(&p.Errors)
-	return
-}
 
 // Find will return the first Primitive that matches the evaluate function. If no match is found, nil will be returned
 func Find(isMatch Match, start Primitive) Primitive {
 	if isMatch(start) {
 		return start
 	}
-	for _, input := range start.Inputs() {
+	inputs, _ := start.Inputs()
+	for _, input := range inputs {
 		result := Find(isMatch, input)
 		if result != nil {
 			return result
@@ -269,41 +289,9 @@ func Exists(m Match, p Primitive) bool {
 	return Find(m, p) != nil
 }
 
-//MarshalJSON serializes the plan into a JSON representation.
-func (p *Plan) MarshalJSON() ([]byte, error) {
-	var instructions *PrimitiveDescription
-	if p.Instructions != nil {
-		description := PrimitiveToPlanDescription(p.Instructions)
-		instructions = &description
-	}
-
-	marshalPlan := struct {
-		QueryType    string
-		Original     string                `json:",omitempty"`
-		Instructions *PrimitiveDescription `json:",omitempty"`
-		ExecCount    uint64                `json:",omitempty"`
-		ExecTime     time.Duration         `json:",omitempty"`
-		ShardQueries uint64                `json:",omitempty"`
-		RowsAffected uint64                `json:",omitempty"`
-		RowsReturned uint64                `json:",omitempty"`
-		Errors       uint64                `json:",omitempty"`
-	}{
-		QueryType:    p.Type.String(),
-		Original:     p.Original,
-		Instructions: instructions,
-		ExecCount:    atomic.LoadUint64(&p.ExecCount),
-		ExecTime:     time.Duration(atomic.LoadUint64(&p.ExecTime)),
-		ShardQueries: atomic.LoadUint64(&p.ShardQueries),
-		RowsAffected: atomic.LoadUint64(&p.RowsAffected),
-		RowsReturned: atomic.LoadUint64(&p.RowsReturned),
-		Errors:       atomic.LoadUint64(&p.Errors),
-	}
-	return json.Marshal(marshalPlan)
-}
-
 // Inputs implements no inputs
-func (noInputs) Inputs() []Primitive {
-	return nil
+func (noInputs) Inputs() ([]Primitive, []map[string]any) {
+	return nil, nil
 }
 
 func (noTxNeeded) NeedsTransaction() bool {

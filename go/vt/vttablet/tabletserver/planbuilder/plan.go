@@ -20,11 +20,11 @@ import (
 	"encoding/json"
 	"strings"
 
-	"vitess.io/vitess/go/vt/vtgate/evalengine"
-
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/tableacl"
+	"vitess.io/vitess/go/vt/vtenv"
 	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/vtgate/evalengine"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/schema"
 
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
@@ -37,7 +37,7 @@ var (
 	PassthroughDMLs = false
 )
 
-//_______________________________________________
+// _______________________________________________
 
 // PlanType indicates a query plan type.
 type PlanType int
@@ -47,6 +47,7 @@ const (
 	PlanSelect PlanType = iota
 	PlanNextval
 	PlanSelectImpossible
+	PlanSelectLockFunc
 	PlanInsert
 	PlanInsertMessage
 	PlanUpdate
@@ -75,7 +76,10 @@ const (
 	PlanCallProc
 	PlanAlterMigration
 	PlanRevertMigration
+	PlanShowMigrations
 	PlanShowMigrationLogs
+	PlanShowThrottledApps
+	PlanShowThrottlerStatus
 	NumPlans
 )
 
@@ -84,6 +88,7 @@ var planName = []string{
 	"Select",
 	"Nextval",
 	"SelectImpossible",
+	"SelectLockFunc",
 	"Insert",
 	"InsertMessage",
 	"Update",
@@ -107,7 +112,10 @@ var planName = []string{
 	"CallProcedure",
 	"AlterMigration",
 	"RevertMigration",
+	"ShowMigrations",
 	"ShowMigrationLogs",
+	"ShowThrottledApps",
+	"ShowThrottlerStatus",
 }
 
 func (pt PlanType) String() string {
@@ -137,31 +145,23 @@ func PlanByNameIC(s string) (pt PlanType, ok bool) {
 	return NumPlans, false
 }
 
-// IsSelect returns true if PlanType is about a select query.
-func (pt PlanType) IsSelect() bool {
-	return pt == PlanSelect || pt == PlanSelectImpossible
-}
-
 // MarshalJSON returns a json string for PlanType.
 func (pt PlanType) MarshalJSON() ([]byte, error) {
 	return json.Marshal(pt.String())
 }
 
-//_______________________________________________
+// _______________________________________________
 
 // Plan contains the parameters for executing a request.
 type Plan struct {
 	PlanID PlanType
 	// When the query indicates a single table
 	Table *schema.Table
-	// SELECT, UPDATE, DELETE statements may list multiple tables
+	// This indicates all the tables that are accessed in the query.
 	AllTables []*schema.Table
 
 	// Permissions stores the permissions for the tables accessed in the query.
 	Permissions []Permission
-
-	// FieldQuery is used to fetch field info
-	FieldQuery *sqlparser.ParsedQuery
 
 	// FullQuery will be set for all plans.
 	FullQuery *sqlparser.ParsedQuery
@@ -175,11 +175,14 @@ type Plan struct {
 
 	// FullStmt can be used when the query does not operate on tables
 	FullStmt sqlparser.Statement
+
+	// NeedsReservedConn indicates at a reserved connection is needed to execute this plan
+	NeedsReservedConn bool
 }
 
 // TableName returns the table name for the plan.
-func (plan *Plan) TableName() sqlparser.TableIdent {
-	var tableName sqlparser.TableIdent
+func (plan *Plan) TableName() sqlparser.IdentifierCS {
+	var tableName sqlparser.IdentifierCS
 	if plan.Table != nil {
 		tableName = plan.Table.Name
 	}
@@ -199,23 +202,12 @@ func (plan *Plan) TableNames() (names []string) {
 }
 
 // Build builds a plan based on the schema.
-func Build(statement sqlparser.Statement, tables map[string]*schema.Table, isReservedConn bool, dbName string) (plan *Plan, err error) {
-	if !isReservedConn {
-		err = checkForPoolingUnsafeConstructs(statement)
-		if err != nil {
-			return nil, err
-		}
-	}
-
+func Build(env *vtenv.Environment, statement sqlparser.Statement, tables map[string]*schema.Table, dbName string, viewsEnabled bool) (plan *Plan, err error) {
 	switch stmt := statement.(type) {
 	case *sqlparser.Union:
-		plan, err = &Plan{
-			PlanID:     PlanSelect,
-			FieldQuery: GenerateFieldQuery(stmt),
-			FullQuery:  GenerateLimitQuery(stmt),
-		}, nil
+		plan = &Plan{PlanID: PlanSelect, FullQuery: GenerateLimitQuery(stmt)}
 	case *sqlparser.Select:
-		plan, err = analyzeSelect(stmt, tables)
+		plan, err = analyzeSelect(env, stmt, tables)
 	case *sqlparser.Insert:
 		plan, err = analyzeInsert(stmt, tables)
 	case *sqlparser.Update:
@@ -223,65 +215,52 @@ func Build(statement sqlparser.Statement, tables map[string]*schema.Table, isRes
 	case *sqlparser.Delete:
 		plan, err = analyzeDelete(stmt, tables)
 	case *sqlparser.Set:
-		plan, err = analyzeSet(stmt), nil
+		plan = analyzeSet(stmt)
 	case sqlparser.DDLStatement:
-		// DDLs and some other statements below don't get fully parsed.
-		// We have to use the original query at the time of execution.
-		// We are in the process of changing this
-		var fullQuery *sqlparser.ParsedQuery
-		// If the query is fully parsed, then use the ast and store the fullQuery
-		if stmt.IsFullyParsed() {
-			fullQuery = GenerateFullQuery(stmt)
-		}
-		plan = &Plan{PlanID: PlanDDL, FullQuery: fullQuery, FullStmt: stmt}
+		plan, err = analyzeDDL(stmt)
 	case *sqlparser.AlterMigration:
-		plan, err = &Plan{PlanID: PlanAlterMigration, FullStmt: stmt}, nil
+		plan = &Plan{PlanID: PlanAlterMigration, FullStmt: stmt}
 	case *sqlparser.RevertMigration:
-		plan, err = &Plan{PlanID: PlanRevertMigration, FullStmt: stmt}, nil
+		plan = &Plan{PlanID: PlanRevertMigration, FullStmt: stmt}
 	case *sqlparser.ShowMigrationLogs:
-		plan, err = &Plan{PlanID: PlanShowMigrationLogs, FullStmt: stmt}, nil
+		plan = &Plan{PlanID: PlanShowMigrationLogs, FullStmt: stmt}
+	case *sqlparser.ShowThrottledApps:
+		plan = &Plan{PlanID: PlanShowThrottledApps, FullStmt: stmt}
+	case *sqlparser.ShowThrottlerStatus:
+		plan = &Plan{PlanID: PlanShowThrottlerStatus, FullStmt: stmt}
 	case *sqlparser.Show:
 		plan, err = analyzeShow(stmt, dbName)
-	case *sqlparser.OtherRead, sqlparser.Explain:
-		plan, err = &Plan{PlanID: PlanOtherRead}, nil
+	case *sqlparser.Analyze, sqlparser.Explain:
+		plan = &Plan{PlanID: PlanOtherRead}
 	case *sqlparser.OtherAdmin:
-		plan, err = &Plan{PlanID: PlanOtherAdmin}, nil
+		plan = &Plan{PlanID: PlanOtherAdmin}
 	case *sqlparser.Savepoint:
-		plan, err = &Plan{PlanID: PlanSavepoint}, nil
+		plan = &Plan{PlanID: PlanSavepoint, FullStmt: stmt}
 	case *sqlparser.Release:
-		plan, err = &Plan{PlanID: PlanRelease}, nil
+		plan = &Plan{PlanID: PlanRelease}
 	case *sqlparser.SRollback:
-		plan, err = &Plan{PlanID: PlanSRollback}, nil
+		plan = &Plan{PlanID: PlanSRollback, FullStmt: stmt}
 	case *sqlparser.Load:
-		plan, err = &Plan{PlanID: PlanLoad}, nil
+		plan = &Plan{PlanID: PlanLoad}
 	case *sqlparser.Flush:
-		plan, err = &Plan{PlanID: PlanFlush, FullQuery: GenerateFullQuery(stmt)}, nil
+		plan, err = analyzeFlush(stmt, tables)
+	case *sqlparser.UnlockTables:
+		plan = &Plan{PlanID: PlanUnlockTables}
 	case *sqlparser.CallProc:
-		plan, err = &Plan{PlanID: PlanCallProc, FullQuery: GenerateFullQuery(stmt)}, nil
+		plan = &Plan{PlanID: PlanCallProc, FullQuery: GenerateFullQuery(stmt)}
 	default:
 		return nil, vterrors.New(vtrpcpb.Code_INVALID_ARGUMENT, "invalid SQL")
 	}
 	if err != nil {
 		return nil, err
 	}
+	plan.AllTables = lookupAllTables(statement, tables)
 	plan.Permissions = BuildPermissions(statement)
 	return plan, nil
 }
 
 // BuildStreaming builds a streaming plan based on the schema.
-func BuildStreaming(sql string, tables map[string]*schema.Table, isReservedConn bool) (*Plan, error) {
-	statement, err := sqlparser.Parse(sql)
-	if err != nil {
-		return nil, err
-	}
-
-	if !isReservedConn {
-		err = checkForPoolingUnsafeConstructs(statement)
-		if err != nil {
-			return nil, err
-		}
-	}
-
+func BuildStreaming(statement sqlparser.Statement, tables map[string]*schema.Table) (*Plan, error) {
 	plan := &Plan{
 		PlanID:      PlanSelectStream,
 		FullQuery:   GenerateFullQuery(statement),
@@ -290,16 +269,17 @@ func BuildStreaming(sql string, tables map[string]*schema.Table, isReservedConn 
 
 	switch stmt := statement.(type) {
 	case *sqlparser.Select:
-		if stmt.Lock != sqlparser.NoLock {
-			return nil, vterrors.New(vtrpcpb.Code_FAILED_PRECONDITION, "select with lock not allowed for streaming")
+		if hasLockFunc(stmt) {
+			plan.NeedsReservedConn = true
 		}
-		plan.Table, plan.AllTables = lookupTables(stmt.From, tables)
-	case *sqlparser.OtherRead, *sqlparser.Show, *sqlparser.Union, *sqlparser.CallProc, sqlparser.Explain:
-		// pass
+		plan.Table = lookupTables(stmt.From, tables)
+	case *sqlparser.Show, *sqlparser.Union, *sqlparser.CallProc, sqlparser.Explain:
+	case *sqlparser.Analyze:
+		plan.PlanID = PlanOtherRead
 	default:
-		return nil, vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "'%v' not allowed for streaming", sqlparser.String(stmt))
+		return nil, vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "%s not allowed for streaming", sqlparser.ASTToStatementType(statement))
 	}
-
+	plan.AllTables = lookupAllTables(statement, tables)
 	return plan, nil
 }
 
@@ -322,27 +302,49 @@ func BuildMessageStreaming(name string, tables map[string]*schema.Table) (*Plan,
 	return plan, nil
 }
 
-// checkForPoolingUnsafeConstructs returns an error if the SQL expression contains
-// a call to GET_LOCK(), which is unsafe with server-side connection pooling.
-// For more background, see https://github.com/vitessio/vitess/issues/3631.
-func checkForPoolingUnsafeConstructs(expr sqlparser.SQLNode) error {
-
-	genError := func(node sqlparser.SQLNode) error {
-		return vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "%s not allowed without a reserved connections", sqlparser.String(node))
-	}
-
-	return sqlparser.Walk(func(in sqlparser.SQLNode) (kontinue bool, err error) {
-		switch node := in.(type) {
-		case *sqlparser.Set:
-			return false, genError(node)
-		case *sqlparser.FuncExpr:
-			if sqlparser.IsLockingFunc(node) {
-				return false, genError(node)
-			}
+// hasLockFunc looks for get_lock function in the select query.
+// If it is present then it returns true otherwise false
+func hasLockFunc(sel *sqlparser.Select) bool {
+	var found bool
+	_ = sqlparser.Walk(func(in sqlparser.SQLNode) (bool, error) {
+		lFunc, isLFunc := in.(*sqlparser.LockingFunc)
+		if !isLFunc {
+			return true, nil
 		}
-
-		// TODO: This could be smarter about not walking down parts of the AST that can't contain
-		// function calls.
+		if lFunc.Type == sqlparser.GetLock {
+			found = true
+			return false, nil
+		}
 		return true, nil
-	}, expr)
+	}, sel.SelectExprs)
+	return found
+}
+
+// BuildSettingQuery builds a query for system settings.
+func BuildSettingQuery(settings []string, parser *sqlparser.Parser) (query string, resetQuery string, err error) {
+	if len(settings) == 0 {
+		return "", "", vterrors.Errorf(vtrpcpb.Code_INTERNAL, "[BUG]: plan called for empty system settings")
+	}
+	var setExprs sqlparser.SetExprs
+	var resetSetExprs sqlparser.SetExprs
+	lDefault := sqlparser.NewStrLiteral("default")
+	for _, setting := range settings {
+		stmt, err := parser.Parse(setting)
+		if err != nil {
+			return "", "", vterrors.Wrapf(err, "[BUG]: failed to parse system setting: %s", setting)
+		}
+		set, ok := stmt.(*sqlparser.Set)
+		if !ok {
+			return "", "", vterrors.Errorf(vtrpcpb.Code_INTERNAL, "[BUG]: invalid set statement: %s", setting)
+		}
+		setExprs = append(setExprs, set.Exprs...)
+		for _, sExpr := range set.Exprs {
+			sysVar := sExpr.Var
+			if sysVar.Scope != sqlparser.SessionScope {
+				return "", "", vterrors.Errorf(vtrpcpb.Code_INTERNAL, "[BUG]: session scope expected, got: %s", sysVar.Scope.ToString())
+			}
+			resetSetExprs = append(resetSetExprs, &sqlparser.SetExpr{Var: sysVar, Expr: lDefault})
+		}
+	}
+	return sqlparser.String(&sqlparser.Set{Exprs: setExprs}), sqlparser.String(&sqlparser.Set{Exprs: resetSetExprs}), nil
 }

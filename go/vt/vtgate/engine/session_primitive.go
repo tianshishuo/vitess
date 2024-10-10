@@ -17,20 +17,21 @@ limitations under the License.
 package engine
 
 import (
+	"context"
+
 	"vitess.io/vitess/go/sqltypes"
 	querypb "vitess.io/vitess/go/vt/proto/query"
-	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/vterrors"
 )
 
 // SessionPrimitive the session primitive is a very small primitive used
 // when we have simple engine code that needs to interact with the Session
 type SessionPrimitive struct {
-	action func(sa SessionActions) (*sqltypes.Result, error)
-	name   string
-
 	noInputs
 	noTxNeeded
+
+	action func(sa SessionActions) (*sqltypes.Result, error)
+	name   string
 }
 
 var _ Primitive = (*SessionPrimitive)(nil)
@@ -59,12 +60,12 @@ func (s *SessionPrimitive) GetTableName() string {
 }
 
 // TryExecute implements the Primitive interface
-func (s *SessionPrimitive) TryExecute(vcursor VCursor, _ map[string]*querypb.BindVariable, _ bool) (*sqltypes.Result, error) {
+func (s *SessionPrimitive) TryExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
 	return s.action(vcursor.Session())
 }
 
 // TryStreamExecute implements the Primitive interface
-func (s *SessionPrimitive) TryStreamExecute(vcursor VCursor, _ map[string]*querypb.BindVariable, _ bool, callback func(*sqltypes.Result) error) error {
+func (s *SessionPrimitive) TryStreamExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
 	qr, err := s.action(vcursor.Session())
 	if err != nil {
 		return err
@@ -73,8 +74,8 @@ func (s *SessionPrimitive) TryStreamExecute(vcursor VCursor, _ map[string]*query
 }
 
 // GetFields implements the Primitive interface
-func (s *SessionPrimitive) GetFields(_ VCursor, _ map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
-	return nil, vterrors.New(vtrpcpb.Code_INTERNAL, "not supported for this primitive")
+func (s *SessionPrimitive) GetFields(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
+	return nil, vterrors.VT13001("GetFields is not supported for SessionPrimitive")
 }
 
 // description implements the Primitive interface

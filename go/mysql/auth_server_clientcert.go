@@ -17,14 +17,13 @@ limitations under the License.
 package mysql
 
 import (
-	"flag"
 	"fmt"
 	"net"
 
+	"github.com/spf13/pflag"
+
 	"vitess.io/vitess/go/vt/log"
 )
-
-var clientcertAuthMethod = flag.String("mysql_clientcert_auth_method", string(MysqlClearPassword), "client-side authentication method to use. Supported values: mysql_clear_password, dialog.")
 
 // AuthServerClientCert implements AuthServer which enforces client side certificates
 type AuthServerClientCert struct {
@@ -33,26 +32,26 @@ type AuthServerClientCert struct {
 }
 
 // InitAuthServerClientCert is public so it can be called from plugin_auth_clientcert.go (go/cmd/vtgate)
-func InitAuthServerClientCert() {
-	if flag.CommandLine.Lookup("mysql_server_ssl_ca").Value.String() == "" {
+func InitAuthServerClientCert(clientcertAuthMethod string) {
+	if pflag.CommandLine.Lookup("mysql_server_ssl_ca").Value.String() == "" {
 		log.Info("Not configuring AuthServerClientCert because mysql_server_ssl_ca is empty")
 		return
 	}
-	if *clientcertAuthMethod != string(MysqlClearPassword) && *clientcertAuthMethod != string(MysqlDialog) {
+	if clientcertAuthMethod != string(MysqlClearPassword) && clientcertAuthMethod != string(MysqlDialog) {
 		log.Exitf("Invalid mysql_clientcert_auth_method value: only support mysql_clear_password or dialog")
 	}
 
-	ascc := newAuthServerClientCert()
+	ascc := newAuthServerClientCert(clientcertAuthMethod)
 	RegisterAuthServer("clientcert", ascc)
 }
 
-func newAuthServerClientCert() *AuthServerClientCert {
+func newAuthServerClientCert(clientcertAuthMethod string) *AuthServerClientCert {
 	ascc := &AuthServerClientCert{
-		Method: AuthMethodDescription(*clientcertAuthMethod),
+		Method: AuthMethodDescription(clientcertAuthMethod),
 	}
 
 	var authMethod AuthMethod
-	switch AuthMethodDescription(*clientcertAuthMethod) {
+	switch AuthMethodDescription(clientcertAuthMethod) {
 	case MysqlClearPassword:
 		authMethod = NewMysqlClearAuthMethod(ascc, ascc)
 	case MysqlDialog:

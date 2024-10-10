@@ -20,12 +20,12 @@
 
 source build.env
 
-set -xe
+set -xeo pipefail
 
 cd "$VTROOT/examples/region_sharding"
 unset VTROOT # ensure that the examples can run without VTROOT now.
 
-source ./env.sh # Required so that "mysql" works from alias
+source ../common/env.sh # Required so that "mysql" works from alias
 
 ./101_initial_cluster.sh
 
@@ -43,7 +43,12 @@ mysql --table < show_initial_data.sql
 # reshard
 ./203_reshard.sh
 
+sleep 5 # Give reshard time to finish copying
+
 # SwitchReads
+
+sleep 5 # wait for workflow to run
+
 ./204_switch_reads.sh
 
 # SwitchWrites

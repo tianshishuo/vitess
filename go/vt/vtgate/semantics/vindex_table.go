@@ -67,16 +67,25 @@ func (v *VindexTable) Name() (sqlparser.TableName, error) {
 }
 
 // GetExpr implements the TableInfo interface
-func (v *VindexTable) getExpr() *sqlparser.AliasedTableExpr {
-	return v.Table.getExpr()
+func (v *VindexTable) GetAliasedTableExpr() *sqlparser.AliasedTableExpr {
+	return v.Table.GetAliasedTableExpr()
+}
+
+func (v *VindexTable) canShortCut() shortCut {
+	return cannotShortCut
 }
 
 // GetColumns implements the TableInfo interface
-func (v *VindexTable) getColumns() []ColumnInfo {
-	return v.Table.getColumns()
+func (v *VindexTable) getColumns(ignoreInvisbleCol bool) []ColumnInfo {
+	return v.Table.getColumns(ignoreInvisbleCol)
 }
 
 // IsInfSchema implements the TableInfo interface
 func (v *VindexTable) IsInfSchema() bool {
 	return v.Table.IsInfSchema()
+}
+
+// GetMirrorRule implements TableInfo.
+func (v *VindexTable) GetMirrorRule() *vindexes.MirrorRule {
+	return nil
 }

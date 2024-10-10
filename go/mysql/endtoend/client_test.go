@@ -25,6 +25,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
+	"vitess.io/vitess/go/mysql/sqlerror"
+
 	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/mysql"
@@ -73,9 +75,9 @@ func TestKill(t *testing.T) {
 	// will differ.
 	err = <-errChan
 	if strings.Contains(err.Error(), "EOF") {
-		assertSQLError(t, err, mysql.CRServerLost, mysql.SSUnknownSQLState, "EOF", "select sleep(10) from dual")
+		assertSQLError(t, err, sqlerror.CRServerLost, sqlerror.SSUnknownSQLState, "EOF", "select sleep(10) from dual")
 	} else {
-		assertSQLError(t, err, mysql.CRServerLost, mysql.SSUnknownSQLState, "", "connection reset by peer")
+		assertSQLError(t, err, sqlerror.CRServerLost, sqlerror.SSUnknownSQLState, "", "connection reset by peer")
 	}
 }
 
@@ -104,7 +106,7 @@ func TestKill2006(t *testing.T) {
 	// unix socket, we will get a broken pipe when the server
 	// closes the connection and we are trying to write the command.
 	_, err = conn.ExecuteFetch("select sleep(10) from dual", 1000, false)
-	assertSQLError(t, err, mysql.CRServerGone, mysql.SSUnknownSQLState, "broken pipe", "select sleep(10) from dual")
+	assertSQLError(t, err, sqlerror.CRServerGone, sqlerror.SSUnknownSQLState, "broken pipe", "select sleep(10) from dual")
 }
 
 // TestDupEntry tests a duplicate key is properly raised.
@@ -123,7 +125,7 @@ func TestDupEntry(t *testing.T) {
 		t.Fatalf("first insert failed: %v", err)
 	}
 	_, err = conn.ExecuteFetch("insert into dup_entry(id, name) values(2, 10)", 0, false)
-	assertSQLError(t, err, mysql.ERDupEntry, mysql.SSConstraintViolation, "Duplicate entry", "insert into dup_entry(id, name) values(2, 10)")
+	assertSQLError(t, err, sqlerror.ERDupEntry, sqlerror.SSConstraintViolation, "Duplicate entry", "insert into dup_entry(id, name) values(2, 10)")
 }
 
 // TestClientFoundRows tests if the CLIENT_FOUND_ROWS flag works.
@@ -202,13 +204,17 @@ func doTestMultiResult(t *testing.T, disableClientDeprecateEOF bool) {
 	require.NoError(t, err)
 	assert.Zero(t, result.RowsAffected, "create table RowsAffected ")
 
-	for i := 0; i < 255; i++ {
+	for i := range 255 {
 		result, err := conn.ExecuteFetch(fmt.Sprintf("insert into a(id, name) values(%v, 'nice name %v')", 1000+i, i), 1000, true)
 		require.NoError(t, err)
 		assert.EqualValues(t, 1, result.RowsAffected, "insert into returned RowsAffected")
 	}
 
-	qr, more, err = conn.ExecuteFetchMulti("update a set name = concat(name, ' updated'); select * from a; select count(*) from a", 300, true)
+	// Verify that a ExecuteFetchMultiDrain leaves the connection/packet in valid state.
+	err = conn.ExecuteFetchMultiDrain("update a set name = concat(name, ', multi drain 1'); select * from a; select count(*) from a")
+	expectNoError(t, err)
+	// If the previous command leaves packet in invalid state, this will fail.
+	qr, more, err = conn.ExecuteFetchMulti("update a set name = concat(name, ', fetch multi'); select * from a; select count(*) from a", 300, true)
 	expectNoError(t, err)
 	expectFlag(t, "ExecuteMultiFetch(multi result)", more, true)
 	assert.EqualValues(t, 255, qr.RowsAffected)
@@ -222,6 +228,13 @@ func doTestMultiResult(t *testing.T, disableClientDeprecateEOF bool) {
 	expectNoError(t, err)
 	expectFlag(t, "ReadQueryResult(2)", more, false)
 	assert.EqualValues(t, 1, len(qr.Rows), "ReadQueryResult(1)")
+
+	// Verify that a ExecuteFetchMultiDrain is happy to operate again after all the above.
+	err = conn.ExecuteFetchMultiDrain("update a set name = concat(name, ', multi drain 2'); select * from a; select count(*) from a")
+	expectNoError(t, err)
+
+	err = conn.ExecuteFetchMultiDrain("update b set name = concat(name, ' nonexistent table'); select * from a; select count(*) from a")
+	require.Error(t, err)
 
 	_, err = conn.ExecuteFetch("drop table a", 10, true)
 	require.NoError(t, err)
@@ -243,10 +256,8 @@ func expectNoError(t *testing.T, err error) {
 
 func expectFlag(t *testing.T, msg string, flag, want bool) {
 	t.Helper()
-	if flag != want {
-		// We cannot continue the test if flag is incorrect.
-		t.Fatalf("%s: %v, want: %v", msg, flag, want)
-	}
+	require.Equal(t, want, flag, "%s: %v, want: %v", msg, flag, want)
+
 }
 
 // TestTLS tests our client can connect via SSL.
@@ -256,12 +267,8 @@ func TestTLS(t *testing.T) {
 
 	// First make sure the official 'mysql' client can connect.
 	output, ok := runMysql(t, &params, "status")
-	if !ok {
-		t.Fatalf("'mysql -e status' failed: %v", output)
-	}
-	if !strings.Contains(output, "Cipher in use is") {
-		t.Fatalf("cannot connect via SSL: %v", output)
-	}
+	require.True(t, ok, "'mysql -e status' failed: %v", output)
+	require.True(t, strings.Contains(output, "Cipher in use is"), "cannot connect via SSL: %v", output)
 
 	// Now connect with our client.
 	ctx := context.Background()
@@ -272,9 +279,8 @@ func TestTLS(t *testing.T) {
 	defer conn.Close()
 
 	result, err := conn.ExecuteFetch("SHOW STATUS LIKE 'Ssl_cipher'", 10, true)
-	if err != nil {
-		t.Fatalf("SHOW STATUS LIKE 'Ssl_cipher' failed: %v", err)
-	}
+	require.NoError(t, err, "SHOW STATUS LIKE 'Ssl_cipher' failed: %v", err)
+
 	if len(result.Rows) != 1 || result.Rows[0][0].ToString() != "Ssl_cipher" ||
 		result.Rows[0][1].ToString() == "" {
 		t.Fatalf("SHOW STATUS LIKE 'Ssl_cipher' returned unexpected result: %v", result)
@@ -291,9 +297,8 @@ func TestReplicationStatus(t *testing.T) {
 	defer conn.Close()
 
 	status, err := conn.ShowReplicationStatus()
-	if err != mysql.ErrNotReplica {
-		t.Errorf("Got unexpected result for ShowReplicationStatus: %v %v", status, err)
-	}
+	assert.Equal(t, mysql.ErrNotReplica, err, "Got unexpected result for ShowReplicationStatus: %v %v", status, err)
+
 }
 
 func TestSessionTrackGTIDs(t *testing.T) {
@@ -326,9 +331,7 @@ func TestCachingSha2Password(t *testing.T) {
 	defer conn.Close()
 
 	qr, err := conn.ExecuteFetch(`select true from information_schema.PLUGINS where PLUGIN_NAME='caching_sha2_password' and PLUGIN_STATUS='ACTIVE'`, 1, false)
-	if err != nil {
-		t.Errorf("select true from information_schema.PLUGINS failed: %v", err)
-	}
+	assert.NoError(t, err, "select true from information_schema.PLUGINS failed: %v", err)
 
 	if len(qr.Rows) != 1 {
 		t.Skip("Server does not support caching_sha2_password plugin")
@@ -361,19 +364,44 @@ func TestClientInfo(t *testing.T) {
 	const infoPrepared = "Statement prepared"
 
 	ctx := context.Background()
-	conn, err := mysql.Connect(ctx, &connParams)
+	params := connParams
+	params.EnableQueryInfo = true
+	conn, err := mysql.Connect(ctx, &params)
 	require.NoError(t, err)
 
 	defer conn.Close()
 
-	conn.ReturnQueryInfo = true
-
 	// This is the simplest query that would return some textual data in the 'info' field
 	result, err := conn.ExecuteFetch(`PREPARE stmt1 FROM 'SELECT 1 = 1'`, -1, true)
-	if err != nil {
-		t.Fatalf("select failed: %v", err)
-	}
-	if result.Info != infoPrepared {
-		t.Fatalf("expected result.Info=%q, got=%q", infoPrepared, result.Info)
-	}
+	require.NoError(t, err, "select failed: %v", err)
+	require.Equal(t, infoPrepared, result.Info, "expected result.Info=%q, got=%q", infoPrepared, result.Info)
+}
+
+func TestBaseShowTables(t *testing.T) {
+	params := connParams
+	ctx := context.Background()
+	conn, err := mysql.Connect(ctx, &params)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	sql := conn.BaseShowTables()
+	// An improved test would make assertions about the results. This test just
+	// makes sure there aren't any errors.
+	_, err = conn.ExecuteFetch(sql, -1, true)
+	require.NoError(t, err)
+}
+
+func TestBaseShowTablesFilePos(t *testing.T) {
+	params := connParams
+	params.Flavor = "FilePos"
+	ctx := context.Background()
+	conn, err := mysql.Connect(ctx, &params)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	sql := conn.BaseShowTables()
+	// An improved test would make assertions about the results. This test just
+	// makes sure there aren't any errors.
+	_, err = conn.ExecuteFetch(sql, -1, true)
+	require.NoError(t, err)
 }

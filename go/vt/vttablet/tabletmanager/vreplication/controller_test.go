@@ -23,60 +23,90 @@ import (
 	"testing"
 	"time"
 
+	vttablet "vitess.io/vitess/go/vt/vttablet/common"
+
 	"vitess.io/vitess/go/sqltypes"
-	"vitess.io/vitess/go/sync2"
 	"vitess.io/vitess/go/vt/binlog/binlogplayer"
-	"vitess.io/vitess/go/vt/mysqlctl/fakemysqldaemon"
+	"vitess.io/vitess/go/vt/discovery"
+	"vitess.io/vitess/go/vt/mysqlctl"
 	"vitess.io/vitess/go/vt/mysqlctl/tmutils"
 
+	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
+	querypb "vitess.io/vitess/go/vt/proto/query"
 	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 var (
 	testSettingsResponse = &sqltypes.Result{
-		Fields:   nil,
+		Fields: []*querypb.Field{
+			{Name: "pos", Type: sqltypes.VarBinary},
+			{Name: "stop_pos", Type: sqltypes.VarBinary},
+			{Name: "max_tps", Type: sqltypes.Int64},
+			{Name: "max_replication_lag", Type: sqltypes.Int64},
+			{Name: "state", Type: sqltypes.VarBinary},
+			{Name: "workflow_type", Type: sqltypes.Int64},
+			{Name: "workflow", Type: sqltypes.VarChar},
+			{Name: "workflow_sub_type", Type: sqltypes.Int64},
+			{Name: "defer_secondary_keys", Type: sqltypes.Int64},
+		},
 		InsertID: 0,
 		Rows: [][]sqltypes.Value{
 			{
 				sqltypes.NewVarBinary("MariaDB/0-1-1083"), // pos
-				sqltypes.NULL, // stop_pos
-				sqltypes.NewVarBinary("9223372036854775807"), // max_tps
-				sqltypes.NewVarBinary("9223372036854775807"), // max_replication_lag
-				sqltypes.NewVarBinary("Running"),             // state
+				sqltypes.NULL,                          // stop_pos
+				sqltypes.NewInt64(9223372036854775807), // max_tps
+				sqltypes.NewInt64(9223372036854775807), // max_replication_lag
+				sqltypes.NewVarBinary(binlogdatapb.VReplicationWorkflowState_Running.String()), // state
+				sqltypes.NewInt64(1),      // workflow_type
+				sqltypes.NewVarChar("wf"), // workflow
+				sqltypes.NewInt64(0),      // workflow_sub_type
+				sqltypes.NewInt64(0),      // defer_secondary_keys
 			},
 		},
 	}
-	testSelectorResponse1 = &sqltypes.Result{Rows: [][]sqltypes.Value{{sqltypes.NewInt64(1)}}}
-	testSelectorResponse2 = &sqltypes.Result{Rows: [][]sqltypes.Value{{sqltypes.NewInt64(1)}, {sqltypes.NewInt64(2)}}}
-	testDMLResponse       = &sqltypes.Result{RowsAffected: 1}
-	testPos               = "MariaDB/0-1-1083"
+	testSelectorResponse1      = &sqltypes.Result{Rows: [][]sqltypes.Value{{sqltypes.NewInt64(1)}}}
+	testSelectorResponse2      = &sqltypes.Result{Rows: [][]sqltypes.Value{{sqltypes.NewInt64(1)}, {sqltypes.NewInt64(2)}}}
+	testDMLResponse            = &sqltypes.Result{RowsAffected: 1}
+	testPos                    = "MariaDB/0-1-1083"
+	defaultTabletPickerOptions = discovery.TabletPickerOptions{}
 )
+
+func setTabletTypesStr(tabletTypesStr string) func() {
+	oldTabletTypesStr := vttablet.DefaultVReplicationConfig.TabletTypesStr
+	vttablet.DefaultVReplicationConfig.TabletTypesStr = tabletTypesStr
+	return func() {
+		vttablet.DefaultVReplicationConfig.TabletTypesStr = oldTabletTypesStr
+	}
+}
 
 func TestControllerKeyRange(t *testing.T) {
 	resetBinlogClient()
 	wantTablet := addTablet(100)
 	defer deleteTablet(wantTablet)
 	params := map[string]string{
-		"id":     "1",
-		"state":  binlogplayer.BlpRunning,
-		"source": fmt.Sprintf(`keyspace:"%s" shard:"0" key_range:{end:"\x80"}`, env.KeyspaceName),
+		"id":      "1",
+		"state":   binlogdatapb.VReplicationWorkflowState_Running.String(),
+		"source":  fmt.Sprintf(`keyspace:"%s" shard:"0" key_range:{end:"\x80"}`, env.KeyspaceName),
+		"options": "{}",
 	}
 
 	dbClient := binlogplayer.NewMockDBClient(t)
-	dbClient.ExpectRequest(changeMasterToPrimary, testDMLResponse, nil)
 	dbClient.ExpectRequestRE("update _vt.vreplication set message='Picked source tablet.*", testDMLResponse, nil)
 	dbClient.ExpectRequest("update _vt.vreplication set state='Running', message='' where id=1", testDMLResponse, nil)
-	dbClient.ExpectRequest("select pos, stop_pos, max_tps, max_replication_lag, state from _vt.vreplication where id=1", testSettingsResponse, nil)
+	dbClient.ExpectRequest(binlogplayer.TestGetWorkflowQueryId1, testSettingsResponse, nil)
 	dbClient.ExpectRequest("begin", nil, nil)
 	dbClient.ExpectRequest("insert into t values(1)", testDMLResponse, nil)
 	dbClient.ExpectRequestRE("update _vt.vreplication set pos='MariaDB/0-1-1235', time_updated=.*", testDMLResponse, nil)
 	dbClient.ExpectRequest("commit", nil, nil)
 
 	dbClientFactory := func() binlogplayer.DBClient { return dbClient }
-	mysqld := &fakemysqldaemon.FakeMysqlDaemon{MysqlPort: sync2.NewAtomicInt32(3306)}
+	mysqld := &mysqlctl.FakeMysqlDaemon{}
+	mysqld.MysqlPort.Store(3306)
+	vre := NewTestEngine(nil, wantTablet.GetAlias().Cell, mysqld, dbClientFactory, dbClientFactory, dbClient.DBName(), nil)
 
-	ct, err := newController(context.Background(), params, dbClientFactory, mysqld, env.TopoServ, env.Cells[0], "replica", nil, nil)
+	defer setTabletTypesStr("replica")()
+	ct, err := newController(context.Background(), params, dbClientFactory, mysqld, env.TopoServ, env.Cells[0], nil, vre, defaultTabletPickerOptions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,24 +125,23 @@ func TestControllerTables(t *testing.T) {
 	resetBinlogClient()
 
 	params := map[string]string{
-		"id":     "1",
-		"state":  binlogplayer.BlpRunning,
-		"source": fmt.Sprintf(`keyspace:"%s" shard:"0" tables:"table1" tables:"/funtables_/" `, env.KeyspaceName),
+		"id":      "1",
+		"state":   binlogdatapb.VReplicationWorkflowState_Running.String(),
+		"source":  fmt.Sprintf(`keyspace:"%s" shard:"0" tables:"table1" tables:"/funtables_/" `, env.KeyspaceName),
+		"options": "{}",
 	}
 
 	dbClient := binlogplayer.NewMockDBClient(t)
-	dbClient.ExpectRequest(changeMasterToPrimary, testDMLResponse, nil)
 	dbClient.ExpectRequestRE("update _vt.vreplication set message='Picked source tablet.*", testDMLResponse, nil)
 	dbClient.ExpectRequest("update _vt.vreplication set state='Running', message='' where id=1", testDMLResponse, nil)
-	dbClient.ExpectRequest("select pos, stop_pos, max_tps, max_replication_lag, state from _vt.vreplication where id=1", testSettingsResponse, nil)
+	dbClient.ExpectRequest(binlogplayer.TestGetWorkflowQueryId1, testSettingsResponse, nil)
 	dbClient.ExpectRequest("begin", nil, nil)
 	dbClient.ExpectRequest("insert into t values(1)", testDMLResponse, nil)
 	dbClient.ExpectRequestRE("update _vt.vreplication set pos='MariaDB/0-1-1235', time_updated=.*", testDMLResponse, nil)
 	dbClient.ExpectRequest("commit", nil, nil)
 
 	dbClientFactory := func() binlogplayer.DBClient { return dbClient }
-	mysqld := &fakemysqldaemon.FakeMysqlDaemon{
-		MysqlPort: sync2.NewAtomicInt32(3306),
+	mysqld := &mysqlctl.FakeMysqlDaemon{
 		Schema: &tabletmanagerdatapb.SchemaDefinition{
 			DatabaseSchema: "",
 			TableDefinitions: []*tabletmanagerdatapb.TableDefinition{
@@ -137,8 +166,10 @@ func TestControllerTables(t *testing.T) {
 			},
 		},
 	}
-
-	ct, err := newController(context.Background(), params, dbClientFactory, mysqld, env.TopoServ, env.Cells[0], "replica", nil, nil)
+	mysqld.MysqlPort.Store(3306)
+	vre := NewTestEngine(nil, wantTablet.GetAlias().Cell, mysqld, dbClientFactory, dbClientFactory, dbClient.DBName(), nil)
+	defer setTabletTypesStr("replica")()
+	ct, err := newController(context.Background(), params, dbClientFactory, mysqld, env.TopoServ, env.Cells[0], nil, vre, defaultTabletPickerOptions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,10 +184,11 @@ func TestControllerTables(t *testing.T) {
 
 func TestControllerBadID(t *testing.T) {
 	params := map[string]string{
-		"id": "bad",
+		"id":      "bad",
+		"options": "{}",
 	}
-	_, err := newController(context.Background(), params, nil, nil, nil, "", "", nil, nil)
-	want := `strconv.Atoi: parsing "bad": invalid syntax`
+	_, err := newController(context.Background(), params, nil, nil, nil, "", nil, nil, defaultTabletPickerOptions)
+	want := `strconv.ParseInt: parsing "bad": invalid syntax`
 	if err == nil || err.Error() != want {
 		t.Errorf("newController err: %v, want %v", err, want)
 	}
@@ -164,11 +196,12 @@ func TestControllerBadID(t *testing.T) {
 
 func TestControllerStopped(t *testing.T) {
 	params := map[string]string{
-		"id":    "1",
-		"state": binlogplayer.BlpStopped,
+		"id":      "1",
+		"state":   binlogdatapb.VReplicationWorkflowState_Stopped.String(),
+		"options": "{}",
 	}
 
-	ct, err := newController(context.Background(), params, nil, nil, nil, "", "", nil, nil)
+	ct, err := newController(context.Background(), params, nil, nil, nil, "", nil, nil, defaultTabletPickerOptions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,26 +221,29 @@ func TestControllerOverrides(t *testing.T) {
 
 	params := map[string]string{
 		"id":           "1",
-		"state":        binlogplayer.BlpRunning,
+		"state":        binlogdatapb.VReplicationWorkflowState_Running.String(),
 		"source":       fmt.Sprintf(`keyspace:"%s" shard:"0" key_range:{end:"\x80"}`, env.KeyspaceName),
 		"cell":         env.Cells[0],
 		"tablet_types": "replica",
+		"options":      "{}",
 	}
 
 	dbClient := binlogplayer.NewMockDBClient(t)
-	dbClient.ExpectRequest(changeMasterToPrimary, testDMLResponse, nil)
 	dbClient.ExpectRequestRE("update _vt.vreplication set message='Picked source tablet.*", testDMLResponse, nil)
 	dbClient.ExpectRequest("update _vt.vreplication set state='Running', message='' where id=1", testDMLResponse, nil)
-	dbClient.ExpectRequest("select pos, stop_pos, max_tps, max_replication_lag, state from _vt.vreplication where id=1", testSettingsResponse, nil)
+	dbClient.ExpectRequest(binlogplayer.TestGetWorkflowQueryId1, testSettingsResponse, nil)
 	dbClient.ExpectRequest("begin", nil, nil)
 	dbClient.ExpectRequest("insert into t values(1)", testDMLResponse, nil)
 	dbClient.ExpectRequestRE("update _vt.vreplication set pos='MariaDB/0-1-1235', time_updated=.*", testDMLResponse, nil)
 	dbClient.ExpectRequest("commit", nil, nil)
 
 	dbClientFactory := func() binlogplayer.DBClient { return dbClient }
-	mysqld := &fakemysqldaemon.FakeMysqlDaemon{MysqlPort: sync2.NewAtomicInt32(3306)}
+	mysqld := &mysqlctl.FakeMysqlDaemon{}
+	mysqld.MysqlPort.Store(3306)
+	vre := NewTestEngine(nil, wantTablet.GetAlias().Cell, mysqld, dbClientFactory, dbClientFactory, dbClient.DBName(), nil)
 
-	ct, err := newController(context.Background(), params, dbClientFactory, mysqld, env.TopoServ, env.Cells[0], "rdonly", nil, nil)
+	defer setTabletTypesStr("rdonly")()
+	ct, err := newController(context.Background(), params, dbClientFactory, mysqld, env.TopoServ, env.Cells[0], nil, vre, defaultTabletPickerOptions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,17 +257,21 @@ func TestControllerOverrides(t *testing.T) {
 }
 
 func TestControllerCanceledContext(t *testing.T) {
-	defer deleteTablet(addTablet(100))
+	wantTablet := addTablet(100)
+	defer deleteTablet(wantTablet)
 
 	params := map[string]string{
-		"id":     "1",
-		"state":  binlogplayer.BlpRunning,
-		"source": fmt.Sprintf(`keyspace:"%s" shard:"0" key_range:{end:"\x80"}`, env.KeyspaceName),
+		"id":      "1",
+		"state":   binlogdatapb.VReplicationWorkflowState_Running.String(),
+		"source":  fmt.Sprintf(`keyspace:"%s" shard:"0" key_range:{end:"\x80"}`, env.KeyspaceName),
+		"options": "{}",
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	ct, err := newController(ctx, params, nil, nil, env.TopoServ, env.Cells[0], "rdonly", nil, nil)
+	vre := NewTestEngine(nil, wantTablet.GetAlias().Cell, nil, nil, nil, "", nil)
+
+	ct, err := newController(ctx, params, nil, nil, env.TopoServ, env.Cells[0], nil, vre, defaultTabletPickerOptions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,39 +285,41 @@ func TestControllerCanceledContext(t *testing.T) {
 }
 
 func TestControllerRetry(t *testing.T) {
-	savedDelay := *retryDelay
-	defer func() { *retryDelay = savedDelay }()
-	*retryDelay = 10 * time.Millisecond
+	savedDelay := vttablet.DefaultVReplicationConfig.RetryDelay
+	defer func() { vttablet.DefaultVReplicationConfig.RetryDelay = savedDelay }()
+	vttablet.DefaultVReplicationConfig.RetryDelay = 10 * time.Millisecond
 
 	resetBinlogClient()
 	defer deleteTablet(addTablet(100))
 
 	params := map[string]string{
 		"id":           "1",
-		"state":        binlogplayer.BlpRunning,
+		"state":        binlogdatapb.VReplicationWorkflowState_Running.String(),
 		"source":       fmt.Sprintf(`keyspace:"%s" shard:"0" key_range:{end:"\x80"}`, env.KeyspaceName),
 		"cell":         env.Cells[0],
 		"tablet_types": "replica",
+		"options":      "{}",
 	}
 
 	dbClient := binlogplayer.NewMockDBClient(t)
-	dbClient.ExpectRequest(changeMasterToPrimary, testDMLResponse, nil)
 	dbClient.ExpectRequestRE("update _vt.vreplication set message='Picked source tablet.*", testDMLResponse, nil)
 	dbClient.ExpectRequest("update _vt.vreplication set state='Running', message='' where id=1", testDMLResponse, nil)
-	dbClient.ExpectRequest("select pos, stop_pos, max_tps, max_replication_lag, state from _vt.vreplication where id=1", nil, errors.New("(expected error)"))
-	dbClient.ExpectRequest("update _vt.vreplication set state='Error', message='error (expected error) in selecting vreplication settings select pos, stop_pos, max_tps, max_replication_lag, state from _vt.vreplication where id=1' where id=1", testDMLResponse, nil)
-	dbClient.ExpectRequest(changeMasterToPrimary, testDMLResponse, nil)
+	dbClient.ExpectRequest(binlogplayer.TestGetWorkflowQueryId1, nil, errors.New("(expected error)"))
+	dbClient.ExpectRequest("update _vt.vreplication set state='Error', message='error (expected error) in selecting vreplication settings select pos, stop_pos, max_tps, max_replication_lag, state, workflow_type, workflow, workflow_sub_type, defer_secondary_keys, options from _vt.vreplication where id=1' where id=1", testDMLResponse, nil)
 	dbClient.ExpectRequestRE("update _vt.vreplication set message='Picked source tablet.*", testDMLResponse, nil)
 	dbClient.ExpectRequest("update _vt.vreplication set state='Running', message='' where id=1", testDMLResponse, nil)
-	dbClient.ExpectRequest("select pos, stop_pos, max_tps, max_replication_lag, state from _vt.vreplication where id=1", testSettingsResponse, nil)
+	dbClient.ExpectRequest(binlogplayer.TestGetWorkflowQueryId1, testSettingsResponse, nil)
 	dbClient.ExpectRequest("begin", nil, nil)
 	dbClient.ExpectRequest("insert into t values(1)", testDMLResponse, nil)
 	dbClient.ExpectRequestRE("update _vt.vreplication set pos='MariaDB/0-1-1235', time_updated=.*", testDMLResponse, nil)
 	dbClient.ExpectRequest("commit", nil, nil)
 	dbClientFactory := func() binlogplayer.DBClient { return dbClient }
-	mysqld := &fakemysqldaemon.FakeMysqlDaemon{MysqlPort: sync2.NewAtomicInt32(3306)}
+	mysqld := &mysqlctl.FakeMysqlDaemon{}
+	mysqld.MysqlPort.Store(3306)
+	vre := NewTestEngine(nil, env.Cells[0], mysqld, dbClientFactory, dbClientFactory, dbClient.DBName(), nil)
 
-	ct, err := newController(context.Background(), params, dbClientFactory, mysqld, env.TopoServ, env.Cells[0], "rdonly", nil, nil)
+	defer setTabletTypesStr("rdonly")()
+	ct, err := newController(context.Background(), params, dbClientFactory, mysqld, env.TopoServ, env.Cells[0], nil, vre, defaultTabletPickerOptions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -292,29 +334,43 @@ func TestControllerStopPosition(t *testing.T) {
 	defer deleteTablet(wantTablet)
 
 	params := map[string]string{
-		"id":     "1",
-		"state":  binlogplayer.BlpRunning,
-		"source": fmt.Sprintf(`keyspace:"%s" shard:"0" key_range:{end:"\x80"}`, env.KeyspaceName),
+		"id":      "1",
+		"state":   binlogdatapb.VReplicationWorkflowState_Running.String(),
+		"source":  fmt.Sprintf(`keyspace:"%s" shard:"0" key_range:{end:"\x80"}`, env.KeyspaceName),
+		"options": "{}",
 	}
 
 	dbClient := binlogplayer.NewMockDBClient(t)
-	dbClient.ExpectRequest(changeMasterToPrimary, testDMLResponse, nil)
 	dbClient.ExpectRequestRE("update _vt.vreplication set message='Picked source tablet.*", testDMLResponse, nil)
 	dbClient.ExpectRequest("update _vt.vreplication set state='Running', message='' where id=1", testDMLResponse, nil)
 	withStop := &sqltypes.Result{
-		Fields:   nil,
+		Fields: []*querypb.Field{
+			{Name: "pos", Type: sqltypes.VarBinary},
+			{Name: "stop_pos", Type: sqltypes.VarBinary},
+			{Name: "max_tps", Type: sqltypes.Int64},
+			{Name: "max_replication_lag", Type: sqltypes.Int64},
+			{Name: "state", Type: sqltypes.VarBinary},
+			{Name: "workflow_type", Type: sqltypes.Int64},
+			{Name: "workflow", Type: sqltypes.VarChar},
+			{Name: "workflow_sub_type", Type: sqltypes.Int64},
+			{Name: "defer_secondary_keys", Type: sqltypes.Int64},
+		},
 		InsertID: 0,
 		Rows: [][]sqltypes.Value{
 			{
-				sqltypes.NewVarBinary("MariaDB/0-1-1083"),    // pos
-				sqltypes.NewVarBinary("MariaDB/0-1-1235"),    // stop_pos
-				sqltypes.NewVarBinary("9223372036854775807"), // max_tps
-				sqltypes.NewVarBinary("9223372036854775807"), // max_replication_lag
-				sqltypes.NewVarBinary("Running"),             // state
+				sqltypes.NewVarBinary("MariaDB/0-1-1083"),                                      // pos
+				sqltypes.NewVarBinary("MariaDB/0-1-1235"),                                      // stop_pos
+				sqltypes.NewInt64(9223372036854775807),                                         // max_tps
+				sqltypes.NewInt64(9223372036854775807),                                         // max_replication_lag
+				sqltypes.NewVarBinary(binlogdatapb.VReplicationWorkflowState_Running.String()), // state
+				sqltypes.NewInt64(1),                                                           // workflow_type
+				sqltypes.NewVarChar("wf"),                                                      // workflow
+				sqltypes.NewInt64(1),                                                           // workflow_sub_type
+				sqltypes.NewInt64(1),                                                           // defer_secondary_keys
 			},
 		},
 	}
-	dbClient.ExpectRequest("select pos, stop_pos, max_tps, max_replication_lag, state from _vt.vreplication where id=1", withStop, nil)
+	dbClient.ExpectRequest(binlogplayer.TestGetWorkflowQueryId1, withStop, nil)
 	dbClient.ExpectRequest("begin", nil, nil)
 	dbClient.ExpectRequest("insert into t values(1)", testDMLResponse, nil)
 	dbClient.ExpectRequestRE("update _vt.vreplication set pos='MariaDB/0-1-1235', time_updated=.*", testDMLResponse, nil)
@@ -322,9 +378,11 @@ func TestControllerStopPosition(t *testing.T) {
 	dbClient.ExpectRequest("update _vt.vreplication set state='Stopped', message='Reached stopping position, done playing logs' where id=1", testDMLResponse, nil)
 
 	dbClientFactory := func() binlogplayer.DBClient { return dbClient }
-	mysqld := &fakemysqldaemon.FakeMysqlDaemon{MysqlPort: sync2.NewAtomicInt32(3306)}
+	mysqld := &mysqlctl.FakeMysqlDaemon{}
+	mysqld.MysqlPort.Store(3306)
+	vre := NewTestEngine(nil, wantTablet.GetAlias().Cell, mysqld, dbClientFactory, dbClientFactory, dbClient.DBName(), nil)
 
-	ct, err := newController(context.Background(), params, dbClientFactory, mysqld, env.TopoServ, env.Cells[0], "replica", nil, nil)
+	ct, err := newController(context.Background(), params, dbClientFactory, mysqld, env.TopoServ, env.Cells[0], nil, vre, defaultTabletPickerOptions)
 	if err != nil {
 		t.Fatal(err)
 	}

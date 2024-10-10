@@ -22,13 +22,13 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"golang.org/x/sync/errgroup"
 
 	"vitess.io/vitess/go/vt/vttls"
 )
@@ -48,11 +48,7 @@ func TestClientServerWithCombineCerts(t *testing.T) {
 // And then performs a few tests on them.
 func testClientServer(t *testing.T, combineCerts bool) {
 	// Our test root.
-	root, err := os.MkdirTemp("", "tlstest")
-	if err != nil {
-		t.Fatalf("TempDir failed: %v", err)
-	}
-	defer os.RemoveAll(root)
+	root := t.TempDir()
 
 	clientServerKeyPairs := CreateClientServerCertPairs(root)
 	serverCA := ""
@@ -94,21 +90,20 @@ func testClientServer(t *testing.T, combineCerts bool) {
 	dialer := new(net.Dialer)
 	dialer.Timeout = 10 * time.Second
 
-	wg := sync.WaitGroup{}
-
 	//
 	// Positive case: accept on server side, connect a client, send data.
 	//
-	var clientErr error
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		clientConn, clientErr := tls.DialWithDialer(dialer, "tcp", addr, clientConfig)
-		if clientErr == nil {
-			_, _ = clientConn.Write([]byte{42})
-			clientConn.Close()
+	var clientEG errgroup.Group
+	clientEG.Go(func() error {
+		conn, err := tls.DialWithDialer(dialer, "tcp", addr, clientConfig)
+		if err != nil {
+			return err
 		}
-	}()
+
+		_, _ = conn.Write([]byte{42})
+		_ = conn.Close()
+		return nil
+	})
 
 	serverConn, err := listener.Accept()
 	if err != nil {
@@ -124,10 +119,8 @@ func testClientServer(t *testing.T, combineCerts bool) {
 	}
 	serverConn.Close()
 
-	wg.Wait()
-
-	if clientErr != nil {
-		t.Fatalf("Dial failed: %v", clientErr)
+	if err := clientEG.Wait(); err != nil {
+		t.Fatalf("client dial failed: %v", err)
 	}
 
 	//
@@ -147,34 +140,36 @@ func testClientServer(t *testing.T, combineCerts bool) {
 		t.Fatalf("TLSClientConfig failed: %v", err)
 	}
 
-	var serverErr error
-	wg.Add(1)
-	go func() {
+	var serverEG errgroup.Group
+	serverEG.Go(func() error {
 		// We expect the Accept to work, but the first read to fail.
-		defer wg.Done()
-		serverConn, serverErr := listener.Accept()
-		// This will fail.
-		if serverErr == nil {
-			result := make([]byte, 1)
-			if n, err := serverConn.Read(result); err == nil {
-				fmt.Printf("Was able to read from server: %v\n", n)
-			}
-			serverConn.Close()
+		conn, err := listener.Accept()
+		if err != nil {
+			return err
 		}
-	}()
+
+		// This will fail.
+		result := make([]byte, 1)
+		if n, err := conn.Read(result); err == nil {
+			return fmt.Errorf("unexpectedly able to read %d bytes from server", n)
+		}
+
+		_ = conn.Close()
+		return nil
+	})
 
 	// When using TLS 1.2, the Dial will fail.
 	// With TLS 1.3, the Dial will succeed and the first Read will fail.
 	clientConn, err := tls.DialWithDialer(dialer, "tcp", addr, badClientConfig)
 	if err != nil {
-		if !strings.Contains(err.Error(), "bad certificate") {
+		if !strings.Contains(err.Error(), "certificate required") {
 			t.Errorf("Wrong error returned: %v", err)
 		}
 		return
 	}
-	wg.Wait()
-	if serverErr != nil {
-		t.Fatalf("Connection failed: %v", serverErr)
+
+	if err := serverEG.Wait(); err != nil {
+		t.Fatalf("server read failed: %v", err)
 	}
 
 	data := make([]byte, 1)
@@ -182,7 +177,8 @@ func testClientServer(t *testing.T, combineCerts bool) {
 	if err == nil {
 		t.Fatalf("Dial or first Read was expected to fail")
 	}
-	if !strings.Contains(err.Error(), "bad certificate") {
+
+	if !strings.Contains(err.Error(), "certificate required") {
 		t.Errorf("Wrong error returned: %v", err)
 	}
 }
@@ -240,11 +236,7 @@ func TestClientTLSConfigCaching(t *testing.T) {
 
 func testConfigGeneration(t *testing.T, rootPrefix string, generateConfig func(ClientServerKeyPairs) (*tls.Config, error), getCertPool func(tlsConfig *tls.Config) *x509.CertPool) {
 	// Our test root.
-	root, err := os.MkdirTemp("", rootPrefix)
-	if err != nil {
-		t.Fatalf("TempDir failed: %v", err)
-	}
-	defer os.RemoveAll(root)
+	root := t.TempDir()
 
 	const configsToGenerate = 1
 
@@ -287,11 +279,7 @@ func testConfigGeneration(t *testing.T, rootPrefix string, generateConfig func(C
 
 func testNumberOfCertsWithOrWithoutCombining(t *testing.T, numCertsExpected int, combine bool) {
 	// Our test root.
-	root, err := os.MkdirTemp("", "tlstest")
-	if err != nil {
-		t.Fatalf("TempDir failed: %v", err)
-	}
-	defer os.RemoveAll(root)
+	root := t.TempDir()
 
 	clientServerKeyPairs := CreateClientServerCertPairs(root)
 	serverCA := ""
@@ -366,11 +354,7 @@ func assertTLSHandshakeFails(t *testing.T, serverConfig, clientConfig *tls.Confi
 }
 
 func TestClientServerWithRevokedServerCert(t *testing.T) {
-	root, err := os.MkdirTemp("", "tlstest")
-	if err != nil {
-		t.Fatalf("TempDir failed: %v", err)
-	}
-	defer os.RemoveAll(root)
+	root := t.TempDir()
 
 	clientServerKeyPairs := CreateClientServerCertPairs(root)
 
@@ -426,11 +410,7 @@ func TestClientServerWithRevokedServerCert(t *testing.T) {
 }
 
 func TestClientServerWithRevokedClientCert(t *testing.T) {
-	root, err := os.MkdirTemp("", "tlstest")
-	if err != nil {
-		t.Fatalf("TempDir failed: %v", err)
-	}
-	defer os.RemoveAll(root)
+	root := t.TempDir()
 
 	clientServerKeyPairs := CreateClientServerCertPairs(root)
 

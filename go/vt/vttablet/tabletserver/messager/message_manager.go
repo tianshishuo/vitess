@@ -21,22 +21,24 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math/rand"
+	"math/rand/v2"
 	"sync"
 	"time"
 
-	"vitess.io/vitess/go/mysql"
+	"golang.org/x/sync/semaphore"
+
+	"vitess.io/vitess/go/mysql/replication"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/stats"
-	"vitess.io/vitess/go/sync2"
 	"vitess.io/vitess/go/timer"
 	"vitess.io/vitess/go/vt/log"
-	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
-	querypb "vitess.io/vitess/go/vt/proto/query"
 	"vitess.io/vitess/go/vt/sqlparser"
-	"vitess.io/vitess/go/vt/vtgate/evalengine"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/schema"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/throttle/throttlerapp"
+
+	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
+	querypb "vitess.io/vitess/go/vt/proto/query"
 )
 
 var (
@@ -168,7 +170,7 @@ type messageManager struct {
 	tsv TabletService
 	vs  VStreamer
 
-	name         sqlparser.TableIdent
+	name         sqlparser.IdentifierCS
 	fieldResult  *sqltypes.Result
 	ackWaitTime  time.Duration
 	purgeAfter   time.Duration
@@ -177,7 +179,7 @@ type messageManager struct {
 	batchSize    int
 	pollerTicks  *timer.Timer
 	purgeTicks   *timer.Timer
-	postponeSema *sync2.Semaphore
+	postponeSema *semaphore.Weighted
 
 	mu     sync.Mutex
 	isOpen bool
@@ -188,27 +190,44 @@ type messageManager struct {
 	receivers       []*receiverWithStatus
 	curReceiver     int
 	messagesPending bool
+	// streamCancel is set when a vstream is running, and is reset
+	// to nil after a cancel. This allows for startVStream and stopVStream
+	// to be idempotent.
+	// This is implicitly protected by the main mutex because startVStream
+	// and stopVStream are called while holding the main mutex.
+	streamCancel func()
 
-	// streamMu keeps the cache and database consistent with each other.
-	// Specifically:
+	// cacheManagementMu keeps the cache and database consistent with each
+	// other by ensuring that only one of the streams is processing messages
+	// and updating the cache at a time. The poller uses a results streamer to
+	// pull directly from the message table and the message manager uses a
+	// binlog streamer to process change events. This mutex ensures that only
+	// one of them are updating the cache at any one time.
 	// It prevents items from being removed from cache while the poller
 	// reads from the db and adds items to it. Otherwise, the poller
 	// might add an older snapshot of a row that was just postponed.
-	// It blocks vstream from receiving messages while the poller
-	// reads a snapshot and updates lastPollPosition. Any events older than
-	// lastPollPosition must be ignored by the vstream. It consequently
-	// also blocks vstream from updating the cache while the poller is
-	// active.
-	streamMu sync.Mutex
-	// streamCancel is set when a vstream is running, and is reset
-	// to nil after a cancel. This allows for startVStream and stopVstream
-	// to be idempotent.
-	streamCancel     func()
-	lastPollPosition *mysql.Position
+	// It blocks the vstream (binlog streamer) from receiving messages while
+	// the poller reads a snapshot and updates lastPollPosition. Any events
+	// older than lastPollPosition must be ignored by the vstream. It
+	// consequently also blocks vstream from updating the cache while the
+	// poller is active.
+	// TODO(mattlord): since this is primarily a flow control mechanism, we
+	// should do it in a more idiomatic go way using channels or cond vars.
+	cacheManagementMu sync.Mutex
+	// The lastPollPosition variable is the main point of coordination
+	// between the poller and the binlog streamer to ensure that we are
+	// not re-processing older events and moving along linearly in the
+	// shared virtual GTID stream within the message manager.
+	// It is theoretically possible for the binlog streamer to be ahead of
+	// the lastPollPosition. This is because of how semi-sync works today
+	// where a replica could have received and processed a GTID that the primary
+	// may not have yet commited; but this is harmless because any events missed
+	// will be picked up during the next poller run.
+	lastPollPosition *replication.Position
 
 	// wg is for ensuring all running goroutines have returned
 	// before we can close the manager. You need to Add before
-	// launching any gorooutine while holding a lock on mu.
+	// launching any goroutine while holding a lock on mu.
 	// The goroutine must in turn defer on Done.
 	wg sync.WaitGroup
 
@@ -222,7 +241,7 @@ type messageManager struct {
 // newMessageManager creates a new message manager.
 // Calls into tsv have to be made asynchronously. Otherwise,
 // it can lead to deadlocks.
-func newMessageManager(tsv TabletService, vs VStreamer, table *schema.Table, postponeSema *sync2.Semaphore) *messageManager {
+func newMessageManager(tsv TabletService, vs VStreamer, table *schema.Table, postponeSema *semaphore.Weighted) *messageManager {
 	mm := &messageManager{
 		tsv:  tsv,
 		vs:   vs,
@@ -252,7 +271,9 @@ func newMessageManager(tsv TabletService, vs VStreamer, table *schema.Table, pos
 		}},
 	}
 	mm.readByPriorityAndTimeNext = sqlparser.BuildParsedQuery(
-		"select priority, time_next, epoch, time_acked, %s from %v where time_next < %a order by priority, time_next desc limit %a",
+		// There should be a poller_idx defined on (time_acked, priority, time_next desc)
+		// for this to be as efficient as possible
+		"select priority, time_next, epoch, time_acked, %s from %v where time_acked is null and time_next < %a order by priority, time_next desc limit %a",
 		columnList, mm.name, ":time_next", ":max")
 	mm.ackQuery = sqlparser.BuildParsedQuery(
 		"update %v set time_acked = %a, time_next = null where id in %a and time_acked is null",
@@ -265,8 +286,8 @@ func newMessageManager(tsv TabletService, vs VStreamer, table *schema.Table, pos
 	return mm
 }
 
-func buildPostponeQuery(name sqlparser.TableIdent, minBackoff, maxBackoff time.Duration) *sqlparser.ParsedQuery {
-	var args []interface{}
+func buildPostponeQuery(name sqlparser.IdentifierCS, minBackoff, maxBackoff time.Duration) *sqlparser.ParsedQuery {
+	var args []any
 
 	// since messages are immediately postponed upon sending, we need to add exponential backoff on top
 	// of the ackWaitTime, otherwise messages will be resent too quickly.
@@ -318,9 +339,9 @@ func buildSelectColumnList(t *schema.Table) string {
 	for i, c := range t.MessageInfo.Fields {
 		// Column names may have to be escaped.
 		if i == 0 {
-			buf.Myprintf("%v", sqlparser.NewColIdent(c.Name))
+			buf.Myprintf("%v", sqlparser.NewIdentifierCI(c.Name))
 		} else {
-			buf.Myprintf(", %v", sqlparser.NewColIdent(c.Name))
+			buf.Myprintf(", %v", sqlparser.NewIdentifierCI(c.Name))
 		}
 	}
 	return buf.String()
@@ -345,27 +366,37 @@ func (mm *messageManager) Open() {
 
 // Close stops the messageManager service.
 func (mm *messageManager) Close() {
+	log.Infof("messageManager (%v) - started execution of Close", mm.name)
 	mm.pollerTicks.Stop()
 	mm.purgeTicks.Stop()
+	log.Infof("messageManager (%v) - stopped the ticks. Acquiring mu Lock", mm.name)
 
 	mm.mu.Lock()
+	log.Infof("messageManager (%v) - acquired mu Lock", mm.name)
 	if !mm.isOpen {
+		log.Infof("messageManager (%v) - manager is not open", mm.name)
 		mm.mu.Unlock()
 		return
 	}
 	mm.isOpen = false
+	log.Infof("messageManager (%v) - cancelling all receivers", mm.name)
 	for _, rcvr := range mm.receivers {
 		rcvr.receiver.cancel()
 	}
 	mm.receivers = nil
 	MessageStats.Set([]string{mm.name.String(), "ClientCount"}, 0)
+	log.Infof("messageManager (%v) - clearing cache", mm.name)
 	mm.cache.Clear()
+	log.Infof("messageManager (%v) - sending a broadcast", mm.name)
 	// This broadcast will cause runSend to exit.
 	mm.cond.Broadcast()
+	log.Infof("messageManager (%v) - stopping VStream", mm.name)
 	mm.stopVStream()
 	mm.mu.Unlock()
 
+	log.Infof("messageManager (%v) - Waiting for the wait group", mm.name)
 	mm.wg.Wait()
+	log.Infof("messageManager (%v) - closed", mm.name)
 }
 
 // Subscribe registers the send function as a receiver of messages
@@ -383,7 +414,7 @@ func (mm *messageManager) Subscribe(ctx context.Context, send func(*sqltypes.Res
 	}
 
 	if err := receiver.Send(mm.fieldResult); err != nil {
-		log.Errorf("Terminating connection due to error sending field info: %v", err)
+		log.Errorf("messageManager (%v) - Terminating connection due to error sending field info: %v", mm.name, err)
 		receiver.cancel()
 		return done
 	}
@@ -544,11 +575,16 @@ func (mm *messageManager) runSend() {
 
 		// Send the message asynchronously.
 		mm.wg.Add(1)
-		go mm.send(receiver, &sqltypes.Result{Rows: rows}) // calls the offsetting mm.wg.Done()
+		go func() {
+			err := mm.send(context.Background(), receiver, &sqltypes.Result{Rows: rows}) // calls the offsetting mm.wg.Done()
+			if err != nil {
+				log.Errorf("messageManager (%v) - send failed: %v", mm.name, err)
+			}
+		}()
 	}
 }
 
-func (mm *messageManager) send(receiver *receiverWithStatus, qr *sqltypes.Result) {
+func (mm *messageManager) send(ctx context.Context, receiver *receiverWithStatus, qr *sqltypes.Result) error {
 	defer func() {
 		mm.tsv.LogError()
 		mm.wg.Done()
@@ -560,12 +596,12 @@ func (mm *messageManager) send(receiver *receiverWithStatus, qr *sqltypes.Result
 	}
 
 	defer func() {
-		// Hold streamMu to prevent the ids from being discarded
+		// Hold cacheManagementMu to prevent the ids from being discarded
 		// if poller is active. Otherwise, it could have read a
 		// snapshot of a row before the postponement and requeue
 		// the message.
-		mm.streamMu.Lock()
-		defer mm.streamMu.Unlock()
+		mm.cacheManagementMu.Lock()
+		defer mm.cacheManagementMu.Unlock()
 		mm.cache.Discard(ids)
 	}()
 
@@ -585,29 +621,28 @@ func (mm *messageManager) send(receiver *receiverWithStatus, qr *sqltypes.Result
 		// Log the error, but we still want to postpone the message.
 		// Otherwise, if this is a chronic failure like "message too
 		// big", we'll end up spamming non-stop.
-		log.Errorf("Error sending messages: %v: %v", qr, err)
+		log.Errorf("messageManager (%v) - Error sending messages: %v: %v", mm.name, qr, err)
 	}
-	mm.postpone(mm.tsv, mm.ackWaitTime, ids)
+	return mm.postpone(ctx, mm.tsv, mm.ackWaitTime, ids)
 }
 
-func (mm *messageManager) postpone(tsv TabletService, ackWaitTime time.Duration, ids []string) {
+func (mm *messageManager) postpone(ctx context.Context, tsv TabletService, ackWaitTime time.Duration, ids []string) error {
 	// Use the semaphore to limit parallelism.
-	if !mm.postponeSema.Acquire() {
-		// Unreachable.
-		return
+	if err := mm.postponeSema.Acquire(ctx, 1); err != nil {
+		// Only happens if context is cancelled.
+		return err
 	}
-	defer mm.postponeSema.Release()
+	defer mm.postponeSema.Release(1)
 	ctx, cancel := context.WithTimeout(tabletenv.LocalContext(), ackWaitTime)
 	defer cancel()
 	if _, err := tsv.PostponeMessages(ctx, nil, mm, ids); err != nil {
 		// This can happen during spikes. Record the incident for monitoring.
 		MessageStats.Add([]string{mm.name.String(), "PostponeFailed"}, 1)
 	}
+	return nil
 }
 
 func (mm *messageManager) startVStream() {
-	mm.streamMu.Lock()
-	defer mm.streamMu.Unlock()
 	if mm.streamCancel != nil {
 		return
 	}
@@ -617,8 +652,7 @@ func (mm *messageManager) startVStream() {
 }
 
 func (mm *messageManager) stopVStream() {
-	mm.streamMu.Lock()
-	defer mm.streamMu.Unlock()
+	log.Infof("messageManager (%v) - calling stream cancel", mm.name)
 	if mm.streamCancel != nil {
 		mm.streamCancel()
 		mm.streamCancel = nil
@@ -630,12 +664,12 @@ func (mm *messageManager) runVStream(ctx context.Context) {
 		err := mm.runOneVStream(ctx)
 		select {
 		case <-ctx.Done():
-			log.Info("Context canceled, exiting vstream")
+			log.Info("messageManager (%v) - Context canceled, exiting vstream", mm.name)
 			return
 		default:
 		}
 		MessageStats.Add([]string{mm.name.String(), "VStreamFailed"}, 1)
-		log.Infof("VStream ended: %v, retrying in 5 seconds", err)
+		log.Infof("messageManager (%v) - VStream ended: %v, retrying in 5 seconds", mm.name, err)
 		time.Sleep(5 * time.Second)
 	}
 }
@@ -651,9 +685,10 @@ func (mm *messageManager) runOneVStream(ctx context.Context) error {
 	var curPos string
 	var fields []*querypb.Field
 
-	err := mm.vs.Stream(ctx, "current", nil, mm.vsFilter, func(events []*binlogdatapb.VEvent) error {
-		mm.streamMu.Lock()
-		defer mm.streamMu.Unlock()
+	err := mm.vs.Stream(ctx, "current", nil, mm.vsFilter, throttlerapp.MessagerName, func(events []*binlogdatapb.VEvent) error {
+		// We need to get the flow control lock
+		mm.cacheManagementMu.Lock()
+		defer mm.cacheManagementMu.Unlock()
 
 		select {
 		case <-ctx.Done():
@@ -668,7 +703,7 @@ func (mm *messageManager) runOneVStream(ctx context.Context) error {
 			if curPos == "" {
 				return true, nil
 			}
-			cur, err := mysql.DecodePosition(curPos)
+			cur, err := replication.DecodePosition(curPos)
 			if err != nil {
 				return false, err
 			}
@@ -707,7 +742,7 @@ func (mm *messageManager) runOneVStream(ctx context.Context) error {
 			}
 		}
 		return nil
-	})
+	}, nil)
 	return err
 }
 
@@ -736,13 +771,18 @@ func (mm *messageManager) processRowEvent(fields []*querypb.Field, rowEvent *bin
 }
 
 func (mm *messageManager) runPoller() {
+	// We need to get the flow control lock first
+	mm.cacheManagementMu.Lock()
+	defer mm.cacheManagementMu.Unlock()
+	// Now we can get the main/structure lock and ensure e.g. that the
+	// the receiver count does not change during the run
+	mm.mu.Lock()
+	defer mm.mu.Unlock()
+
 	// Fast-path. Skip all the work.
-	if mm.receiverCount() == 0 {
+	if len(mm.receivers) == 0 {
 		return
 	}
-
-	mm.streamMu.Lock()
-	defer mm.streamMu.Unlock()
 
 	ctx, cancel := context.WithTimeout(tabletenv.LocalContext(), mm.pollerTicks.Interval())
 	defer func() {
@@ -755,22 +795,16 @@ func (mm *messageManager) runPoller() {
 		"time_next": sqltypes.Int64BindVariable(time.Now().UnixNano()),
 		"max":       sqltypes.Int64BindVariable(int64(size)),
 	}
+
 	qr, err := mm.readPending(ctx, bindVars)
 	if err != nil {
 		return
 	}
 
-	// Obtain mu lock to verify and preserve that len(receivers) != 0.
-	mm.mu.Lock()
-	defer mm.mu.Unlock()
 	mm.messagesPending = false
 	if len(qr.Rows) >= size {
 		// There are probably more messages to be sent.
 		mm.messagesPending = true
-	}
-	if len(mm.receivers) == 0 {
-		// Almost never reachable because we just checked this.
-		return
 	}
 	if len(qr.Rows) != 0 {
 		// We've most likely added items.
@@ -781,7 +815,7 @@ func (mm *messageManager) runPoller() {
 		mr, err := BuildMessageRow(row)
 		if err != nil {
 			mm.tsv.Stats().InternalErrors.Add("Messages", 1)
-			log.Errorf("Error reading message row: %v", err)
+			log.Errorf("messageManager (%v) - Error reading message row: %v", mm.name, err)
 			continue
 		}
 		if !mm.cache.Add(mr) {
@@ -802,7 +836,7 @@ func (mm *messageManager) runPurge() {
 			count, err := mm.tsv.PurgeMessages(ctx, nil, mm, time.Now().Add(-mm.purgeAfter).UnixNano())
 			if err != nil {
 				MessageStats.Add([]string{mm.name.String(), "PurgeFailed"}, 1)
-				log.Errorf("Unable to delete messages: %v", err)
+				log.Errorf("messageManager (%v) - Unable to delete messages: %v", mm.name, err)
 			} else {
 				MessageStats.Add([]string{mm.name.String(), "Purged"}, count)
 			}
@@ -867,32 +901,32 @@ func (mm *messageManager) GeneratePurgeQuery(timeCutoff int64) (string, map[stri
 	}
 }
 
-// BuildMessageRow builds a MessageRow for a db row.
+// BuildMessageRow builds a MessageRow from a db row.
 func BuildMessageRow(row []sqltypes.Value) (*MessageRow, error) {
 	mr := &MessageRow{Row: row[4:]}
 	if !row[0].IsNull() {
-		v, err := evalengine.ToInt64(row[0])
+		v, err := row[0].ToCastInt64()
 		if err != nil {
 			return nil, err
 		}
 		mr.Priority = v
 	}
 	if !row[1].IsNull() {
-		v, err := evalengine.ToInt64(row[1])
+		v, err := row[1].ToCastInt64()
 		if err != nil {
 			return nil, err
 		}
 		mr.TimeNext = v
 	}
 	if !row[2].IsNull() {
-		v, err := evalengine.ToInt64(row[2])
+		v, err := row[2].ToCastInt64()
 		if err != nil {
 			return nil, err
 		}
 		mr.Epoch = v
 	}
 	if !row[3].IsNull() {
-		v, err := evalengine.ToInt64(row[3])
+		v, err := row[3].ToCastInt64()
 		if err != nil {
 			return nil, err
 		}
@@ -901,17 +935,11 @@ func BuildMessageRow(row []sqltypes.Value) (*MessageRow, error) {
 	return mr, nil
 }
 
-func (mm *messageManager) receiverCount() int {
-	mm.mu.Lock()
-	defer mm.mu.Unlock()
-	return len(mm.receivers)
-}
-
 func (mm *messageManager) readPending(ctx context.Context, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
 	query, err := mm.readByPriorityAndTimeNext.GenerateQuery(bindVars, nil)
 	if err != nil {
 		mm.tsv.Stats().InternalErrors.Add("Messages", 1)
-		log.Errorf("Error reading rows from message table: %v", err)
+		log.Errorf("messageManager (%v) - Error reading rows from message table: %v", mm.name, err)
 		return nil, err
 	}
 	qr := &sqltypes.Result{}
@@ -920,7 +948,7 @@ func (mm *messageManager) readPending(ctx context.Context, bindVars map[string]*
 			qr.Fields = response.Fields
 		}
 		if response.Gtid != "" {
-			pos, err := mysql.DecodePosition(response.Gtid)
+			pos, err := replication.DecodePosition(response.Gtid)
 			if err != nil {
 				return err
 			}
@@ -935,4 +963,10 @@ func (mm *messageManager) readPending(ctx context.Context, bindVars map[string]*
 		return nil, err
 	}
 	return qr, err
+}
+
+func (mm *messageManager) getLastPollPosition() *replication.Position {
+	mm.cacheManagementMu.Lock()
+	defer mm.cacheManagementMu.Unlock()
+	return mm.lastPollPosition
 }

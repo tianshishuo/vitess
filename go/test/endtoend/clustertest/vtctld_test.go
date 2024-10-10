@@ -48,13 +48,13 @@ func TestVtctldProcess(t *testing.T) {
 	url := fmt.Sprintf("http://%s:%d/api/keyspaces/", clusterInstance.Hostname, clusterInstance.VtctldHTTPPort)
 	testURL(t, url, "keyspace url")
 
-	healthCheckURL := fmt.Sprintf("http://%s:%d/debug/health/", clusterInstance.Hostname, clusterInstance.VtctldHTTPPort)
+	healthCheckURL := fmt.Sprintf("http://%s:%d/debug/health", clusterInstance.Hostname, clusterInstance.VtctldHTTPPort)
 	testURL(t, healthCheckURL, "vtctld health check url")
 
 	url = fmt.Sprintf("http://%s:%d/api/topodata/", clusterInstance.Hostname, clusterInstance.VtctldHTTPPort)
-
 	testTopoDataAPI(t, url)
-	testListAllTablets(t)
+
+	testGetTablets(t)
 	testTabletStatus(t)
 	testExecuteAsDba(t)
 	testExecuteAsApp(t)
@@ -62,13 +62,15 @@ func TestVtctldProcess(t *testing.T) {
 
 func testTopoDataAPI(t *testing.T, url string) {
 	resp, err := http.Get(url)
-	require.Nil(t, err)
+	require.NoError(t, err)
+	defer resp.Body.Close()
 	assert.Equal(t, resp.StatusCode, 200)
 
-	resultMap := make(map[string]interface{})
-	respByte, _ := io.ReadAll(resp.Body)
+	resultMap := make(map[string]any)
+	respByte, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
 	err = json.Unmarshal(respByte, &resultMap)
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	errorValue := reflect.ValueOf(resultMap["Error"])
 	assert.Empty(t, errorValue.String())
@@ -80,10 +82,10 @@ func testTopoDataAPI(t *testing.T, url string) {
 	assert.Contains(t, childrenGot, clusterInstance.Cell)
 }
 
-func testListAllTablets(t *testing.T) {
+func testGetTablets(t *testing.T) {
 	// first w/o any filters, aside from cell
-	result, err := clusterInstance.VtctlclientProcess.ExecuteCommandWithOutput("ListAllTablets", clusterInstance.Cell)
-	require.Nil(t, err)
+	result, err := clusterInstance.VtctldClientProcess.ExecuteCommandWithOutput("GetTablets", "--cell", clusterInstance.Cell)
+	require.NoError(t, err)
 
 	tablets := getAllTablets()
 
@@ -100,11 +102,13 @@ func testListAllTablets(t *testing.T) {
 
 	// now filtering with the first keyspace and tablet type of primary, in
 	// addition to the cell
-	result, err = clusterInstance.VtctlclientProcess.ExecuteCommandWithOutput(
-		"ListAllTablets", "-keyspace", clusterInstance.Keyspaces[0].Name,
-		"-tablet_type", "primary",
-		clusterInstance.Cell)
-	require.Nil(t, err)
+	result, err = clusterInstance.VtctldClientProcess.ExecuteCommandWithOutput(
+		"GetTablets",
+		"--keyspace", clusterInstance.Keyspaces[0].Name,
+		"--tablet-type", "primary",
+		"--cell", clusterInstance.Cell,
+	)
+	require.NoError(t, err)
 
 	// We should only return a single primary tablet per shard in the first keyspace
 	tabletsFromCMD = strings.Split(result, "\n")
@@ -115,24 +119,67 @@ func testListAllTablets(t *testing.T) {
 
 func testTabletStatus(t *testing.T) {
 	resp, err := http.Get(fmt.Sprintf("http://%s:%d", clusterInstance.Hostname, clusterInstance.Keyspaces[0].Shards[0].Vttablets[0].HTTPPort))
-	require.Nil(t, err)
+	require.NoError(t, err)
+	defer resp.Body.Close()
 	respByte, err := io.ReadAll(resp.Body)
-	require.Nil(t, err)
+	require.NoError(t, err)
 	result := string(respByte)
 	log.Infof("Tablet status response: %v", result)
-	assert.True(t, strings.Contains(result, `Alias: <a href="http://localhost:`))
+	assert.True(t, strings.Contains(result, `/debug/health`))
 	assert.True(t, strings.Contains(result, `</html>`))
 }
 
 func testExecuteAsDba(t *testing.T) {
-	result, err := clusterInstance.VtctlclientProcess.ExecuteCommandWithOutput("ExecuteFetchAsDba", clusterInstance.Keyspaces[0].Shards[0].Vttablets[0].Alias, `SELECT 1 AS a`)
-	require.Nil(t, err)
-	assert.Equal(t, result, oneTableOutput)
+	tcases := []struct {
+		query     string
+		result    string
+		expectErr bool
+	}{
+		{
+			query:     "",
+			expectErr: true,
+		},
+		{
+			query:  "SELECT 1 AS a",
+			result: oneTableOutput,
+		},
+		{
+			query:     "SELECT 1 AS a; SELECT 1 AS a",
+			expectErr: true,
+		},
+		{
+			query:  "create table t(id int)",
+			result: "",
+		},
+		{
+			query:  "create table if not exists t(id int)",
+			result: "",
+		},
+		{
+			query:  "create table if not exists t(id int); create table if not exists t(id int);",
+			result: "",
+		},
+		{
+			query:     "create table if not exists t(id int); create table if not exists t(id int); SELECT 1 AS a",
+			expectErr: true,
+		},
+	}
+	for _, tcase := range tcases {
+		t.Run(tcase.query, func(t *testing.T) {
+			result, err := clusterInstance.VtctldClientProcess.ExecuteCommandWithOutput("ExecuteFetchAsDBA", clusterInstance.Keyspaces[0].Shards[0].Vttablets[0].Alias, tcase.query)
+			if tcase.expectErr {
+				assert.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tcase.result, result)
+			}
+		})
+	}
 }
 
 func testExecuteAsApp(t *testing.T) {
-	result, err := clusterInstance.VtctlclientProcess.ExecuteCommandWithOutput("ExecuteFetchAsApp", clusterInstance.Keyspaces[0].Shards[0].Vttablets[0].Alias, `SELECT 1 AS a`)
-	require.Nil(t, err)
+	result, err := clusterInstance.VtctldClientProcess.ExecuteCommandWithOutput("ExecuteFetchAsApp", clusterInstance.Keyspaces[0].Shards[0].Vttablets[0].Alias, `SELECT 1 AS a`)
+	require.NoError(t, err)
 	assert.Equal(t, result, oneTableOutput)
 }
 

@@ -17,9 +17,9 @@ limitations under the License.
 package planbuilder
 
 import (
-	"reflect"
 	"testing"
 
+	"vitess.io/vitess/go/test/utils"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/tableacl"
 )
@@ -169,22 +169,66 @@ func TestBuildPermissions(t *testing.T) {
 	}, {
 		input: "update (select * from t1) as a join t2 on a=b set c=d",
 		output: []Permission{{
-			TableName: "t1",
-			Role:      tableacl.WRITER,
-		}, {
 			TableName: "t2",
 			Role:      tableacl.WRITER,
+		}, {
+			TableName: "t1", // derived table in update or delete needs reader permission as they cannot be modified.
+		}},
+	}, {
+		input: "select next 10 values from seq",
+		output: []Permission{{
+			TableName: "seq",
+			Role:      tableacl.WRITER,
+		}},
+	}, {
+		input: "with t as (select count(*) as a from user) select a from t",
+		output: []Permission{{
+			TableName: "user",
+			Role:      tableacl.READER,
+		}},
+	}, {
+		input: "with d as (select id, count(*) as a from user) select d.a from music join d on music.user_id = d.id group by 1",
+		output: []Permission{{
+			TableName: "music",
+			Role:      tableacl.READER,
+		}, {
+			TableName: "user",
+			Role:      tableacl.READER,
+		}},
+	}, {
+		input: "WITH t1 AS ( SELECT id FROM t2 ) SELECT * FROM t1 JOIN ks.t1 AS t3",
+		output: []Permission{{
+			TableName: "t1",
+			Role:      tableacl.READER,
+		}, {
+			TableName: "t2",
+			Role:      tableacl.READER,
+		}},
+	}, {
+		input: "WITH RECURSIVE t1 (n) AS ( SELECT id from t2 UNION ALL SELECT n + 1 FROM t1 WHERE n < 5 ) SELECT * FROM t1 JOIN t1 AS t3",
+		output: []Permission{{
+			TableName: "t2",
+			Role:      tableacl.READER,
+		}},
+	}, {
+		input: "(with t1 as (select count(*) as a from user) select a from t1) union  select * from t1",
+		output: []Permission{{
+			TableName: "user",
+			Role:      tableacl.READER,
+		}, {
+			TableName: "t1",
+			Role:      tableacl.READER,
 		}},
 	}}
 
 	for _, tcase := range tcases {
-		stmt, err := sqlparser.Parse(tcase.input)
-		if err != nil {
-			t.Fatal(err)
-		}
-		got := BuildPermissions(stmt)
-		if !reflect.DeepEqual(got, tcase.output) {
-			t.Errorf("BuildPermissions(%s): %v, want %v", tcase.input, got, tcase.output)
-		}
+		t.Run(tcase.input, func(t *testing.T) {
+			stmt, err := sqlparser.NewTestParser().Parse(tcase.input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := BuildPermissions(stmt)
+			utils.MustMatch(t, tcase.output, got)
+		})
 	}
 }

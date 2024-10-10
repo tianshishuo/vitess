@@ -1,5 +1,5 @@
 /*
-Copyright 2021 The Vitess Authors.
+Copyright 2023 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,22 +19,26 @@ package tabletmanager
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
-
-	"vitess.io/vitess/go/vt/topo/memorytopo"
 )
 
-// TestPromoteReplicaHealthTicksStopped checks that the health ticks are not running on the
-// replication manager after running PromoteReplica
-func TestPromoteReplicaHealthTicksStopped(t *testing.T) {
-	ctx := context.Background()
-	ts := memorytopo.NewServer("cell1")
-	statsTabletTypeCount.ResetAll()
-	tm := newTestTM(t, ts, 100, keyspace, shard)
-	defer tm.Stop()
+// TestWaitForGrantsToHaveApplied tests that waitForGrantsToHaveApplied only succeeds after waitForDBAGrants has been called.
+func TestWaitForGrantsToHaveApplied(t *testing.T) {
+	tm := &TabletManager{
+		_waitForGrantsComplete: make(chan struct{}),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	err := tm.waitForGrantsToHaveApplied(ctx)
+	require.ErrorContains(t, err, "deadline exceeded")
 
-	_, err := tm.PromoteReplica(ctx, false)
+	err = tm.waitForDBAGrants(nil, 0)
 	require.NoError(t, err)
-	require.False(t, tm.replManager.ticks.Running())
+
+	secondContext, secondCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer secondCancel()
+	err = tm.waitForGrantsToHaveApplied(secondContext)
+	require.NoError(t, err)
 }

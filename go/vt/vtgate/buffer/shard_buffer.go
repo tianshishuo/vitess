@@ -21,13 +21,17 @@ import (
 	"fmt"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"vitess.io/vitess/go/vt/discovery"
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/logutil"
-	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	"vitess.io/vitess/go/vt/topo/topoproto"
 	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/vtgate/errorsanitizer"
+
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 // bufferState represents the different states a shardBuffer object can be in.
@@ -91,14 +95,6 @@ type shardBuffer struct {
 	state bufferState
 	// queue is the list of buffered requests (ordered by arrival).
 	queue []*entry
-	// externallyReparented is the maximum value of all seen
-	// "StreamHealthResponse.TabletexternallyReparentedTimestamp" values across
-	// all PRIMARY tablets of this shard.
-	// In practice, it is a) the last time the shard was reparented or b) the last
-	// time the TabletExternallyReparented RPC was called on the tablet to confirm
-	// that the tablet is the current PRIMARY.
-	// We assume the value is a Unix timestamp in seconds.
-	externallyReparented int64
 	// lastStart is the last time we saw the start of a failover.
 	lastStart time.Time
 	// lastEnd is the last time we saw the end of a failover.
@@ -283,7 +279,7 @@ func (sb *shardBuffer) startBufferingLocked(err error) {
 		sb.buf.config.Window,
 		sb.buf.config.Size,
 		sb.buf.config.MaxFailoverDuration,
-		err,
+		errorsanitizer.NormalizeError(err.Error()),
 	)
 }
 
@@ -305,7 +301,7 @@ func (sb *shardBuffer) logErrorIfStateNotLocked(state bufferState) {
 // give up their spot in the buffer. It also holds the "bufferCancel" function.
 // If buffering fails e.g. due to a full buffer, an error is returned.
 func (sb *shardBuffer) bufferRequestLocked(ctx context.Context) (*entry, error) {
-	if !sb.buf.bufferSizeSema.TryAcquire() {
+	if !sb.buf.bufferSizeSema.TryAcquire(1) {
 		// Buffer is full. Evict the oldest entry and buffer this request instead.
 		if len(sb.queue) == 0 {
 			// Overall buffer is full, but this shard's queue is empty. That means
@@ -382,7 +378,7 @@ func (sb *shardBuffer) waitForRequestFinish(e *entry, releaseSlot, async bool) {
 	// the buffer full eviction or the timeout thread does not block on us.
 	// This way, the request's slot can only be reused after the request finished.
 	if releaseSlot {
-		sb.buf.bufferSizeSema.Release()
+		sb.buf.bufferSizeSema.Release(1)
 	}
 }
 
@@ -474,11 +470,12 @@ func (sb *shardBuffer) remove(toRemove *entry) {
 	// Entry was already removed. Keep the queue as it is.
 }
 
-func (sb *shardBuffer) recordKeyspaceEvent(alias *topodatapb.TabletAlias, stillServing bool) {
+func (sb *shardBuffer) recordKeyspaceEvent(alias *topodatapb.TabletAlias, stillServing bool, keyspaceEvent *discovery.KeyspaceEvent) {
 	sb.mu.Lock()
 	defer sb.mu.Unlock()
 
-	log.Infof("disruption in shard %s/%s resolved (serving: %v)", sb.keyspace, sb.shard, stillServing)
+	log.Infof("disruption in shard %s/%s resolved (serving: %v), movetable state %#v",
+		sb.keyspace, sb.shard, stillServing, keyspaceEvent.MoveTablesState)
 
 	if !topoproto.TabletAliasEqual(alias, sb.currentPrimary) {
 		if sb.currentPrimary != nil {
@@ -486,42 +483,26 @@ func (sb *shardBuffer) recordKeyspaceEvent(alias *topodatapb.TabletAlias, stillS
 		}
 		sb.currentPrimary = alias
 	}
-	if stillServing {
-		sb.stopBufferingLocked(stopFailoverEndDetected, "a primary promotion has been detected")
-	} else {
-		sb.stopBufferingLocked(stopShardMissing, "the keyspace has been resharded")
-	}
-}
+	var reason stopReason
+	var msg string
 
-func (sb *shardBuffer) recordExternallyReparentedTimestamp(timestamp int64, alias *topodatapb.TabletAlias) {
-	// Fast path (read lock): Check if new timestamp is higher.
-	sb.mu.RLock()
-	if timestamp <= sb.externallyReparented {
-		// Do nothing. Equal values are reported if the primary has not changed.
-		// Smaller values can be reported during the failover by the old primary
-		// after the new primary already took over.
-		sb.mu.RUnlock()
-		return
+	// heuristically determine the reason why vtgate is currently buffering
+	moveTablesSwitched := false
+	if keyspaceEvent.MoveTablesState.State == discovery.MoveTablesSwitched {
+		moveTablesSwitched = true
 	}
-	sb.mu.RUnlock()
-
-	// New timestamp is higher. Stop buffering if running.
-	sb.mu.Lock()
-	defer sb.mu.Unlock()
-
-	// Re-check value after acquiring write lock.
-	if timestamp <= sb.externallyReparented {
-		return
+	switch {
+	case moveTablesSwitched:
+		reason = stopMoveTablesSwitchingTraffic
+		msg = stopMoveTablesSwitchingTrafficMessage
+	case stillServing:
+		reason = stopFailoverEndDetected
+		msg = stopFailoverEndDetectedMessage
+	default:
+		reason = stopShardMissing
+		msg = stopShardMissingMessage
 	}
-
-	sb.externallyReparented = timestamp
-	if !topoproto.TabletAliasEqual(alias, sb.currentPrimary) {
-		if sb.currentPrimary != nil {
-			sb.lastReparent = sb.timeNow()
-		}
-		sb.currentPrimary = alias
-	}
-	sb.stopBufferingLocked(stopFailoverEndDetected, "failover end detected")
+	sb.stopBufferingLocked(reason, msg)
 }
 
 func (sb *shardBuffer) stopBufferingDueToMaxDuration() {
@@ -567,7 +548,8 @@ func (sb *shardBuffer) stopBufferingLocked(reason stopReason, details string) {
 	if sb.mode == bufferModeDryRun {
 		msg = "Dry-run: Would have stopped buffering"
 	}
-	log.Infof("%v for shard: %s after: %.1f seconds due to: %v. Draining %d buffered requests now.", msg, topoproto.KeyspaceShardString(sb.keyspace, sb.shard), d.Seconds(), details, len(q))
+	log.Infof("%v for shard: %s after: %.1f seconds due to: %v. Draining %d buffered requests now.",
+		msg, topoproto.KeyspaceShardString(sb.keyspace, sb.shard), d.Seconds(), details, len(q))
 
 	var clientEntryError error
 	if reason == stopShardMissing {
@@ -579,6 +561,18 @@ func (sb *shardBuffer) stopBufferingLocked(reason stopReason, details string) {
 	go sb.drain(q, clientEntryError)
 }
 
+// parallelRangeIndex uses counter to return a unique idx value up to the
+// passed max and ok will be set to false if the counter exceeds the max
+func parallelRangeIndex(counter *atomic.Int64, max int) (idx int, ok bool) {
+	next := counter.Add(1)
+	if next-1 > int64(max) {
+		return -1, false
+	}
+	// if this is a 32-bit platform, max won't exceed the 32-bit integer limit
+	// so a cast from a too-large 64-bit int to a 32-bit int will never happen
+	return int(next) - 1, true
+}
+
 func (sb *shardBuffer) drain(q []*entry, err error) {
 	defer sb.wg.Done()
 
@@ -587,10 +581,32 @@ func (sb *shardBuffer) drain(q []*entry, err error) {
 	sb.timeoutThread.stop()
 
 	start := sb.timeNow()
-	// TODO(mberlin): Parallelize the drain by pumping the data through a channel.
-	for _, e := range q {
-		sb.unblockAndWait(e, err, true /* releaseSlot */, true /* blockingWait */)
+
+	entryCount := len(q)
+	parallelism := min(sb.buf.config.DrainConcurrency, entryCount)
+
+	var wg sync.WaitGroup
+	var rangeCounter atomic.Int64
+
+	wg.Add(parallelism)
+	for i := 0; i < parallelism; i++ {
+		go func() {
+			defer wg.Done()
+			for {
+				idx, ok := parallelRangeIndex(&rangeCounter, entryCount-1)
+				if !ok {
+					break
+				}
+				// Shared access to the q slice is concurrency-safe because each goroutine receives
+				// a unique set of slice indices from parallelRangeIndex above and the slice remains
+				// immutable for the lifetime of this operation.
+				sb.unblockAndWait(q[idx], err, true /* releaseSlot */, true /* blockingWait */)
+			}
+		}()
 	}
+
+	wg.Wait()
+
 	d := sb.timeNow().Sub(start)
 	log.Infof("Draining finished for shard: %s Took: %v for: %d requests.", topoproto.KeyspaceShardString(sb.keyspace, sb.shard), d, len(q))
 	requestsDrained.Add(sb.statsKey, int64(len(q)))

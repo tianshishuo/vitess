@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+	http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -38,8 +38,8 @@ func TestFallbackSecurityPolicy(t *testing.T) {
 	require.NoError(t, err)
 
 	// Requesting an unregistered security_policy should fallback to deny-all.
-	clusterInstance.VtTabletExtraArgs = []string{"-security_policy", "bogus"}
-	err = clusterInstance.StartVttablet(mTablet, "SERVING", false, cell, keyspaceName, hostname, shardName)
+	clusterInstance.VtTabletExtraArgs = []string{"--security_policy", "bogus"}
+	err = clusterInstance.StartVttablet(mTablet, false, "SERVING", false, cell, keyspaceName, hostname, shardName)
 	require.NoError(t, err)
 
 	// It should deny ADMIN role.
@@ -57,7 +57,7 @@ func TestFallbackSecurityPolicy(t *testing.T) {
 	// Reset the VtTabletExtraArgs
 	clusterInstance.VtTabletExtraArgs = []string{}
 	// Tear down custom processes
-	killTablets(t, mTablet)
+	killTablets(mTablet)
 }
 
 func assertNotAllowedURLTest(t *testing.T, url string) {
@@ -93,8 +93,8 @@ func TestDenyAllSecurityPolicy(t *testing.T) {
 	require.NoError(t, err)
 
 	// Requesting a deny-all security_policy.
-	clusterInstance.VtTabletExtraArgs = []string{"-security_policy", "deny-all"}
-	err = clusterInstance.StartVttablet(mTablet, "SERVING", false, cell, keyspaceName, hostname, shardName)
+	clusterInstance.VtTabletExtraArgs = []string{"--security_policy", "deny-all"}
+	err = clusterInstance.StartVttablet(mTablet, false, "SERVING", false, cell, keyspaceName, hostname, shardName)
 	require.NoError(t, err)
 
 	// It should deny ADMIN role.
@@ -112,7 +112,7 @@ func TestDenyAllSecurityPolicy(t *testing.T) {
 	// Reset the VtTabletExtraArgs
 	clusterInstance.VtTabletExtraArgs = []string{}
 	// Tear down custom processes
-	killTablets(t, mTablet)
+	killTablets(mTablet)
 }
 
 func TestReadOnlySecurityPolicy(t *testing.T) {
@@ -125,8 +125,8 @@ func TestReadOnlySecurityPolicy(t *testing.T) {
 	require.NoError(t, err)
 
 	// Requesting a read-only security_policy.
-	clusterInstance.VtTabletExtraArgs = []string{"-security_policy", "read-only"}
-	err = clusterInstance.StartVttablet(mTablet, "SERVING", false, cell, keyspaceName, hostname, shardName)
+	clusterInstance.VtTabletExtraArgs = []string{"--security_policy", "read-only"}
+	err = clusterInstance.StartVttablet(mTablet, false, "SERVING", false, cell, keyspaceName, hostname, shardName)
 	require.NoError(t, err)
 
 	// It should deny ADMIN role.
@@ -144,5 +144,5 @@ func TestReadOnlySecurityPolicy(t *testing.T) {
 	// Reset the VtTabletExtraArgs
 	clusterInstance.VtTabletExtraArgs = []string{}
 	// Tear down custom processes
-	killTablets(t, mTablet)
+	killTablets(mTablet)
 }

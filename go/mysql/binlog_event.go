@@ -19,6 +19,9 @@ package mysql
 import (
 	"fmt"
 
+	"vitess.io/vitess/go/mysql/collations"
+	"vitess.io/vitess/go/mysql/replication"
+
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 )
 
@@ -70,6 +73,8 @@ type BinlogEvent interface {
 	IsRand() bool
 	// IsPreviousGTIDs returns true if this event is a PREVIOUS_GTIDS_EVENT.
 	IsPreviousGTIDs() bool
+	// IsHeartbeat returns true if this event is a HEARTBEAT_EVENT.
+	IsHeartbeat() bool
 	// IsSemiSyncAckRequested returns true if the source requests a semi-sync ack for this event
 	IsSemiSyncAckRequested() bool
 
@@ -86,6 +91,8 @@ type BinlogEvent interface {
 
 	// Timestamp returns the timestamp from the event header.
 	Timestamp() uint32
+	// ServerID returns the server ID from the event header.
+	ServerID() uint32
 
 	// Format returns a BinlogFormat struct based on the event data.
 	// This is only valid if IsFormatDescription() returns true.
@@ -93,7 +100,7 @@ type BinlogEvent interface {
 	// GTID returns the GTID from the event, and if this event
 	// also serves as a BEGIN statement.
 	// This is only valid if IsGTID() returns true.
-	GTID(BinlogFormat) (GTID, bool, error)
+	GTID(BinlogFormat) (replication.GTID, bool, error)
 	// Query returns a Query struct representing data from a QUERY_EVENT.
 	// This is only valid if IsQuery() returns true.
 	Query(BinlogFormat) (Query, error)
@@ -105,7 +112,7 @@ type BinlogEvent interface {
 	Rand(BinlogFormat) (uint64, uint64, error)
 	// PreviousGTIDs returns the Position from the event.
 	// This is only valid if IsPreviousGTIDs() returns true.
-	PreviousGTIDs(BinlogFormat) (Position, error)
+	PreviousGTIDs(BinlogFormat) (replication.Position, error)
 
 	// TableID returns the table ID for a TableMap, UpdateRows,
 	// WriteRows or DeleteRows event.
@@ -119,6 +126,12 @@ type BinlogEvent interface {
 	// IsWriteRows(), IsUpdateRows(), or IsDeleteRows() returns
 	// true.
 	Rows(BinlogFormat, *TableMap) (Rows, error)
+	// TransactionPayload returns a TransactionPayload type which provides
+	// a GetNextEvent() method to iterate over the events contained within
+	// the uncompressed payload. You must call Close() when you are done
+	// with the TransactionPayload to ensure that the underlying resources
+	// used are cleaned up.
+	TransactionPayload(BinlogFormat) (*TransactionPayload, error)
 	// NextLogFile returns the name of the next binary log file & pos.
 	// This is only valid if IsRotate() returns true
 	NextLogFile(BinlogFormat) (string, uint64, error)
@@ -131,8 +144,9 @@ type BinlogEvent interface {
 	// IsPseudo is for custom implementations of GTID.
 	IsPseudo() bool
 
-	// IsCompressed returns true if a compressed event is found (binlog_transaction_compression=ON)
-	IsCompressed() bool
+	// IsTransactionPayload returns true if a compressed transaction
+	// payload event is found (binlog_transaction_compression=ON).
+	IsTransactionPayload() bool
 
 	// Bytes returns the binary representation of the event
 	Bytes() []byte
@@ -146,7 +160,7 @@ type BinlogFormat struct {
 	HeaderSizes []byte
 
 	// ServerVersion is the name of the MySQL server version.
-	// It starts with something like 5.6.33-xxxx.
+	// It starts with something like 8.0.34-xxxx.
 	ServerVersion string
 
 	// FormatVersion is the version number of the binlog file format.
@@ -209,6 +223,13 @@ type TableMap struct {
 	// - If the metadata is one byte, only the lower 8 bits are used.
 	// - If the metadata is two bytes, all 16 bits are used.
 	Metadata []uint16
+
+	// ColumnCollationIDs contains information about the inherited
+	// or implied column default collation and any explicit per-column
+	// override for text based columns ONLY. This means that the
+	// array position needs to be mapped to the ordered list of
+	// text based columns in the table.
+	ColumnCollationIDs []collations.ID
 }
 
 // Rows contains data from a {WRITE,UPDATE,DELETE}_ROWS_EVENT.
@@ -281,6 +302,11 @@ func (b *Bitmap) Count() int {
 	return b.count
 }
 
+// Bits returns the underlying bitmap.
+func (b *Bitmap) Bits() []byte {
+	return b.data[:]
+}
+
 // Bit returned the value of a given bit in the Bitmap.
 func (b *Bitmap) Bit(index int) bool {
 	byteIndex := index / 8
@@ -304,7 +330,7 @@ func (b *Bitmap) Set(index int, value bool) {
 // hence the non-efficient logic.
 func (b *Bitmap) BitCount() int {
 	sum := 0
-	for i := 0; i < b.count; i++ {
+	for i := range b.count {
 		if b.Bit(i) {
 			sum++
 		}

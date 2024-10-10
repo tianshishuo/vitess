@@ -18,21 +18,42 @@ package reparentutil
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 
-	"vitess.io/vitess/go/mysql"
+	"golang.org/x/exp/maps"
+	"golang.org/x/sync/errgroup"
+
+	"vitess.io/vitess/go/mysql/replication"
+	"vitess.io/vitess/go/mysql/sqlerror"
+	"vitess.io/vitess/go/stats"
+	"vitess.io/vitess/go/vt/concurrency"
+	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/vtctl/reparentutil/promotionrule"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vttablet/tmclient"
 
+	replicationdatapb "vitess.io/vitess/go/vt/proto/replicationdata"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	"vitess.io/vitess/go/vt/proto/vtrpc"
 )
 
-// ChooseNewPrimary finds a tablet that should become a primary after reparent.
+var (
+	reparentShardOpTimings = stats.NewTimings("ReparentShardOperationTimings", "Timings of reparent shard operations", "Operation")
+	failureResult          = "failure"
+	successResult          = "success"
+)
+
+const (
+	lostTopologyLockMsg = "lost topology lock, aborting"
+)
+
+// ElectNewPrimary finds a tablet that should become a primary after reparent.
 // The criteria for the new primary-elect are (preferably) to be in the same
 // cell as the current primary, and to be different from avoidPrimaryAlias. The
 // tablet with the most advanced replication position is chosen to minimize the
@@ -42,13 +63,13 @@ import (
 // with transactions being executed on the current primary, so when all tablets
 // are at roughly the same position, then the choice of new primary-elect will
 // be somewhat unpredictable.
-func ChooseNewPrimary(
+func ElectNewPrimary(
 	ctx context.Context,
 	tmc tmclient.TabletManagerClient,
 	shardInfo *topo.ShardInfo,
 	tabletMap map[string]*topo.TabletInfo,
-	avoidPrimaryAlias *topodatapb.TabletAlias,
-	waitReplicasTimeout time.Duration,
+	innodbBufferPoolData map[string]int,
+	opts *PlannedReparentOptions,
 	// (TODO:@ajm188) it's a little gross we need to pass this, maybe embed in the context?
 	logger logutil.Logger,
 ) (*topodatapb.TabletAlias, error) {
@@ -59,48 +80,78 @@ func ChooseNewPrimary(
 	}
 
 	var (
-		wg sync.WaitGroup
 		// mutex to secure the next two fields from concurrent access
 		mu sync.Mutex
 		// tablets that are possible candidates to be the new primary and their positions
-		validTablets    []*topodatapb.Tablet
-		tabletPositions []mysql.Position
+		validTablets         []*topodatapb.Tablet
+		tabletPositions      []replication.Position
+		innodbBufferPool     []int
+		errorGroup, groupCtx = errgroup.WithContext(ctx)
 	)
 
+	// candidates are the list of tablets that can be potentially promoted after filtering out based on preliminary checks.
+	candidates := []*topodatapb.Tablet{}
+	reasonsToInvalidate := strings.Builder{}
 	for _, tablet := range tabletMap {
 		switch {
-		case primaryCell != "" && tablet.Alias.Cell != primaryCell:
+		case opts.NewPrimaryAlias != nil:
+			// If newPrimaryAlias is provided, then that is the only valid tablet, even if it is not of type replica or in a different cell.
+			if !topoproto.TabletAliasEqual(tablet.Alias, opts.NewPrimaryAlias) {
+				reasonsToInvalidate.WriteString(fmt.Sprintf("\n%v does not match the new primary alias provided", topoproto.TabletAliasString(tablet.Alias)))
+				continue
+			}
+		case !opts.AllowCrossCellPromotion && primaryCell != "" && tablet.Alias.Cell != primaryCell:
+			reasonsToInvalidate.WriteString(fmt.Sprintf("\n%v is not in the same cell as the previous primary", topoproto.TabletAliasString(tablet.Alias)))
 			continue
-		case avoidPrimaryAlias != nil && topoproto.TabletAliasEqual(tablet.Alias, avoidPrimaryAlias):
+		case opts.AvoidPrimaryAlias != nil && topoproto.TabletAliasEqual(tablet.Alias, opts.AvoidPrimaryAlias):
+			reasonsToInvalidate.WriteString(fmt.Sprintf("\n%v matches the primary alias to avoid", topoproto.TabletAliasString(tablet.Alias)))
 			continue
 		case tablet.Tablet.Type != topodatapb.TabletType_REPLICA:
+			reasonsToInvalidate.WriteString(fmt.Sprintf("\n%v is not a replica", topoproto.TabletAliasString(tablet.Alias)))
 			continue
 		}
 
-		wg.Add(1)
-
-		go func(tablet *topodatapb.Tablet) {
-			defer wg.Done()
-			// find and store the positions for the tablet
-			pos, err := findPositionForTablet(ctx, tablet, logger, tmc, waitReplicasTimeout)
-			mu.Lock()
-			defer mu.Unlock()
-			if err == nil {
-				validTablets = append(validTablets, tablet)
-				tabletPositions = append(tabletPositions, pos)
-			}
-		}(tablet.Tablet)
+		candidates = append(candidates, tablet.Tablet)
 	}
 
-	wg.Wait()
+	// There is only one tablet and tolerable replication lag is unspecified,
+	// then we don't need to find the position of the said tablet for sorting.
+	// We can just return the tablet quickly.
+	// This check isn't required, but it saves us an RPC call that is otherwise unnecessary.
+	if len(candidates) == 1 && opts.TolerableReplLag == 0 {
+		return candidates[0].Alias, nil
+	}
 
-	// return nothing if there are no valid tablets available
+	for _, tablet := range candidates {
+		tb := tablet
+		errorGroup.Go(func() error {
+			// find and store the positions for the tablet
+			pos, replLag, err := findPositionAndLagForTablet(groupCtx, tb, logger, tmc, opts.WaitReplicasTimeout)
+			mu.Lock()
+			defer mu.Unlock()
+			if err == nil && (opts.TolerableReplLag == 0 || opts.TolerableReplLag >= replLag) {
+				validTablets = append(validTablets, tb)
+				tabletPositions = append(tabletPositions, pos)
+				innodbBufferPool = append(innodbBufferPool, innodbBufferPoolData[topoproto.TabletAliasString(tb.Alias)])
+			} else {
+				reasonsToInvalidate.WriteString(fmt.Sprintf("\n%v has %v replication lag which is more than the tolerable amount", topoproto.TabletAliasString(tablet.Alias), replLag))
+			}
+			return err
+		})
+	}
+
+	err := errorGroup.Wait()
+	if err != nil {
+		return nil, err
+	}
+
+	// return an error if there are no valid tablets available
 	if len(validTablets) == 0 {
-		return nil, nil
+		return nil, vterrors.Errorf(vtrpc.Code_INTERNAL, "cannot find a tablet to reparent to%v", reasonsToInvalidate.String())
 	}
 
 	// sort the tablets for finding the best primary
-	err := sortTabletsForReparent(validTablets, tabletPositions)
+	err = sortTabletsForReparent(validTablets, tabletPositions, innodbBufferPool, opts.durability)
 	if err != nil {
 		return nil, err
 	}
@@ -108,9 +159,9 @@ func ChooseNewPrimary(
 	return validTablets[0].Alias, nil
 }
 
-// findPositionForTablet processes the replication position for a single tablet and
+// findPositionAndLagForTablet processes the replication position and lag for a single tablet and
 // returns it. It is safe to call from multiple goroutines.
-func findPositionForTablet(ctx context.Context, tablet *topodatapb.Tablet, logger logutil.Logger, tmc tmclient.TabletManagerClient, waitTimeout time.Duration) (mysql.Position, error) {
+func findPositionAndLagForTablet(ctx context.Context, tablet *topodatapb.Tablet, logger logutil.Logger, tmc tmclient.TabletManagerClient, waitTimeout time.Duration) (replication.Position, time.Duration, error) {
 	logger.Infof("getting replication position from %v", topoproto.TabletAliasString(tablet.Alias))
 
 	ctx, cancel := context.WithTimeout(ctx, waitTimeout)
@@ -118,13 +169,13 @@ func findPositionForTablet(ctx context.Context, tablet *topodatapb.Tablet, logge
 
 	status, err := tmc.ReplicationStatus(ctx, tablet)
 	if err != nil {
-		sqlErr, isSQLErr := mysql.NewSQLErrorFromError(err).(*mysql.SQLError)
-		if isSQLErr && sqlErr != nil && sqlErr.Number() == mysql.ERNotReplica {
+		sqlErr, isSQLErr := sqlerror.NewSQLErrorFromError(err).(*sqlerror.SQLError)
+		if isSQLErr && sqlErr != nil && sqlErr.Number() == sqlerror.ERNotReplica {
 			logger.Warningf("no replication statue from %v, using empty gtid set", topoproto.TabletAliasString(tablet.Alias))
-			return mysql.Position{}, nil
+			return replication.Position{}, 0, nil
 		}
 		logger.Warningf("failed to get replication status from %v, ignoring tablet: %v", topoproto.TabletAliasString(tablet.Alias), err)
-		return mysql.Position{}, err
+		return replication.Position{}, 0, err
 	}
 
 	// Use the relay log position if available, otherwise use the executed GTID set (binary log position).
@@ -132,13 +183,13 @@ func findPositionForTablet(ctx context.Context, tablet *topodatapb.Tablet, logge
 	if status.RelayLogPosition != "" {
 		positionString = status.RelayLogPosition
 	}
-	pos, err := mysql.DecodePosition(positionString)
+	pos, err := replication.DecodePosition(positionString)
 	if err != nil {
 		logger.Warningf("cannot decode replica position %v for tablet %v, ignoring tablet: %v", positionString, topoproto.TabletAliasString(tablet.Alias), err)
-		return mysql.Position{}, err
+		return replication.Position{}, 0, err
 	}
 
-	return pos, nil
+	return pos, time.Second * time.Duration(status.ReplicationLagSeconds), nil
 }
 
 // FindCurrentPrimary returns the current primary tablet of a shard, if any. The
@@ -193,10 +244,56 @@ func FindCurrentPrimary(tabletMap map[string]*topo.TabletInfo, logger logutil.Lo
 	return currentPrimary
 }
 
+// ShardReplicationStatuses returns the ReplicationStatus for each tablet in a shard.
+func ShardReplicationStatuses(ctx context.Context, ts *topo.Server, tmc tmclient.TabletManagerClient, keyspace, shard string) ([]*topo.TabletInfo, []*replicationdatapb.Status, error) {
+	tabletMap, err := ts.GetTabletMapForShard(ctx, keyspace, shard)
+	if err != nil {
+		return nil, nil, err
+	}
+	tablets := maps.Values(tabletMap)
+
+	log.Infof("Gathering tablet replication status for: %v", tablets)
+	wg := sync.WaitGroup{}
+	rec := concurrency.AllErrorRecorder{}
+	result := make([]*replicationdatapb.Status, len(tablets))
+
+	for i, ti := range tablets {
+		// Don't scan tablets that won't return something
+		// useful. Otherwise, you'll end up waiting for a timeout.
+		if ti.Type == topodatapb.TabletType_PRIMARY {
+			wg.Add(1)
+			go func(i int, ti *topo.TabletInfo) {
+				defer wg.Done()
+				pos, err := tmc.PrimaryPosition(ctx, ti.Tablet)
+				if err != nil {
+					rec.RecordError(fmt.Errorf("PrimaryPosition(%v) failed: %v", ti.AliasString(), err))
+					return
+				}
+				result[i] = &replicationdatapb.Status{
+					Position: pos,
+				}
+			}(i, ti)
+		} else if ti.IsReplicaType() {
+			wg.Add(1)
+			go func(i int, ti *topo.TabletInfo) {
+				defer wg.Done()
+				status, err := tmc.ReplicationStatus(ctx, ti.Tablet)
+				if err != nil {
+					rec.RecordError(fmt.Errorf("ReplicationStatus(%v) failed: %v", ti.AliasString(), err))
+					return
+				}
+				result[i] = status
+			}(i, ti)
+		}
+	}
+	wg.Wait()
+	return tablets, result, rec.Error()
+}
+
 // getValidCandidatesAndPositionsAsList converts the valid candidates from a map to a list of tablets, making it easier to sort
-func getValidCandidatesAndPositionsAsList(validCandidates map[string]mysql.Position, tabletMap map[string]*topo.TabletInfo) ([]*topodatapb.Tablet, []mysql.Position, error) {
+func getValidCandidatesAndPositionsAsList(validCandidates map[string]replication.Position, tabletMap map[string]*topo.TabletInfo) ([]*topodatapb.Tablet, []replication.Position, error) {
 	var validTablets []*topodatapb.Tablet
-	var tabletPositions []mysql.Position
+	var tabletPositions []replication.Position
 	for tabletAlias, position := range validCandidates {
 		tablet, isFound := tabletMap[tabletAlias]
 		if !isFound {
@@ -209,8 +306,8 @@ func getValidCandidatesAndPositionsAsList(validCandidates map[string]mysql.Posit
 }
 
 // restrictValidCandidates is used to restrict some candidates from being considered eligible for becoming the intermediate source or the final promotion candidate
-func restrictValidCandidates(validCandidates map[string]mysql.Position, tabletMap map[string]*topo.TabletInfo) (map[string]mysql.Position, error) {
-	restrictedValidCandidates := make(map[string]mysql.Position)
+func restrictValidCandidates(validCandidates map[string]replication.Position, tabletMap map[string]*topo.TabletInfo) (map[string]replication.Position, error) {
+	restrictedValidCandidates := make(map[string]replication.Position)
 	for candidate, position := range validCandidates {
 		candidateInfo, ok := tabletMap[candidate]
 		if !ok {
@@ -225,47 +322,32 @@ func restrictValidCandidates(validCandidates map[string]mysql.Position, tabletMa
 	return restrictedValidCandidates, nil
 }
 
-func findCandidateSameCell(
-	newPrimary *topodatapb.Tablet,
-	prevPrimary *topodatapb.Tablet,
-	possibleCandidates []*topodatapb.Tablet,
-) *topodatapb.Tablet {
-	// check whether the one we have selected as the source is in the same cell and belongs to the candidate list provided
-	for _, candidate := range possibleCandidates {
-		if !(topoproto.TabletAliasEqual(newPrimary.Alias, candidate.Alias)) {
-			continue
-		}
-		if prevPrimary != nil && !(prevPrimary.Alias.Cell == candidate.Alias.Cell) {
-			continue
-		}
-		return candidate
-	}
-	// check whether there is some other tablet in the same cell belonging to the candidate list provided
-	for _, candidate := range possibleCandidates {
-		if prevPrimary != nil && !(prevPrimary.Alias.Cell == candidate.Alias.Cell) {
-			continue
-		}
-		return candidate
-	}
-	return nil
-}
-
-func findCandidateAnyCell(
-	newPrimary *topodatapb.Tablet,
+func findCandidate(
+	intermediateSource *topodatapb.Tablet,
 	possibleCandidates []*topodatapb.Tablet,
 ) *topodatapb.Tablet {
 	// check whether the one we have selected as the source belongs to the candidate list provided
 	for _, candidate := range possibleCandidates {
-		if !(topoproto.TabletAliasEqual(newPrimary.Alias, candidate.Alias)) {
-			continue
+		if topoproto.TabletAliasEqual(intermediateSource.Alias, candidate.Alias) {
+			return candidate
 		}
-		return candidate
 	}
 	// return the first candidate from this list, if it isn't empty
 	if len(possibleCandidates) > 0 {
 		return possibleCandidates[0]
 	}
 	return nil
+}
+
+// getTabletsWithPromotionRules gets the tablets with the given promotion rule from the list of tablets
+func getTabletsWithPromotionRules(durability Durabler, tablets []*topodatapb.Tablet, rule promotionrule.CandidatePromotionRule) (res []*topodatapb.Tablet) {
+	for _, candidate := range tablets {
+		promotionRule := PromotionRule(durability, candidate)
+		if promotionRule == rule {
+			res = append(res, candidate)
+		}
+	}
+	return res
 }
 
 // waitForCatchUp is used to wait for the given tablet until it has caught up to the source
@@ -292,4 +374,16 @@ func waitForCatchUp(
 		return err
 	}
 	return nil
+}
+
+// GetBackupCandidates is used to get a list of healthy tablets for backup
+func GetBackupCandidates(tablets []*topo.TabletInfo, stats []*replicationdatapb.Status) (res []*topo.TabletInfo) {
+	for i, stat := range stats {
+		// shardTablets[i] and stats[i] is 1:1 mapping
+		// Always include TabletType_PRIMARY. Healthy shardTablets[i] will be added to tablets
+		if tablets[i].Type == topodatapb.TabletType_PRIMARY || stat != nil {
+			res = append(res, tablets[i])
+		}
+	}
+	return res
 }

@@ -17,13 +17,13 @@ limitations under the License.
 package vtgate
 
 import (
-	"fmt"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"text/template"
 	"time"
+
+	"vitess.io/vitess/go/vt/vtgate/logstats"
 
 	"vitess.io/vitess/go/acl"
 	"vitess.io/vitess/go/vt/log"
@@ -39,6 +39,7 @@ var (
 				<th>Context</th>
 				<th>Effective Caller</th>
 				<th>Immediate Caller</th>
+				<th>SessionUUID</th>
 				<th>Start</th>
 				<th>End</th>
 				<th>Duration</th>
@@ -54,10 +55,9 @@ var (
 		</thead>
 	`)
 	querylogzFuncMap = template.FuncMap{
-		"stampMicro":    func(t time.Time) string { return t.Format(time.StampMicro) },
-		"cssWrappable":  logz.Wrappable,
-		"truncateQuery": sqlparser.TruncateForUI,
-		"unquote":       func(s string) string { return strings.Trim(s, "\"") },
+		"stampMicro":   func(t time.Time) string { return t.Format(time.StampMicro) },
+		"cssWrappable": logz.Wrappable,
+		"unquote":      func(s string) string { return strings.Trim(s, "\"") },
 	}
 	querylogzTmpl = template.Must(template.New("example").Funcs(querylogzFuncMap).Parse(`
 		<tr class="{{.ColorLevel}}">
@@ -65,6 +65,7 @@ var (
 			<td>{{.ContextHTML}}</td>
 			<td>{{.EffectiveCaller}}</td>
 			<td>{{.ImmediateCaller}}</td>
+			<td>{{.SessionUUID}}</td>
 			<td>{{.StartTime | stampMicro}}</td>
 			<td>{{.EndTime | stampMicro}}</td>
 			<td>{{.TotalTime.Seconds}}</td>
@@ -72,7 +73,7 @@ var (
 			<td>{{.ExecuteTime.Seconds}}</td>
 			<td>{{.CommitTime.Seconds}}</td>
 			<td>{{.StmtType}}</td>
-			<td>{{.SQL | truncateQuery | unquote | cssWrappable}}</td>
+			<td>{{.SQL | .Parser.TruncateForUI | unquote | cssWrappable}}</td>
 			<td>{{.ShardQueries}}</td>
 			<td>{{.RowsAffected}}</td>
 			<td>{{.ErrorStr}}</td>
@@ -82,7 +83,7 @@ var (
 
 // querylogzHandler serves a human readable snapshot of the
 // current query log.
-func querylogzHandler(ch chan interface{}, w http.ResponseWriter, r *http.Request) {
+func querylogzHandler(ch chan *logstats.LogStats, w http.ResponseWriter, r *http.Request, parser *sqlparser.Parser) {
 	if err := acl.CheckAccessHTTP(r, acl.DEBUGGING); err != nil {
 		acl.SendError(w, err)
 		return
@@ -96,20 +97,11 @@ func querylogzHandler(ch chan interface{}, w http.ResponseWriter, r *http.Reques
 	defer tmr.Stop()
 	for i := 0; i < limit; i++ {
 		select {
-		case out := <-ch:
+		case stats := <-ch:
 			select {
 			case <-tmr.C:
 				return
 			default:
-			}
-			stats, ok := out.(*LogStats)
-			if !ok {
-				err := fmt.Errorf("unexpected value in %s: %#v (expecting value of type %T)", QueryLogger.Name(), out, &LogStats{})
-				_, _ = io.WriteString(w, `<tr class="error">`)
-				_, _ = io.WriteString(w, err.Error())
-				_, _ = io.WriteString(w, "</tr>")
-				log.Error(err)
-				continue
 			}
 			var level string
 			if stats.TotalTime().Seconds() < 0.01 {
@@ -120,9 +112,10 @@ func querylogzHandler(ch chan interface{}, w http.ResponseWriter, r *http.Reques
 				level = "high"
 			}
 			tmplData := struct {
-				*LogStats
+				*logstats.LogStats
 				ColorLevel string
-			}{stats, level}
+				Parser     *sqlparser.Parser
+			}{stats, level, parser}
 			if err := querylogzTmpl.Execute(w, tmplData); err != nil {
 				log.Errorf("querylogz: couldn't execute template: %v", err)
 			}

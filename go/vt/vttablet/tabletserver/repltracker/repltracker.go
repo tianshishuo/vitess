@@ -23,9 +23,11 @@ import (
 	"vitess.io/vitess/go/stats"
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/mysqlctl"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/heartbeat"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
+
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
-	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
 )
 
 var (
@@ -50,8 +52,7 @@ var (
 
 // ReplTracker tracks replication lag.
 type ReplTracker struct {
-	mode           string
-	forceHeartbeat bool
+	mode string
 
 	mu        sync.Mutex
 	isPrimary bool
@@ -64,12 +65,16 @@ type ReplTracker struct {
 // NewReplTracker creates a new ReplTracker.
 func NewReplTracker(env tabletenv.Env, alias *topodatapb.TabletAlias) *ReplTracker {
 	return &ReplTracker{
-		mode:           env.Config().ReplicationTracker.Mode,
-		forceHeartbeat: env.Config().EnableLagThrottler,
-		hw:             newHeartbeatWriter(env, alias),
-		hr:             newHeartbeatReader(env),
-		poller:         &poller{},
+		mode:   env.Config().ReplicationTracker.Mode,
+		hw:     newHeartbeatWriter(env, alias),
+		hr:     newHeartbeatReader(env),
+		poller: &poller{},
 	}
+}
+
+// HeartbeatWriter returns the heartbeat writer used by this tracker
+func (rt *ReplTracker) HeartbeatWriter() heartbeat.HeartbeatWriter {
+	return rt.hw
 }
 
 // InitDBConfig initializes the target name.
@@ -90,9 +95,7 @@ func (rt *ReplTracker) MakePrimary() {
 		rt.hr.Close()
 		rt.hw.Open()
 	}
-	if rt.forceHeartbeat {
-		rt.hw.Open()
-	}
+	rt.hw.Open()
 }
 
 // MakeNonPrimary must be called if the tablet type becomes non-PRIMARY.
@@ -110,9 +113,7 @@ func (rt *ReplTracker) MakeNonPrimary() {
 		// Run the status once to pre-initialize values.
 		rt.poller.Status()
 	}
-	if rt.forceHeartbeat {
-		rt.hw.Close()
-	}
+	rt.hw.Close()
 }
 
 // Close closes ReplTracker.
@@ -140,5 +141,9 @@ func (rt *ReplTracker) Status() (time.Duration, error) {
 // EnableHeartbeat enables or disables writes of heartbeat. This functionality
 // is only used by tests.
 func (rt *ReplTracker) EnableHeartbeat(enable bool) {
-	rt.hw.enableWrites(enable)
+	if enable {
+		rt.hw.enableWrites()
+	} else {
+		rt.hw.disableWrites()
+	}
 }

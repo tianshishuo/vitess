@@ -17,102 +17,83 @@ limitations under the License.
 package sqlparser
 
 import (
-	"bytes"
 	"io"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestParseNextValid concatenates all the valid SQL test cases and check it can read
 // them as one long string.
 func TestParseNextValid(t *testing.T) {
-	var sql bytes.Buffer
+	var sql strings.Builder
 	for _, tcase := range validSQL {
 		sql.WriteString(strings.TrimSuffix(tcase.input, ";"))
 		sql.WriteRune(';')
 	}
 
-	tokens := NewStringTokenizer(sql.String())
-	for i, tcase := range validSQL {
-		input := tcase.input + ";"
+	parser := NewTestParser()
+	tokens := parser.NewStringTokenizer(sql.String())
+	for _, tcase := range validSQL {
 		want := tcase.output
 		if want == "" {
 			want = tcase.input
 		}
 
 		tree, err := ParseNext(tokens)
-		if err != nil {
-			t.Fatalf("[%d] ParseNext(%q) err: %q, want nil", i, input, err)
-			continue
-		}
-
-		if got := String(tree); got != want {
-			t.Fatalf("[%d] ParseNext(%q) = %q, want %q", i, input, got, want)
-		}
+		require.NoError(t, err)
+		require.Equal(t, want, String(tree))
 	}
 
 	// Read once more and it should be EOF.
-	if tree, err := ParseNext(tokens); err != io.EOF {
-		t.Errorf("ParseNext(tokens) = (%q, %v) want io.EOF", String(tree), err)
-	}
+	tree, err := ParseNext(tokens)
+	require.ErrorIsf(t, err, io.EOF, "ParseNext(tokens) = (%q, %v) want io.EOF", String(tree), err)
 }
 
 func TestIgnoreSpecialComments(t *testing.T) {
 	input := `SELECT 1;/*! ALTER TABLE foo DISABLE KEYS */;SELECT 2;`
 
-	tokenizer := NewStringTokenizer(input)
+	parser := NewTestParser()
+	tokenizer := parser.NewStringTokenizer(input)
 	tokenizer.SkipSpecialComments = true
 	one, err := ParseNextStrictDDL(tokenizer)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
+	require.Equal(t, "select 1 from dual", String(one))
 	two, err := ParseNextStrictDDL(tokenizer)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := String(one), "select 1 from dual"; got != want {
-		t.Fatalf("got %s want %s", got, want)
-	}
-	if got, want := String(two), "select 2 from dual"; got != want {
-		t.Fatalf("got %s want %s", got, want)
-	}
+	require.NoError(t, err)
+	require.Equal(t, "select 2 from dual", String(two))
 }
 
 // TestParseNextErrors tests all the error cases, and ensures a valid
 // SQL statement can be passed afterwards.
 func TestParseNextErrors(t *testing.T) {
+	parser := NewTestParser()
 	for _, tcase := range invalidSQL {
 		if tcase.excludeMulti {
 			// Skip tests which leave unclosed strings, or comments.
 			continue
 		}
+		t.Run(tcase.input, func(t *testing.T) {
+			sql := tcase.input + "; select 1 from t"
+			tokens := parser.NewStringTokenizer(sql)
 
-		sql := tcase.input + "; select 1 from t"
-		tokens := NewStringTokenizer(sql)
+			// The first statement should be an error
+			_, err := ParseNextStrictDDL(tokens)
+			require.EqualError(t, err, tcase.output)
 
-		// The first statement should be an error
-		_, err := ParseNext(tokens)
-		if err == nil || err.Error() != tcase.output {
-			t.Fatalf("[0] ParseNext(%q) err: %q, want %q", sql, err, tcase.output)
-			continue
-		}
+			// The second should be valid
+			tree, err := ParseNextStrictDDL(tokens)
+			require.NoError(t, err)
 
-		// The second should be valid
-		tree, err := ParseNext(tokens)
-		if err != nil {
-			t.Fatalf("[1] ParseNext(%q) err: %q, want nil", sql, err)
-			continue
-		}
+			want := "select 1 from t"
+			assert.Equal(t, want, String(tree))
 
-		want := "select 1 from t"
-		if got := String(tree); got != want {
-			t.Fatalf("[1] ParseNext(%q) = %q, want %q", sql, got, want)
-		}
-
-		// Read once more and it should be EOF.
-		if tree, err := ParseNext(tokens); err != io.EOF {
-			t.Errorf("ParseNext(tokens) = (%q, %v) want io.EOF", String(tree), err)
-		}
+			// Read once more and it should be EOF.
+			_, err = ParseNextStrictDDL(tokens)
+			require.Same(t, io.EOF, err)
+		})
 	}
 }
 
@@ -155,16 +136,13 @@ func TestParseNextEdgeCases(t *testing.T) {
 		input: "create table a ignore me this is garbage; select 1 from a",
 		want:  []string{"create table a", "select 1 from a"},
 	}}
-
+	parser := NewTestParser()
 	for _, test := range tests {
-		tokens := NewStringTokenizer(test.input)
+		tokens := parser.NewStringTokenizer(test.input)
 
 		for i, want := range test.want {
 			tree, err := ParseNext(tokens)
-			if err != nil {
-				t.Fatalf("[%d] ParseNext(%q) err = %q, want nil", i, test.input, err)
-				continue
-			}
+			require.NoError(t, err)
 
 			if got := String(tree); got != want {
 				t.Fatalf("[%d] ParseNext(%q) = %q, want %q", i, test.input, got, want)
@@ -190,7 +168,8 @@ func TestParseNextStrictNonStrict(t *testing.T) {
 	want := []string{"create table a", "select 1 from a"}
 
 	// First go through as expected with non-strict DDL parsing.
-	tokens := NewStringTokenizer(input)
+	parser := NewTestParser()
+	tokens := parser.NewStringTokenizer(input)
 	for i, want := range want {
 		tree, err := ParseNext(tokens)
 		if err != nil {
@@ -202,7 +181,7 @@ func TestParseNextStrictNonStrict(t *testing.T) {
 	}
 
 	// Now try again with strict parsing and observe the expected error.
-	tokens = NewStringTokenizer(input)
+	tokens = parser.NewStringTokenizer(input)
 	_, err := ParseNextStrictDDL(tokens)
 	if err == nil || !strings.Contains(err.Error(), "ignore") {
 		t.Fatalf("ParseNext(%q) err = %q, want ignore", input, err)

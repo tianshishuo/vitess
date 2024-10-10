@@ -17,10 +17,10 @@ limitations under the License.
 package vindexes
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/sqltypes"
@@ -30,22 +30,66 @@ import (
 var null SingleColumn
 
 func init() {
-	hv, err := CreateVindex("null", "nn", map[string]string{"Table": "t", "Column": "c"})
+	hv, err := CreateVindex("null", "nn", map[string]string{})
 	if err != nil {
 		panic(err)
+	}
+	unknownParams := hv.(ParamValidating).UnknownParams()
+	if len(unknownParams) > 0 {
+		panic("null test init: expected 0 unknown params")
 	}
 	null = hv.(SingleColumn)
 }
 
-func TestNullInfo(t *testing.T) {
-	assert.Equal(t, 100, null.Cost())
-	assert.Equal(t, "nn", null.String())
-	assert.True(t, null.IsUnique())
-	assert.False(t, null.NeedsVCursor())
+func nullCreateVindexTestCase(
+	testName string,
+	vindexParams map[string]string,
+	expectErr error,
+	expectUnknownParams []string,
+) createVindexTestCase {
+	return createVindexTestCase{
+		testName: testName,
+
+		vindexType:   "null",
+		vindexName:   "null",
+		vindexParams: vindexParams,
+
+		expectCost:          100,
+		expectErr:           expectErr,
+		expectIsUnique:      true,
+		expectNeedsVCursor:  false,
+		expectString:        "null",
+		expectUnknownParams: expectUnknownParams,
+	}
+}
+
+func TestNullCreateVindex(t *testing.T) {
+	cases := []createVindexTestCase{
+		nullCreateVindexTestCase(
+			"no params",
+			nil,
+			nil,
+			nil,
+		),
+		nullCreateVindexTestCase(
+			"empty params",
+			map[string]string{},
+			nil,
+			nil,
+		),
+		nullCreateVindexTestCase(
+			"unknown params",
+			map[string]string{"hello": "world"},
+			nil,
+			[]string{"hello"},
+		),
+	}
+
+	testCreateVindexes(t, cases)
 }
 
 func TestNullMap(t *testing.T) {
-	got, err := null.Map(nil, []sqltypes.Value{
+	got, err := null.Map(context.Background(), nil, []sqltypes.Value{
 		sqltypes.NewInt64(1),
 		sqltypes.NewInt64(2),
 		sqltypes.NewInt64(3),
@@ -74,7 +118,7 @@ func TestNullMap(t *testing.T) {
 func TestNullVerify(t *testing.T) {
 	ids := []sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewInt64(2)}
 	ksids := [][]byte{{0}, {1}}
-	got, err := null.Verify(nil, ids, ksids)
+	got, err := null.Verify(context.Background(), nil, ids, ksids)
 	if err != nil {
 		t.Fatal(err)
 	}

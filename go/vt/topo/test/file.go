@@ -17,18 +17,16 @@ limitations under the License.
 package test
 
 import (
-	"reflect"
-	"testing"
-
 	"context"
+	"reflect"
+	"strings"
+	"testing"
 
 	"vitess.io/vitess/go/vt/topo"
 )
 
 // checkFile tests the file part of the Conn API.
-func checkFile(t *testing.T, ts *topo.Server) {
-	ctx := context.Background()
-
+func checkFile(t *testing.T, ctx context.Context, ts *topo.Server) {
 	// global cell
 	t.Logf("===   checkFileInCell global")
 	conn, err := ts.ConnForCell(ctx, topo.GlobalCell)
@@ -200,4 +198,52 @@ func checkFileInCell(t *testing.T, conn topo.Conn, hasCells bool) {
 	// ListDir root: nothing.
 	expected = expected[:len(expected)-1]
 	checkListDir(ctx, t, conn, "/", expected)
+}
+
+// checkList tests the file part of the Conn API.
+func checkList(t *testing.T, ctx context.Context, ts *topo.Server) {
+	// global cell
+	conn, err := ts.ConnForCell(ctx, LocalCellName)
+	if err != nil {
+		t.Fatalf("ConnForCell(LocalCellName) failed: %v", err)
+	}
+
+	_, err = conn.Create(ctx, "/some/arbitrary/file", []byte{'a'})
+	if err != nil {
+		t.Fatalf("Create('/myfile') failed: %v", err)
+	}
+
+	_, err = conn.List(ctx, "/")
+	if topo.IsErrType(err, topo.NoImplementation) {
+		// If this is not supported, skip the test
+		t.Skipf("%T does not support List()", conn)
+		return
+	}
+	if err != nil {
+		t.Fatalf("List(test) failed: %v", err)
+	}
+
+	_, err = conn.Create(ctx, "/toplevel/nested/myfile", []byte{'a'})
+	if err != nil {
+		t.Fatalf("Create('/myfile') failed: %v", err)
+	}
+
+	for _, path := range []string{"/top", "/toplevel", "/toplevel/", "/toplevel/nes", "/toplevel/nested/myfile"} {
+		entries, err := conn.List(ctx, path)
+		if err != nil {
+			t.Fatalf("List failed(path: %q): %v", path, err)
+		}
+
+		if len(entries) != 1 {
+			t.Fatalf("List(test) returned incorrect number of elements for path %q. Expected 1, got %d: %v", path, len(entries), entries)
+		}
+
+		if !strings.HasSuffix(string(entries[0].Key), "/toplevel/nested/myfile") {
+			t.Fatalf("found entry doesn't end with /toplevel/nested/myfile for path %q: %s", path, string(entries[0].Key))
+		}
+
+		if string(entries[0].Value) != "a" {
+			t.Fatalf("found entry doesn't have value \"a\" for path %q: %s", path, string(entries[0].Value))
+		}
+	}
 }

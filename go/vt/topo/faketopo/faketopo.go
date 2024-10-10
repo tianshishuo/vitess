@@ -20,13 +20,13 @@ import (
 	"context"
 	"strings"
 	"sync"
-
-	"vitess.io/vitess/go/vt/topo/memorytopo"
+	"time"
 
 	"vitess.io/vitess/go/vt/log"
-	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
-
 	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/topo/memorytopo"
+
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 // FakeFactory implements the Factory interface. This is supposed to be used only for testing
@@ -254,6 +254,11 @@ func (f *FakeConn) Get(ctx context.Context, filePath string) ([]byte, topo.Versi
 	return res.contents, memorytopo.NodeVersion(res.version), nil
 }
 
+// GetVersion is part of topo.Conn interface.
+func (f *FakeConn) GetVersion(ctx context.Context, filePath string, version int64) ([]byte, error) {
+	return nil, topo.NewError(topo.NoImplementation, "GetVersion not supported in fake topo")
+}
+
 // List is part of the topo.Conn interface.
 func (f *FakeConn) List(ctx context.Context, filePathPrefix string) ([]topo.KVInfo, error) {
 	return nil, topo.NewError(topo.NoImplementation, "List not supported in fake topo")
@@ -287,13 +292,32 @@ func (f *FakeConn) Lock(ctx context.Context, dirPath, contents string) (topo.Loc
 	return &fakeLockDescriptor{}, nil
 }
 
+// LockWithTTL implements the Conn interface.
+func (f *FakeConn) LockWithTTL(ctx context.Context, dirPath, contents string, _ time.Duration) (topo.LockDescriptor, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return &fakeLockDescriptor{}, nil
+}
+
+// LockName implements the Conn interface.
+func (f *FakeConn) LockName(ctx context.Context, dirPath, contents string) (topo.LockDescriptor, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return &fakeLockDescriptor{}, nil
+}
+
+// TryLock is part of the topo.Conn interface. Its implementation is same as Lock
+func (f *FakeConn) TryLock(ctx context.Context, dirPath, contents string) (topo.LockDescriptor, error) {
+	return f.Lock(ctx, dirPath, contents)
+}
+
 // Watch implements the Conn interface
-func (f *FakeConn) Watch(ctx context.Context, filePath string) (*topo.WatchData, <-chan *topo.WatchData, topo.CancelFunc) {
+func (f *FakeConn) Watch(ctx context.Context, filePath string) (*topo.WatchData, <-chan *topo.WatchData, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	res, isPresent := f.getResultMap[filePath]
 	if !isPresent {
-		return &topo.WatchData{Err: topo.NewError(topo.NoNode, filePath)}, nil, nil
+		return nil, nil, topo.NewError(topo.NoNode, filePath)
 	}
 	current := &topo.WatchData{
 		Contents: res.contents,
@@ -303,7 +327,8 @@ func (f *FakeConn) Watch(ctx context.Context, filePath string) (*topo.WatchData,
 	notifications := make(chan *topo.WatchData, 100)
 	f.watches[filePath] = append(f.watches[filePath], notifications)
 
-	cancel := func() {
+	go func() {
+		<-ctx.Done()
 		watches, isPresent := f.watches[filePath]
 		if !isPresent {
 			return
@@ -315,8 +340,12 @@ func (f *FakeConn) Watch(ctx context.Context, filePath string) (*topo.WatchData,
 				break
 			}
 		}
-	}
-	return current, notifications, cancel
+	}()
+	return current, notifications, nil
+}
+
+func (f *FakeConn) WatchRecursive(ctx context.Context, path string) ([]*topo.WatchDataRecursive, <-chan *topo.WatchDataRecursive, error) {
+	panic("implement me")
 }
 
 // NewLeaderParticipation implements the Conn interface
@@ -330,13 +359,13 @@ func (f *FakeConn) Close() {
 }
 
 // NewFakeTopoServer creates a new fake topo server
-func NewFakeTopoServer(factory *FakeFactory) *topo.Server {
+func NewFakeTopoServer(ctx context.Context, factory *FakeFactory) *topo.Server {
 	ts, err := topo.NewWithFactory(factory, "" /*serverAddress*/, "" /*root*/)
 	if err != nil {
 		log.Exitf("topo.NewWithFactory() failed: %v", err)
 	}
 	for cell := range factory.cells {
-		if err := ts.CreateCellInfo(context.Background(), cell, &topodatapb.CellInfo{}); err != nil {
+		if err := ts.CreateCellInfo(ctx, cell, &topodatapb.CellInfo{}); err != nil {
 			log.Exitf("ts.CreateCellInfo(%v) failed: %v", cell, err)
 		}
 	}

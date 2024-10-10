@@ -30,37 +30,35 @@ package servenv
 
 import (
 	"flag"
+	"fmt"
 	"net/url"
 	"os"
-	"os/signal"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
-	// register the HTTP handlers for profiling
-	_ "net/http/pprof"
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	"vitess.io/vitess/go/event"
 	"vitess.io/vitess/go/netutil"
 	"vitess.io/vitess/go/stats"
+	"vitess.io/vitess/go/trace"
+	"vitess.io/vitess/go/viperutil"
+	viperdebug "vitess.io/vitess/go/viperutil/debug"
+	"vitess.io/vitess/go/vt/grpccommon"
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/vterrors"
 
-	// register the proper init and shutdown hooks for logging
-	_ "vitess.io/vitess/go/vt/logutil"
+	// Include deprecation warnings for soon-to-be-unsupported flag invocations.
+	_flag "vitess.io/vitess/go/internal/flag"
 )
 
 var (
-	// Port is part of the flags used when calling RegisterDefaultFlags.
-	Port *int
-
-	// Flags to alter the behavior of the library.
-	lameduckPeriod = flag.Duration("lameduck-period", 50*time.Millisecond, "keep running at least this long after SIGTERM before stopping")
-	onTermTimeout  = flag.Duration("onterm_timeout", 10*time.Second, "wait no more than this for OnTermSync handlers before stopping")
-	onCloseTimeout = flag.Duration("onclose_timeout", time.Nanosecond, "wait no more than this for OnClose handlers before stopping")
-	_              = flag.Int("mem-profile-rate", 512*1024, "deprecated: use '-pprof=mem' instead")
-	_              = flag.Int("mutex-profile-fraction", 0, "deprecated: use '-pprof=mutex' instead")
-	catchSigpipe   = flag.Bool("catch-sigpipe", false, "catch and ignore SIGPIPE on stdout and stderr if specified")
+	// port is part of the flags used when calling RegisterDefaultFlags.
+	port        int
+	bindAddress string
 
 	// mutex used to protect the Init function
 	mu sync.Mutex
@@ -75,50 +73,64 @@ var (
 	ListeningURL url.URL
 )
 
-// Init is the first phase of the server startup.
-func Init() {
+// Flags specific to Init, Run, and RunDefault functions.
+var (
+	catchSigpipe         bool
+	maxStackSize         = 64 * 1024 * 1024
+	initStartTime        time.Time // time when tablet init started: for debug purposes to time how long a tablet init takes
+	tableRefreshInterval int
+)
+
+type TimeoutFlags struct {
+	LameduckPeriod time.Duration
+	OnTermTimeout  time.Duration
+	OnCloseTimeout time.Duration
+}
+
+var timeouts = &TimeoutFlags{
+	LameduckPeriod: 50 * time.Millisecond,
+	OnTermTimeout:  10 * time.Second,
+	OnCloseTimeout: 10 * time.Second,
+}
+
+// RegisterFlags installs the flags used by Init, Run, and RunDefault.
+//
+// This must be called before servenv.ParseFlags if using any of those
+// functions.
+func RegisterFlags() {
+	OnParse(func(fs *pflag.FlagSet) {
+		fs.DurationVar(&timeouts.LameduckPeriod, "lameduck-period", timeouts.LameduckPeriod, "keep running at least this long after SIGTERM before stopping")
+		fs.DurationVar(&timeouts.OnTermTimeout, "onterm_timeout", timeouts.OnTermTimeout, "wait no more than this for OnTermSync handlers before stopping")
+		fs.DurationVar(&timeouts.OnCloseTimeout, "onclose_timeout", timeouts.OnCloseTimeout, "wait no more than this for OnClose handlers before stopping")
+		fs.BoolVar(&catchSigpipe, "catch-sigpipe", catchSigpipe, "catch and ignore SIGPIPE on stdout and stderr if specified")
+		fs.IntVar(&maxStackSize, "max-stack-size", maxStackSize, "configure the maximum stack size in bytes")
+		fs.IntVar(&tableRefreshInterval, "table-refresh-interval", tableRefreshInterval, "interval in milliseconds to refresh tables in status page with refreshRequired class")
+
+		// pid_file.go
+		fs.StringVar(&pidFile, "pid_file", pidFile, "If set, the process will write its pid to the named file, and delete it on graceful shutdown.")
+	})
+}
+
+func RegisterFlagsWithTimeouts(tf *TimeoutFlags) {
+	OnParse(func(fs *pflag.FlagSet) {
+		fs.DurationVar(&tf.LameduckPeriod, "lameduck-period", tf.LameduckPeriod, "keep running at least this long after SIGTERM before stopping")
+		fs.DurationVar(&tf.OnTermTimeout, "onterm_timeout", tf.OnTermTimeout, "wait no more than this for OnTermSync handlers before stopping")
+		fs.DurationVar(&tf.OnCloseTimeout, "onclose_timeout", tf.OnCloseTimeout, "wait no more than this for OnClose handlers before stopping")
+		fs.BoolVar(&catchSigpipe, "catch-sigpipe", catchSigpipe, "catch and ignore SIGPIPE on stdout and stderr if specified")
+		fs.IntVar(&maxStackSize, "max-stack-size", maxStackSize, "configure the maximum stack size in bytes")
+		fs.IntVar(&tableRefreshInterval, "table-refresh-interval", tableRefreshInterval, "interval in milliseconds to refresh tables in status page with refreshRequired class")
+
+		// pid_file.go
+		fs.StringVar(&pidFile, "pid_file", pidFile, "If set, the process will write its pid to the named file, and delete it on graceful shutdown.")
+
+		timeouts = tf
+	})
+}
+
+func GetInitStartTime() time.Time {
 	mu.Lock()
 	defer mu.Unlock()
-
-	// Ignore SIGPIPE if specified
-	// The Go runtime catches SIGPIPE for us on all fds except stdout/stderr
-	// See https://golang.org/pkg/os/signal/#hdr-SIGPIPE
-	if *catchSigpipe {
-		sigChan := make(chan os.Signal, 1)
-		signal.Notify(sigChan, syscall.SIGPIPE)
-		go func() {
-			<-sigChan
-			log.Warning("Caught SIGPIPE (ignoring all future SIGPIPEs)")
-			signal.Ignore(syscall.SIGPIPE)
-		}()
-	}
-
-	// Add version tag to every info log
-	log.Infof(AppVersion.String())
-	if inited {
-		log.Fatal("servenv.Init called second time")
-	}
-	inited = true
-
-	// Once you run as root, you pretty much destroy the chances of a
-	// non-privileged user starting the program correctly.
-	if uid := os.Getuid(); uid == 0 {
-		log.Exitf("servenv.Init: running this as root makes no sense")
-	}
-
-	// We used to set this limit directly, but you pretty much have to
-	// use a root account to allow increasing a limit reliably. Dropping
-	// privileges is also tricky. The best strategy is to make a shell
-	// script set up the limits as root and switch users before starting
-	// the server.
-	fdLimit := &syscall.Rlimit{}
-	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, fdLimit); err != nil {
-		log.Errorf("max-open-fds failed: %v", err)
-	}
-	fdl := stats.NewGauge("MaxFds", "File descriptor limit")
-	fdl.Set(int64(fdLimit.Cur))
-
-	onInitHooks.Fire()
+	return initStartTime
 }
 
 func populateListeningURL(port int32) {
@@ -218,44 +230,281 @@ func FireRunHooks() {
 // listening to a given port for standard connections.
 // If calling this, then call RunDefault()
 func RegisterDefaultFlags() {
-	Port = flag.Int("port", 0, "port for the server")
+	OnParse(func(fs *pflag.FlagSet) {
+		fs.IntVar(&port, "port", port, "port for the server")
+		fs.StringVar(&bindAddress, "bind-address", bindAddress, "Bind address for the server. If empty, the server will listen on all available unicast and anycast IP addresses of the local system.")
+	})
+}
+
+// Port returns the value of the `--port` flag.
+func Port() int {
+	return port
 }
 
 // RunDefault calls Run() with the parameters from the flags.
 func RunDefault() {
-	Run(*Port)
+	Run(bindAddress, port)
 }
+
+var (
+	flagHooksM      sync.Mutex
+	globalFlagHooks = []func(*pflag.FlagSet){
+		vterrors.RegisterFlags,
+	}
+	commandFlagHooks = map[string][]func(*pflag.FlagSet){}
+)
+
+// OnParse registers a callback function to register flags on the flagset that are
+// used by any caller of servenv.Parse or servenv.ParseWithArgs.
+func OnParse(f func(fs *pflag.FlagSet)) {
+	flagHooksM.Lock()
+	defer flagHooksM.Unlock()
+
+	globalFlagHooks = append(globalFlagHooks, f)
+}
+
+// OnParseFor registers a callback function to register flags on the flagset
+// used by servenv.Parse or servenv.ParseWithArgs. The provided callback will
+// only be called if the `cmd` argument passed to either Parse or ParseWithArgs
+// exactly matches the `cmd` argument passed to OnParseFor.
+//
+// To register for flags for multiple commands, for example if a package's flags
+// should be used for only vtgate and vttablet but no other binaries, call this
+// multiple times with the same callback function. To register flags for all
+// commands globally, use OnParse instead.
+func OnParseFor(cmd string, f func(fs *pflag.FlagSet)) {
+	flagHooksM.Lock()
+	defer flagHooksM.Unlock()
+
+	commandFlagHooks[cmd] = append(commandFlagHooks[cmd], f)
+}
+
+func getFlagHooksFor(cmd string) (hooks []func(fs *pflag.FlagSet)) {
+	flagHooksM.Lock()
+	defer flagHooksM.Unlock()
+
+	hooks = append(hooks, globalFlagHooks...) // done deliberately to copy the slice
+
+	if commandHooks, ok := commandFlagHooks[cmd]; ok {
+		hooks = append(hooks, commandHooks...)
+	}
+
+	return hooks
+}
+
+// Needed because some tests require multiple parse passes, so we guard against
+// that here.
+var debugConfigRegisterOnce sync.Once
 
 // ParseFlags initializes flags and handles the common case when no positional
 // arguments are expected.
 func ParseFlags(cmd string) {
-	flag.Parse()
+	fs := GetFlagSetFor(cmd)
 
-	if *Version {
+	viperutil.BindFlags(fs)
+
+	_flag.Parse(fs)
+
+	if version {
 		AppVersion.Print()
 		os.Exit(0)
 	}
 
-	args := flag.Args()
+	args := fs.Args()
 	if len(args) > 0 {
-		flag.Usage()
+		_flag.Usage()
 		log.Exitf("%s doesn't take any positional arguments, got '%s'", cmd, strings.Join(args, " "))
 	}
+
+	loadViper(cmd)
+
+	logutil.PurgeLogs()
+}
+
+// ParseFlagsForTests initializes flags but skips the version, filesystem
+// args and go flag related work.
+// Note: this should not be used outside of unit tests.
+func ParseFlagsForTests(cmd string) {
+	fs := GetFlagSetFor(cmd)
+	pflag.CommandLine = fs
+	pflag.Parse()
+	viperutil.BindFlags(fs)
+	loadViper(cmd)
+}
+
+// MoveFlagsToCobraCommand moves the servenv-registered flags to the flagset of
+// the given cobra command, then copies over the glog flags that otherwise
+// require manual transferring.
+func MoveFlagsToCobraCommand(cmd *cobra.Command) {
+	moveFlags(cmd.Use, cmd.Flags())
+}
+
+// MovePersistentFlagsToCobraCommand functions exactly like MoveFlagsToCobraCommand,
+// but moves the servenv-registered flags to the persistent flagset of
+// the given cobra command, then copies over the glog flags that otherwise
+// require manual transferring.
+//
+// Useful for transferring flags to a parent command whose subcommands should
+// inherit the servenv-registered flags.
+func MovePersistentFlagsToCobraCommand(cmd *cobra.Command) {
+	moveFlags(cmd.Use, cmd.PersistentFlags())
+}
+
+func moveFlags(name string, fs *pflag.FlagSet) {
+	fs.AddFlagSet(GetFlagSetFor(name))
+
+	// glog flags, no better way to do this
+	_flag.PreventGlogVFlagFromClobberingVersionFlagShorthand(fs)
+	fs.AddGoFlag(flag.Lookup("logtostderr"))
+	fs.AddGoFlag(flag.Lookup("log_backtrace_at"))
+	fs.AddGoFlag(flag.Lookup("alsologtostderr"))
+	fs.AddGoFlag(flag.Lookup("stderrthreshold"))
+	fs.AddGoFlag(flag.Lookup("log_dir"))
+	fs.AddGoFlag(flag.Lookup("vmodule"))
+
+	pflag.CommandLine = fs
+}
+
+// CobraPreRunE returns the common function that commands will need to load
+// viper infrastructure. It matches the signature of cobra's (Pre|Post)RunE-type
+// functions.
+func CobraPreRunE(cmd *cobra.Command, args []string) error {
+	_flag.TrickGlog()
+
+	watchCancel, err := viperutil.LoadConfig()
+	if err != nil {
+		return fmt.Errorf("%s: failed to read in config: %s", cmd.Name(), err)
+	}
+
+	OnTerm(watchCancel)
+	HTTPHandleFunc("/debug/config", viperdebug.HandlerFunc)
+
+	logutil.PurgeLogs()
+
+	return nil
+}
+
+// GetFlagSetFor returns the flag set for a given command.
+// This has to exported for the Vitess-operator to use
+func GetFlagSetFor(cmd string) *pflag.FlagSet {
+	fs := pflag.NewFlagSet(cmd, pflag.ExitOnError)
+	for _, hook := range getFlagHooksFor(cmd) {
+		hook(fs)
+	}
+
+	return fs
 }
 
 // ParseFlagsWithArgs initializes flags and returns the positional arguments
 func ParseFlagsWithArgs(cmd string) []string {
-	flag.Parse()
+	fs := GetFlagSetFor(cmd)
 
-	if *Version {
+	viperutil.BindFlags(fs)
+
+	_flag.Parse(fs)
+
+	if version {
 		AppVersion.Print()
 		os.Exit(0)
 	}
 
-	args := flag.Args()
+	args := fs.Args()
 	if len(args) == 0 {
 		log.Exitf("%s expected at least one positional argument", cmd)
 	}
 
+	loadViper(cmd)
+
+	logutil.PurgeLogs()
+
 	return args
+}
+
+func loadViper(cmd string) {
+	watchCancel, err := viperutil.LoadConfig()
+	if err != nil {
+		log.Exitf("%s: failed to read in config: %s", cmd, err.Error())
+	}
+	OnTerm(watchCancel)
+	debugConfigRegisterOnce.Do(func() {
+		HTTPHandleFunc("/debug/config", viperdebug.HandlerFunc)
+	})
+}
+
+// Flag installations for packages that servenv imports. We need to register
+// here rather than in those packages (which is what we would normally do)
+// because that would create a dependency cycle.
+func init() {
+	// These are the binaries that call trace.StartTracing.
+	for _, cmd := range []string{
+		"vtadmin",
+		"vtclient",
+		"vtcombo",
+		"vtctl",
+		"vtctlclient",
+		"vtctld",
+		"vtgate",
+		"vttablet",
+	} {
+		OnParseFor(cmd, trace.RegisterFlags)
+	}
+
+	// These are the binaries that make gRPC calls.
+	for _, cmd := range []string{
+		"vtbackup",
+		"vtcombo",
+		"vtctl",
+		"vtctlclient",
+		"vtctld",
+		"vtgate",
+		"vtgateclienttest",
+		"vtorc",
+		"vttablet",
+		"vttestserver",
+	} {
+		OnParseFor(cmd, grpccommon.RegisterFlags)
+	}
+
+	// These are the binaries that export stats
+	for _, cmd := range []string{
+		"vtbackup",
+		"vtcombo",
+		"vtctld",
+		"vtgate",
+		"vttablet",
+		"vtorc",
+	} {
+		OnParseFor(cmd, stats.RegisterFlags)
+	}
+
+	// Flags in package log are installed for all binaries.
+	OnParse(log.RegisterFlags)
+	// Flags in package logutil are installed for all binaries.
+	OnParse(logutil.RegisterFlags)
+	// Flags in package viperutil/config are installed for all binaries.
+	OnParse(viperutil.RegisterFlags)
+}
+
+func RegisterFlagsForTopoBinaries(registerFlags func(fs *pflag.FlagSet)) {
+	topoBinaries := []string{
+		"vtbackup",
+		"vtcombo",
+		"vtctl",
+		"vtctld",
+		"vtgate",
+		"vttablet",
+		"vttestserver",
+		"zk",
+		"vtorc",
+	}
+	for _, cmd := range topoBinaries {
+		OnParseFor(cmd, registerFlags)
+	}
+}
+
+// TestingEndtoend is true when this Vitess binary is being ran as part of an endtoend test suite
+var TestingEndtoend = false
+
+func init() {
+	TestingEndtoend = os.Getenv("VTTEST") == "endtoend"
 }

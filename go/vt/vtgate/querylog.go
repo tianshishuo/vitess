@@ -17,10 +17,11 @@ limitations under the License.
 package vtgate
 
 import (
-	"flag"
 	"net/http"
 
 	"vitess.io/vitess/go/streamlog"
+	"vitess.io/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/vtgate/logstats"
 )
 
 var (
@@ -32,33 +33,33 @@ var (
 
 	// QueryzHandler is the debug UI path for exposing query plan stats
 	QueryzHandler = "/debug/queryz"
-
-	// QueryLogger enables streaming logging of queries
-	QueryLogger = streamlog.New("VTGate", 10)
-
-	// queryLogToFile controls whether query logs are sent to a file
-	queryLogToFile = flag.String("log_queries_to_file", "", "Enable query logging to the specified file")
 )
 
-func initQueryLogger(vtg *VTGate) error {
-	QueryLogger.ServeLogs(QueryLogHandler, streamlog.GetFormatter(QueryLogger))
+func (e *Executor) defaultQueryLogger() error {
+	queryLogger := streamlog.New[*logstats.LogStats]("VTGate", queryLogBufferSize)
+	queryLogger.ServeLogs(QueryLogHandler, streamlog.GetFormatter(queryLogger))
 
-	http.HandleFunc(QueryLogzHandler, func(w http.ResponseWriter, r *http.Request) {
-		ch := QueryLogger.Subscribe("querylogz")
-		defer QueryLogger.Unsubscribe(ch)
-		querylogzHandler(ch, w, r)
+	servenv.HTTPHandleFunc(QueryLogzHandler, func(w http.ResponseWriter, r *http.Request) {
+		ch := queryLogger.Subscribe("querylogz")
+		defer queryLogger.Unsubscribe(ch)
+		querylogzHandler(ch, w, r, e.env.Parser())
 	})
 
-	http.HandleFunc(QueryzHandler, func(w http.ResponseWriter, r *http.Request) {
-		queryzHandler(vtg.executor, w, r)
+	servenv.HTTPHandleFunc(QueryzHandler, func(w http.ResponseWriter, r *http.Request) {
+		queryzHandler(e, w, r)
 	})
 
-	if *queryLogToFile != "" {
-		_, err := QueryLogger.LogToFile(*queryLogToFile, streamlog.GetFormatter(QueryLogger))
+	if queryLogToFile != "" {
+		_, err := queryLogger.LogToFile(queryLogToFile, streamlog.GetFormatter(queryLogger))
 		if err != nil {
 			return err
 		}
 	}
 
+	e.queryLogger = queryLogger
 	return nil
+}
+
+func (e *Executor) SetQueryLogger(ql *streamlog.StreamLogger[*logstats.LogStats]) {
+	e.queryLogger = ql
 }

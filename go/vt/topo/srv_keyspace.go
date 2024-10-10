@@ -17,14 +17,11 @@ limitations under the License.
 package topo
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
 	"path"
 	"sync"
-
-	"google.golang.org/protobuf/proto"
-
-	"context"
 
 	"vitess.io/vitess/go/vt/vterrors"
 
@@ -51,24 +48,26 @@ type WatchSrvKeyspaceData struct {
 // WatchSrvKeyspace will set a watch on the SrvKeyspace object.
 // It has the same contract as Conn.Watch, but it also unpacks the
 // contents into a SrvKeyspace object.
-func (ts *Server) WatchSrvKeyspace(ctx context.Context, cell, keyspace string) (*WatchSrvKeyspaceData, <-chan *WatchSrvKeyspaceData, CancelFunc) {
+func (ts *Server) WatchSrvKeyspace(ctx context.Context, cell, keyspace string) (*WatchSrvKeyspaceData, <-chan *WatchSrvKeyspaceData, error) {
 	conn, err := ts.ConnForCell(ctx, cell)
 	if err != nil {
 		return &WatchSrvKeyspaceData{Err: err}, nil, nil
 	}
 
 	filePath := srvKeyspaceFileName(keyspace)
-	current, wdChannel, cancel := conn.Watch(ctx, filePath)
-	if current.Err != nil {
-		return &WatchSrvKeyspaceData{Err: current.Err}, nil, nil
+	ctx, cancel := context.WithCancel(ctx)
+	current, wdChannel, err := conn.Watch(ctx, filePath)
+	if err != nil {
+		cancel()
+		return nil, nil, err
 	}
 	value := &topodatapb.SrvKeyspace{}
-	if err := proto.Unmarshal(current.Contents, value); err != nil {
+	if err := value.UnmarshalVT(current.Contents); err != nil {
 		// Cancel the watch, drain channel.
 		cancel()
 		for range wdChannel {
 		}
-		return &WatchSrvKeyspaceData{Err: vterrors.Wrapf(err, "error unpacking initial SrvKeyspace object")}, nil, nil
+		return nil, nil, vterrors.Wrapf(err, "error unpacking initial SrvKeyspace object")
 	}
 
 	changes := make(chan *WatchSrvKeyspaceData, 10)
@@ -79,6 +78,7 @@ func (ts *Server) WatchSrvKeyspace(ctx context.Context, cell, keyspace string) (
 	// send an ErrInterrupted and then close the channel. We'll
 	// just propagate that back to our caller.
 	go func() {
+		defer cancel()
 		defer close(changes)
 
 		for wd := range wdChannel {
@@ -91,7 +91,7 @@ func (ts *Server) WatchSrvKeyspace(ctx context.Context, cell, keyspace string) (
 			}
 
 			value := &topodatapb.SrvKeyspace{}
-			if err := proto.Unmarshal(wd.Contents, value); err != nil {
+			if err := value.UnmarshalVT(wd.Contents); err != nil {
 				cancel()
 				for range wdChannel {
 				}
@@ -103,7 +103,7 @@ func (ts *Server) WatchSrvKeyspace(ctx context.Context, cell, keyspace string) (
 		}
 	}()
 
-	return &WatchSrvKeyspaceData{Value: value}, changes, cancel
+	return &WatchSrvKeyspaceData{Value: value}, changes, nil
 }
 
 // GetSrvKeyspaceNames returns the SrvKeyspace objects for a cell.
@@ -137,7 +137,7 @@ func (ts *Server) GetShardServingCells(ctx context.Context, si *ShardInfo) (serv
 	var mu sync.Mutex
 	for _, cell := range cells {
 		wg.Add(1)
-		go func(cell, keyspace string) {
+		go func(cell string) {
 			defer wg.Done()
 			srvKeyspace, err := ts.GetSrvKeyspace(ctx, cell, si.keyspace)
 			switch {
@@ -166,7 +166,7 @@ func (ts *Server) GetShardServingCells(ctx context.Context, si *ShardInfo) (serv
 				rec.RecordError(err)
 				return
 			}
-		}(cell, si.Keyspace())
+		}(cell)
 	}
 	wg.Wait()
 	if rec.HasErrors() {
@@ -188,7 +188,7 @@ func (ts *Server) GetShardServingTypes(ctx context.Context, si *ShardInfo) (serv
 	var mu sync.Mutex
 	for _, cell := range cells {
 		wg.Add(1)
-		go func(cell, keyspace string) {
+		go func(cell string) {
 			defer wg.Done()
 			srvKeyspace, err := ts.GetSrvKeyspace(ctx, cell, si.keyspace)
 			switch {
@@ -223,7 +223,7 @@ func (ts *Server) GetShardServingTypes(ctx context.Context, si *ShardInfo) (serv
 				rec.RecordError(err)
 				return
 			}
-		}(cell, si.Keyspace())
+		}(cell)
 	}
 	wg.Wait()
 	if rec.HasErrors() {
@@ -392,6 +392,51 @@ func (ts *Server) DeleteSrvKeyspacePartitions(ctx context.Context, keyspace stri
 		return NewError(PartialResult, rec.Error().Error())
 	}
 	return nil
+}
+
+// UpdateSrvKeyspaceThrottlerConfig updates existing throttler configuration
+func (ts *Server) UpdateSrvKeyspaceThrottlerConfig(ctx context.Context, keyspace string, cells []string, update func(throttlerConfig *topodatapb.ThrottlerConfig) *topodatapb.ThrottlerConfig) (updatedCells []string, err error) {
+	if err = CheckKeyspaceLocked(ctx, keyspace); err != nil {
+		return updatedCells, err
+	}
+
+	// The caller intends to update all cells in this case
+	if len(cells) == 0 {
+		cells, err = ts.GetCellInfoNames(ctx)
+		if err != nil {
+			return updatedCells, err
+		}
+	}
+
+	wg := sync.WaitGroup{}
+	rec := concurrency.AllErrorRecorder{}
+	for _, cell := range cells {
+		wg.Add(1)
+		go func(cell string) {
+			defer wg.Done()
+			srvKeyspace, err := ts.GetSrvKeyspace(ctx, cell, keyspace)
+			switch {
+			case err == nil:
+				srvKeyspace.ThrottlerConfig = update(srvKeyspace.ThrottlerConfig)
+				if err := ts.UpdateSrvKeyspace(ctx, cell, keyspace, srvKeyspace); err != nil {
+					rec.RecordError(err)
+					return
+				}
+				updatedCells = append(updatedCells, cell)
+				return
+			case IsErrType(err, NoNode):
+				// NOOP as not every cell will contain a serving tablet in the keyspace
+			default:
+				rec.RecordError(err)
+				return
+			}
+		}(cell)
+	}
+	wg.Wait()
+	if rec.HasErrors() {
+		return updatedCells, NewError(PartialResult, rec.Error().Error())
+	}
+	return updatedCells, nil
 }
 
 // UpdateDisableQueryService will make sure the disableQueryService is
@@ -568,10 +613,8 @@ func (ts *Server) MigrateServedType(ctx context.Context, keyspace string, shards
 			case IsErrType(err, NoNode):
 				// Assuming this cell is not active, nothing to do.
 			default:
-				if err != nil {
-					rec.RecordError(err)
-					return
-				}
+				rec.RecordError(err)
+				return
 			}
 		}(cell, keyspace)
 	}
@@ -590,7 +633,7 @@ func (ts *Server) UpdateSrvKeyspace(ctx context.Context, cell, keyspace string, 
 	}
 
 	nodePath := srvKeyspaceFileName(keyspace)
-	data, err := proto.Marshal(srvKeyspace)
+	data, err := srvKeyspace.MarshalVT()
 	if err != nil {
 		return err
 	}
@@ -644,7 +687,7 @@ func (ts *Server) GetSrvKeyspace(ctx context.Context, cell, keyspace string) (*t
 		return nil, err
 	}
 	srvKeyspace := &topodatapb.SrvKeyspace{}
-	if err := proto.Unmarshal(data, srvKeyspace); err != nil {
+	if err := srvKeyspace.UnmarshalVT(data); err != nil {
 		return nil, vterrors.Wrapf(err, "SrvKeyspace unmarshal failed: %v", data)
 	}
 	return srvKeyspace, nil
@@ -687,18 +730,6 @@ func OrderAndCheckPartitions(cell string, srvKeyspace *topodatapb.SrvKeyspace) e
 	}
 
 	return nil
-}
-
-// ShardIsServing returns true if this shard is found in any of the partitions in the srvKeyspace
-func ShardIsServing(srvKeyspace *topodatapb.SrvKeyspace, shard *topodatapb.Shard) bool {
-	for _, partition := range srvKeyspace.GetPartitions() {
-		for _, shardReference := range partition.GetShardReferences() {
-			if key.KeyRangeEqual(shardReference.GetKeyRange(), shard.GetKeyRange()) {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // ValidateSrvKeyspace validates that the SrvKeyspace for given keyspace in the provided cells is not corrupted

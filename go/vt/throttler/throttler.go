@@ -35,8 +35,10 @@ import (
 
 	"vitess.io/vitess/go/vt/discovery"
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/proto/topodata"
 
 	throttlerdatapb "vitess.io/vitess/go/vt/proto/throttlerdata"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 const (
@@ -50,7 +52,7 @@ const (
 
 	// MaxRateModuleDisabled can be set in NewThrottler() to disable throttling
 	// by a fixed rate.
-	MaxRateModuleDisabled = math.MaxInt64
+	MaxRateModuleDisabled = int64(math.MaxInt64)
 
 	// InvalidMaxRate is a constant which will fail in a NewThrottler() call.
 	// It should be used when returning maxRate in an error case.
@@ -58,21 +60,37 @@ const (
 
 	// ReplicationLagModuleDisabled can be set in NewThrottler() to disable
 	// throttling based on the MySQL replication lag.
-	ReplicationLagModuleDisabled = math.MaxInt64
+	ReplicationLagModuleDisabled = int64(math.MaxInt64)
 
 	// InvalidMaxReplicationLag is a constant which will fail in a NewThrottler()
 	// call. It should be used when returning maxReplicationlag in an error case.
 	InvalidMaxReplicationLag = -1
 )
 
-// Throttler provides a client-side, thread-aware throttler.
+// Throttler defines the throttler interface.
+type Throttler interface {
+	Throttle(threadID int) time.Duration
+	ThreadFinished(threadID int)
+	Close()
+	MaxRate() int64
+	SetMaxRate(rate int64)
+	RecordReplicationLag(time time.Time, th *discovery.TabletHealth)
+	GetConfiguration() *throttlerdatapb.Configuration
+	UpdateConfiguration(configuration *throttlerdatapb.Configuration, copyZeroValues bool) error
+	ResetConfiguration()
+	MaxLag(tabletType topodatapb.TabletType) uint32
+	Log() []Result
+}
+
+// ThrottlerImpl implements a client-side, thread-aware throttler.
 // See the package doc for more information.
 //
 // Calls of Throttle() and ThreadFinished() take threadID as parameter which is
 // in the range [0, threadCount). (threadCount is set in NewThrottler().)
 // NOTE: Trottle() and ThreadFinished() assume that *per thread* calls to them
-//       are serialized and must not happen concurrently.
-type Throttler struct {
+//
+//	are serialized and must not happen concurrently.
+type ThrottlerImpl struct {
 	// name describes the Throttler instance and is used e.g. in the webinterface.
 	name string
 	// unit describes the entity the throttler is limiting e.g. "queries" or
@@ -125,23 +143,35 @@ type Throttler struct {
 // unit refers to the type of entity you want to throttle e.g. "queries" or
 // "transactions".
 // name describes the Throttler instance and will be used by the webinterface.
-func NewThrottler(name, unit string, threadCount int, maxRate, maxReplicationLag int64) (*Throttler, error) {
+func NewThrottler(name, unit string, threadCount int, maxRate, maxReplicationLag int64) (Throttler, error) {
 	return newThrottler(GlobalManager, name, unit, threadCount, maxRate, maxReplicationLag, time.Now)
 }
 
-func newThrottler(manager *managerImpl, name, unit string, threadCount int, maxRate, maxReplicationLag int64, nowFunc func() time.Time) (*Throttler, error) {
-	// Verify input parameters.
-	if maxRate < 0 {
-		return nil, fmt.Errorf("maxRate must be >= 0: %v", maxRate)
+func NewThrottlerFromConfig(name, unit string, threadCount int, maxRateModuleMaxRate int64, maxReplicationLagModuleConfig MaxReplicationLagModuleConfig, nowFunc func() time.Time) (Throttler, error) {
+	return newThrottlerFromConfig(GlobalManager, name, unit, threadCount, maxRateModuleMaxRate, maxReplicationLagModuleConfig, nowFunc)
+}
+
+func newThrottler(manager *managerImpl, name, unit string, threadCount int, maxRate, maxReplicationLag int64, nowFunc func() time.Time) (Throttler, error) {
+	config := NewMaxReplicationLagModuleConfig(maxReplicationLag)
+	config.MaxReplicationLagSec = maxReplicationLag
+
+	return newThrottlerFromConfig(manager, name, unit, threadCount, maxRate, config, nowFunc)
+
+}
+
+func newThrottlerFromConfig(manager *managerImpl, name, unit string, threadCount int, maxRateModuleMaxRate int64, maxReplicationLagModuleConfig MaxReplicationLagModuleConfig, nowFunc func() time.Time) (Throttler, error) {
+	err := maxReplicationLagModuleConfig.Verify()
+	if err != nil {
+		return nil, fmt.Errorf("invalid max replication lag config: %w", err)
 	}
-	if maxReplicationLag < 0 {
-		return nil, fmt.Errorf("maxReplicationLag must be >= 0: %v", maxReplicationLag)
+	if maxRateModuleMaxRate < 0 {
+		return nil, fmt.Errorf("maxRate must be >= 0: %v", maxRateModuleMaxRate)
 	}
 
 	// Enable the configured modules.
-	maxRateModule := NewMaxRateModule(maxRate)
+	maxRateModule := NewMaxRateModule(maxRateModuleMaxRate)
 	actualRateHistory := newAggregatedIntervalHistory(1024, 1*time.Second, threadCount)
-	maxReplicationLagModule, err := NewMaxReplicationLagModule(NewMaxReplicationLagModuleConfig(maxReplicationLag), actualRateHistory, nowFunc)
+	maxReplicationLagModule, err := NewMaxReplicationLagModule(maxReplicationLagModuleConfig, actualRateHistory, nowFunc)
 	if err != nil {
 		return nil, err
 	}
@@ -162,7 +192,7 @@ func newThrottler(manager *managerImpl, name, unit string, threadCount int, maxR
 		threadThrottlers[i] = newThreadThrottler(i, actualRateHistory)
 		runningThreads[i] = true
 	}
-	t := &Throttler{
+	t := &ThrottlerImpl{
 		name:                    name,
 		unit:                    unit,
 		manager:                 manager,
@@ -201,7 +231,7 @@ func newThrottler(manager *managerImpl, name, unit string, threadCount int, maxR
 // the backoff duration elapsed.
 // The maximum value for the returned backoff is 1 second since the throttler
 // internally operates on a per-second basis.
-func (t *Throttler) Throttle(threadID int) time.Duration {
+func (t *ThrottlerImpl) Throttle(threadID int) time.Duration {
 	if t.closed {
 		panic(fmt.Sprintf("BUG: thread with ID: %v must not access closed Throttler", threadID))
 	}
@@ -211,10 +241,20 @@ func (t *Throttler) Throttle(threadID int) time.Duration {
 	return t.threadThrottlers[threadID].throttle(t.nowFunc())
 }
 
+// MaxLag returns the max of all the last replication lag values seen across all tablets of
+// the provided type, excluding ignored tablets.
+func (t *ThrottlerImpl) MaxLag(tabletType topodata.TabletType) uint32 {
+	cache := t.maxReplicationLagModule.lagCacheByType(tabletType)
+	if cache == nil {
+		return 0
+	}
+	return cache.maxLag()
+}
+
 // ThreadFinished marks threadID as finished and redistributes the thread's
 // rate allotment across the other threads.
 // After ThreadFinished() is called, Throttle() must not be called anymore.
-func (t *Throttler) ThreadFinished(threadID int) {
+func (t *ThrottlerImpl) ThreadFinished(threadID int) {
 	if t.threadFinished[threadID] {
 		panic(fmt.Sprintf("BUG: thread with ID: %v already finished", threadID))
 	}
@@ -229,7 +269,7 @@ func (t *Throttler) ThreadFinished(threadID int) {
 
 // Close stops all modules and frees all resources.
 // When Close() returned, the Throttler object must not be used anymore.
-func (t *Throttler) Close() {
+func (t *ThrottlerImpl) Close() {
 	for _, m := range t.modules {
 		m.Stop()
 	}
@@ -242,7 +282,7 @@ func (t *Throttler) Close() {
 // threadThrottlers accordingly.
 // The rate changes when the number of thread changes or a module updated its
 // max rate.
-func (t *Throttler) updateMaxRate() {
+func (t *ThrottlerImpl) updateMaxRate() {
 	// Set it to infinite initially.
 	maxRate := int64(math.MaxInt64)
 
@@ -283,39 +323,39 @@ func (t *Throttler) updateMaxRate() {
 }
 
 // MaxRate returns the current rate of the MaxRateModule.
-func (t *Throttler) MaxRate() int64 {
+func (t *ThrottlerImpl) MaxRate() int64 {
 	return t.maxRateModule.MaxRate()
 }
 
 // SetMaxRate updates the rate of the MaxRateModule.
-func (t *Throttler) SetMaxRate(rate int64) {
+func (t *ThrottlerImpl) SetMaxRate(rate int64) {
 	t.maxRateModule.SetMaxRate(rate)
 }
 
 // RecordReplicationLag must be called by users to report the "ts" tablet health
 // data observed at "time".
 // Note: After Close() is called, this method must not be called anymore.
-func (t *Throttler) RecordReplicationLag(time time.Time, ts *discovery.LegacyTabletStats) {
-	t.maxReplicationLagModule.RecordReplicationLag(time, ts)
+func (t *ThrottlerImpl) RecordReplicationLag(time time.Time, th *discovery.TabletHealth) {
+	t.maxReplicationLagModule.RecordReplicationLag(time, th)
 }
 
 // GetConfiguration returns the configuration of the MaxReplicationLag module.
-func (t *Throttler) GetConfiguration() *throttlerdatapb.Configuration {
+func (t *ThrottlerImpl) GetConfiguration() *throttlerdatapb.Configuration {
 	return t.maxReplicationLagModule.getConfiguration()
 }
 
 // UpdateConfiguration updates the configuration of the MaxReplicationLag module.
-func (t *Throttler) UpdateConfiguration(configuration *throttlerdatapb.Configuration, copyZeroValues bool) error {
+func (t *ThrottlerImpl) UpdateConfiguration(configuration *throttlerdatapb.Configuration, copyZeroValues bool) error {
 	return t.maxReplicationLagModule.updateConfiguration(configuration, copyZeroValues)
 }
 
 // ResetConfiguration resets the configuration of the MaxReplicationLag module
 // to its initial settings.
-func (t *Throttler) ResetConfiguration() {
+func (t *ThrottlerImpl) ResetConfiguration() {
 	t.maxReplicationLagModule.resetConfiguration()
 }
 
 // Log returns the most recent changes of the MaxReplicationLag module.
-func (t *Throttler) Log() []result {
+func (t *ThrottlerImpl) Log() []Result {
 	return t.maxReplicationLagModule.log()
 }

@@ -21,6 +21,7 @@ package txserializer
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -43,15 +44,15 @@ import (
 //
 // This implementation has some parallels to the sync2.Consolidator class.
 // However, there are many substantial differences:
-// - Results are not shared between queued transactions.
-// - Only one waiting transaction and not all are notified when the current one
-//   has finished.
-// - Waiting transactions are woken up in FIFO order.
-// - Waiting transactions are unblocked if their context is done.
-// - Both the local queue (per row range) and global queue (whole process) are
-//   limited to avoid that queued transactions can consume the full capacity
-//   of vttablet. This is important if the capaciy is finite. For example, the
-//   number of RPCs in flight could be limited by the RPC subsystem.
+//   - Results are not shared between queued transactions.
+//   - Only one waiting transaction and not all are notified when the current one
+//     has finished.
+//   - Waiting transactions are woken up in FIFO order.
+//   - Waiting transactions are unblocked if their context is done.
+//   - Both the local queue (per row range) and global queue (whole process) are
+//     limited to avoid that queued transactions can consume the full capacity
+//     of vttablet. This is important if the capacity is finite. For example, the
+//     number of RPCs in flight could be limited by the RPC subsystem.
 type TxSerializer struct {
 	env tabletenv.Env
 	*sync2.ConsolidatorCache
@@ -68,7 +69,7 @@ type TxSerializer struct {
 	//
 	// waitsDryRun is similar as "waits": In dry-run mode it records how many
 	// transactions would have been queued.
-	// The key of the map is the table name of the query.
+	// The key of the map is the table name and WHERE clause.
 	//
 	// queueExceeded counts per table how many transactions were rejected because
 	// the max queue size per row (range) was exceeded.
@@ -150,7 +151,7 @@ func (txs *TxSerializer) Wait(ctx context.Context, key, table string) (done Done
 	if err != nil {
 		if waited {
 			// Waiting failed early e.g. due a canceled context and we did NOT get the
-			// slot. Call "done" now because we don'txs return it to the caller.
+			// slot. Call "done" now because we do not return it to the caller.
 			txs.unlockLocked(key, false /* returnSlot */)
 		}
 		return nil, waited, err
@@ -184,9 +185,17 @@ func (txs *TxSerializer) lockLocked(ctx context.Context, key, table string) (boo
 	if q.size >= txs.maxQueueSize {
 		if txs.dryRun {
 			txs.queueExceededDryRun.Add(table, 1)
-			txs.logQueueExceededDryRun.Warningf("Would have rejected BeginExecute RPC because there are too many queued transactions (%d >= %d) for the same row (table + WHERE clause: '%v')", q.size, txs.maxQueueSize, key)
+			if txs.env.Config().SanitizeLogMessages {
+				txs.logQueueExceededDryRun.Warningf("Would have rejected BeginExecute RPC because there are too many queued transactions (%d >= %d) for the same row (table + WHERE clause: '%v')", q.size, txs.maxQueueSize, txs.sanitizeKey(key))
+			} else {
+				txs.logQueueExceededDryRun.Warningf("Would have rejected BeginExecute RPC because there are too many queued transactions (%d >= %d) for the same row (table + WHERE clause: '%v')", q.size, txs.maxQueueSize, key)
+			}
 		} else {
 			txs.queueExceeded.Add(table, 1)
+			if txs.env.Config().TerseErrors {
+				return false, vterrors.Errorf(vtrpcpb.Code_RESOURCE_EXHAUSTED,
+					"hot row protection: too many queued transactions (%d >= %d) for the same row (table + WHERE clause: '%v')", q.size, txs.maxQueueSize, txs.sanitizeKey(key))
+			}
 			return false, vterrors.Errorf(vtrpcpb.Code_RESOURCE_EXHAUSTED,
 				"hot row protection: too many queued transactions (%d >= %d) for the same row (table + WHERE clause: '%v')", q.size, txs.maxQueueSize, key)
 		}
@@ -216,7 +225,11 @@ func (txs *TxSerializer) lockLocked(ctx context.Context, key, table string) (boo
 
 	if txs.dryRun {
 		txs.waitsDryRun.Add(table, 1)
-		txs.logWaitsDryRun.Warningf("Would have queued BeginExecute RPC for row (range): '%v' because another transaction to the same range is already in progress.", key)
+		if txs.env.Config().SanitizeLogMessages {
+			txs.logWaitsDryRun.Warningf("Would have queued BeginExecute RPC for row (range): '%v' because another transaction to the same range is already in progress.", txs.sanitizeKey(key))
+		} else {
+			txs.logWaitsDryRun.Warningf("Would have queued BeginExecute RPC for row (range): '%v' because another transaction to the same range is already in progress.", key)
+		}
 		return false, nil
 	}
 
@@ -260,10 +273,19 @@ func (txs *TxSerializer) unlockLocked(key string, returnSlot bool) {
 		delete(txs.queues, key)
 
 		if q.max > 1 {
+			var formattedKey = key
+			var logMsg string
+
+			if txs.env.Config().SanitizeLogMessages {
+				formattedKey = txs.sanitizeKey(key)
+			}
+
 			if txs.dryRun {
-				txs.logDryRun.Infof("%v simultaneous transactions (%v in total) for the same row range (%v) would have been queued.", q.max, q.count, key)
+				logMsg = fmt.Sprintf("%v simultaneous transactions (%v in total) for the same row range (%v) would have been queued.", q.max, q.count, formattedKey)
+				txs.logDryRun.Infof(logMsg)
 			} else {
-				txs.log.Infof("%v simultaneous transactions (%v in total) for the same row range (%v) were queued.", q.max, q.count, key)
+				logMsg = fmt.Sprintf("%v simultaneous transactions (%v in total) for the same row range (%v) have been queued.", q.max, q.count, formattedKey)
+				txs.log.Infof(logMsg)
 			}
 		}
 
@@ -306,7 +328,7 @@ func (txs *TxSerializer) Pending(key string) int {
 
 // ServeHTTP lists the most recent, cached queries and their count.
 func (txs *TxSerializer) ServeHTTP(response http.ResponseWriter, request *http.Request) {
-	if *streamlog.RedactDebugUIQueries {
+	if streamlog.GetRedactDebugUIQueries() {
 		response.Write([]byte(`
 	<!DOCTYPE html>
 	<html>
@@ -370,4 +392,21 @@ func newQueueForFirstTransaction(concurrentTransactions int) *queue {
 		count: 1,
 		max:   1,
 	}
+}
+
+// sanitizeKey takes the internal key and returns one that has potentially
+// sensitive info removed.
+// This is needed because the internal key is e.g. 'tbl1 where col1="foo"'
+// and the WHERE clause can contain sensitive information that should not
+// be shown so we we strip everything after the first WHERE keyword.
+// e.g. 'tbl1 where col1="foo" and col2="bar"' -> 'tbl1 ... [REDACTED]'
+func (txs *TxSerializer) sanitizeKey(key string) string {
+	var sanitizedKey string
+	whereLoc := strings.Index(strings.ToLower(key), "where")
+	if whereLoc != -1 {
+		sanitizedKey = key[:whereLoc] + "... [REDACTED]"
+	} else {
+		sanitizedKey = key
+	}
+	return sanitizedKey
 }

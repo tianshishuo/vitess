@@ -24,12 +24,41 @@ import (
 	"log"
 	"math/bits"
 	"os"
-	"reflect"
 
 	"vitess.io/vitess/go/mysql/collations/internal/uca"
 )
 
-type PageGenerator struct {
+type LiteralPageGenerator struct {
+	index map[string]string
+}
+
+func (pg *LiteralPageGenerator) WritePage16(g *Generator, varname string, values []uint16) string {
+	hash := hashWeights(values)
+	if existing, ok := pg.index[hash]; ok {
+		return "&" + existing
+	}
+
+	pg.index[hash] = varname
+	g.P("var ", varname, " = []uint16{")
+
+	for col, w := range values {
+		if col > 0 && col%32 == 0 {
+			g.WriteByte('\n')
+		}
+		fmt.Fprintf(g, "0x%04x,", w)
+	}
+	g.P("}")
+	return "&" + varname
+}
+
+func WriteFastPage32(g *Generator, varname string, values []uint32) {
+	if len(values) != 256 {
+		panic("WritePage32: page does not have 256 values")
+	}
+	g.P("var fast", varname, " = ", Array32(values))
+}
+
+type EmbedPageGenerator struct {
 	index map[string]string
 	raw   bytes.Buffer
 }
@@ -42,7 +71,7 @@ func hashWeights(values []uint16) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-func (pg *PageGenerator) WritePage16(g *Generator, varname string, values []uint16) string {
+func (pg *EmbedPageGenerator) WritePage16(g *Generator, varname string, values []uint16) string {
 	hash := hashWeights(values)
 	if existing, ok := pg.index[hash]; ok {
 		return "&" + existing
@@ -59,16 +88,8 @@ func (pg *PageGenerator) WritePage16(g *Generator, varname string, values []uint
 	return "&" + varname
 }
 
-func (pg *PageGenerator) WritePage32(g *Generator, varname string, values []uint32) {
-	if len(values) != 256 {
-		panic("WritePage32: page does not have 256 values")
-	}
-	g.P("var fast", varname, " = ", Array32(values))
-}
-
-func (pg *PageGenerator) WriteTrailer(g *Generator, embedfile string) {
+func (pg *EmbedPageGenerator) WriteTrailer(g *Generator, embedfile string) {
 	unsafe := Package("unsafe")
-	reflect := Package("reflect")
 	g.UsePackage("embed")
 
 	g.P()
@@ -76,42 +97,37 @@ func (pg *PageGenerator) WriteTrailer(g *Generator, embedfile string) {
 	g.P("var weightsUCA_embed_data string")
 	g.P()
 	g.P("func weightsUCA_embed(pos, length int) []uint16 {")
-	g.P("return (*[0x7fff0000]uint16)(", unsafe, ".Pointer((*", reflect, ".StringHeader)(", unsafe, ".Pointer(&weightsUCA_embed_data)).Data))[pos:pos+length]")
+	g.P("return (*[0x7fff0000]uint16)(", unsafe, ".Pointer(", unsafe, ".StringData(weightsUCA_embed_data)))[pos:pos+length]")
 	g.P("}")
 }
 
-func (pg *PageGenerator) WriteToFile(out string) {
+func (pg *EmbedPageGenerator) WriteToFile(out string) {
 	if err := os.WriteFile(out, pg.raw.Bytes(), 0644); err != nil {
 		log.Fatal(err)
 	}
 	log.Printf("written %q (%.02fkb)", out, float64(pg.raw.Len())/1024.0)
 }
 
-func NewPageGenerator() *PageGenerator {
-	return &PageGenerator{
-		index: make(map[string]string),
+type PageGenerator interface {
+	WritePage16(g *Generator, varname string, values []uint16) string
+}
+
+func NewPageGenerator(embed bool) PageGenerator {
+	index := make(map[string]string)
+	if embed {
+		return &EmbedPageGenerator{index: index}
 	}
+	return &LiteralPageGenerator{index: index}
 }
 
 type entry struct {
 	weights []uint16
 }
 
-func (e *entry) adjustHangulWeights(tb *TableGenerator, jamos []rune) {
-	for _, jamo := range jamos {
-		_, entry := tb.entryForCodepoint(jamo)
-		e.weights = append(e.weights, entry.weights[0], entry.weights[1], entry.weights[2]+1)
-	}
-}
-
 type page struct {
 	n          int
 	entryCount int
 	entries    [uca.CodepointsPerPage]entry
-}
-
-func (p *page) equals(other *page) bool {
-	return reflect.DeepEqual(p, other)
 }
 
 func (p *page) name(uca string) string {
@@ -135,7 +151,7 @@ func (p *page) weights900Fast(level int) (w []uint32) {
 	if p.entryCount == 0 {
 		return nil
 	}
-	for i := 0; i < 128; i++ {
+	for i := range 128 {
 		entry := &p.entries[i]
 		if len(entry.weights) > 3 {
 			panic("trying to dump fast weights for codepoint with >3 weights")
@@ -149,7 +165,7 @@ func (p *page) weights900Fast(level int) (w []uint32) {
 		}
 		w = append(w, weight)
 	}
-	for i := 0; i < 128; i++ {
+	for range 128 {
 		w = append(w, 0x0)
 	}
 	return
@@ -163,7 +179,7 @@ func (p *page) weights900() (w []uint16) {
 	for _, entry := range p.entries {
 		w = append(w, uint16(len(entry.weights)/3))
 	}
-	for level := 0; level < maxCollations; level++ {
+	for level := range maxCollations {
 		for _, entry := range p.entries {
 			var weight uint16
 			if level < len(entry.weights) {
@@ -199,27 +215,13 @@ type TableGenerator struct {
 	pages   []page
 	maxChar rune
 	ucav    string
-	pg      *PageGenerator
+	pg      PageGenerator
 }
 
 func (tg *TableGenerator) entryForCodepoint(codepoint rune) (*page, *entry) {
 	page := &tg.pages[int(codepoint)/uca.CodepointsPerPage]
 	entry := &page.entries[int(codepoint)%uca.CodepointsPerPage]
 	return page, entry
-}
-
-func (tg *TableGenerator) Add900(codepoint rune, rhs [][3]uint16) {
-	page, entry := tg.entryForCodepoint(codepoint)
-	page.entryCount++
-
-	for i, weights := range rhs {
-		if i >= uca.MaxCollationElementsPerCodepoint {
-			break
-		}
-		for _, we := range weights {
-			entry.weights = append(entry.weights, we)
-		}
-	}
 }
 
 func (tg *TableGenerator) Add(codepoint rune, weights []uint16) {
@@ -230,22 +232,6 @@ func (tg *TableGenerator) Add(codepoint rune, weights []uint16) {
 		panic("duplicate codepoint inserted")
 	}
 	entry.weights = append(entry.weights, weights...)
-}
-
-func (tg *TableGenerator) AddFromAllkeys(lhs []rune, rhs [][]int, vars []int) {
-	if len(lhs) > 1 || lhs[0] > tg.maxChar {
-		// TODO: support contractions
-		return
-	}
-
-	var weights [][3]uint16
-	for _, we := range rhs {
-		if len(we) != 3 {
-			panic("non-triplet weight in allkeys.txt")
-		}
-		weights = append(weights, [3]uint16{uint16(we[0]), uint16(we[1]), uint16(we[2])})
-	}
-	tg.Add900(lhs[0], weights)
 }
 
 func (tg *TableGenerator) writePage(g *Generator, p *page, layout uca.Layout) string {
@@ -272,7 +258,7 @@ func (tg *TableGenerator) WriteTables(g *Generator, layout uca.Layout) {
 
 	g.P("var weightTable_", tg.ucav, " = []*[]uint16{")
 	for col, pageptr := range pagePtrs {
-		if col%32 == 0 {
+		if col > 0 && col%32 == 0 {
 			g.WriteByte('\n')
 		}
 		g.WriteString(pageptr)
@@ -289,12 +275,12 @@ func (tg *TableGenerator) WriteFastTables(g *Generator, layout uca.Layout) {
 	}
 
 	ascii := &tg.pages[0]
-	tg.pg.WritePage32(g, ascii.name(tg.ucav)+"L0", ascii.weights900Fast(0))
-	tg.pg.WritePage32(g, ascii.name(tg.ucav)+"L1", ascii.weights900Fast(1))
-	tg.pg.WritePage32(g, ascii.name(tg.ucav)+"L2", ascii.weights900Fast(2))
+	WriteFastPage32(g, ascii.name(tg.ucav)+"L0", ascii.weights900Fast(0))
+	WriteFastPage32(g, ascii.name(tg.ucav)+"L1", ascii.weights900Fast(1))
+	WriteFastPage32(g, ascii.name(tg.ucav)+"L2", ascii.weights900Fast(2))
 }
 
-func NewTableGenerator(ucav string, pagebuilder *PageGenerator) *TableGenerator {
+func NewTableGenerator(ucav string, pagebuilder PageGenerator) *TableGenerator {
 	var maxChar rune
 	switch ucav {
 	case "uca520", "uca900", "uca900_zh", "uca900_ja":

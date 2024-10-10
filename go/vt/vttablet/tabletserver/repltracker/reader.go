@@ -17,21 +17,18 @@ limitations under the License.
 package repltracker
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
 
-	"vitess.io/vitess/go/vt/vtgate/evalengine"
-
-	"vitess.io/vitess/go/vt/vterrors"
-
-	"context"
-
+	"vitess.io/vitess/go/constants/sidecar"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/timer"
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/connpool"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
 
@@ -73,7 +70,7 @@ func newHeartbeatReader(env tabletenv.Env) *heartbeatReader {
 		return &heartbeatReader{}
 	}
 
-	heartbeatInterval := config.ReplicationTracker.HeartbeatIntervalSeconds.Get()
+	heartbeatInterval := config.ReplicationTracker.HeartbeatInterval
 	return &heartbeatReader{
 		env:      env,
 		enabled:  true,
@@ -82,8 +79,8 @@ func newHeartbeatReader(env tabletenv.Env) *heartbeatReader {
 		ticks:    timer.NewTimer(heartbeatInterval),
 		errorLog: logutil.NewThrottledLogger("HeartbeatReporter", 60*time.Second),
 		pool: connpool.NewPool(env, "HeartbeatReadPool", tabletenv.ConnPoolConfig{
-			Size:               1,
-			IdleTimeoutSeconds: env.Config().OltpReadPool.IdleTimeoutSeconds,
+			Size:        1,
+			IdleTimeout: env.Config().OltpReadPool.IdleTimeout,
 		}),
 	}
 }
@@ -122,6 +119,9 @@ func (r *heartbeatReader) Close() {
 	}
 	r.ticks.Stop()
 	r.pool.Close()
+
+	currentLagNs.Set(0)
+
 	r.isOpen = false
 	log.Info("Heartbeat Reader: closed")
 }
@@ -170,7 +170,7 @@ func (r *heartbeatReader) readHeartbeat() {
 // fetchMostRecentHeartbeat fetches the most recently recorded heartbeat from the heartbeat table,
 // returning a result with the timestamp of the heartbeat.
 func (r *heartbeatReader) fetchMostRecentHeartbeat(ctx context.Context) (*sqltypes.Result, error) {
-	conn, err := r.pool.Get(ctx)
+	conn, err := r.pool.Get(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -179,7 +179,7 @@ func (r *heartbeatReader) fetchMostRecentHeartbeat(ctx context.Context) (*sqltyp
 	if err != nil {
 		return nil, err
 	}
-	return conn.Exec(ctx, sel, 1, false)
+	return conn.Conn.Exec(ctx, sel, 1, false)
 }
 
 // bindHeartbeatFetch takes a heartbeat read and adds the necessary
@@ -189,7 +189,7 @@ func (r *heartbeatReader) bindHeartbeatFetch() (string, error) {
 	bindVars := map[string]*querypb.BindVariable{
 		"ks": sqltypes.StringBindVariable(r.keyspaceShard),
 	}
-	parsed := sqlparser.BuildParsedQuery(sqlFetchMostRecentHeartbeat, "_vt", ":ks")
+	parsed := sqlparser.BuildParsedQuery(sqlFetchMostRecentHeartbeat, sidecar.GetIdentifier(), ":ks")
 	bound, err := parsed.GenerateQuery(bindVars, nil)
 	if err != nil {
 		return "", err
@@ -202,7 +202,7 @@ func parseHeartbeatResult(res *sqltypes.Result) (int64, error) {
 	if len(res.Rows) != 1 {
 		return 0, fmt.Errorf("failed to read heartbeat: writer query did not result in 1 row. Got %v", len(res.Rows))
 	}
-	ts, err := evalengine.ToInt64(res.Rows[0][0])
+	ts, err := res.Rows[0][0].ToCastInt64()
 	if err != nil {
 		return 0, err
 	}

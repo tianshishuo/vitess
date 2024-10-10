@@ -17,28 +17,34 @@ limitations under the License.
 package wrangler
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"testing"
 	"time"
 
-	"context"
-
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 
+	"vitess.io/vitess/go/mysql/collations"
 	"vitess.io/vitess/go/mysql/fakesqldb"
 	"vitess.io/vitess/go/netutil"
 	"vitess.io/vitess/go/vt/dbconfigs"
-	"vitess.io/vitess/go/vt/mysqlctl/fakemysqldaemon"
+	"vitess.io/vitess/go/vt/mysqlctl"
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/vtenv"
 	"vitess.io/vitess/go/vt/vttablet/grpctmserver"
-	"vitess.io/vitess/go/vt/vttablet/tabletconn"
+	"vitess.io/vitess/go/vt/vttablet/queryservice"
+	"vitess.io/vitess/go/vt/vttablet/queryservice/fakes"
+	"vitess.io/vitess/go/vt/vttablet/tabletconntest"
 	"vitess.io/vitess/go/vt/vttablet/tabletmanager"
+	vdiff2 "vitess.io/vitess/go/vt/vttablet/tabletmanager/vdiff"
 	"vitess.io/vitess/go/vt/vttablet/tabletservermock"
 	"vitess.io/vitess/go/vt/vttablet/tmclient"
+	"vitess.io/vitess/go/vt/vttablet/tmclienttest"
 
 	// import the gRPC client implementation for tablet manager
 	_ "vitess.io/vitess/go/vt/vttablet/grpctmclient"
@@ -46,6 +52,12 @@ import (
 	// import the gRPC client implementation for query service
 	_ "vitess.io/vitess/go/vt/vttablet/grpctabletconn"
 )
+
+func init() {
+	// Ensure we will use the right protocol (gRPC) in all unit tests.
+	tabletconntest.SetProtocol("go.vt.wrangler.fake_tablet_test", "grpc")
+	tmclienttest.SetProtocol("go.vt.wrangler.fake_tablet_test", "grpc")
+}
 
 // This file was copied from testlib. All tests from testlib should be moved
 // to the current directory. In order to move tests from there, we have to
@@ -66,7 +78,7 @@ type fakeTablet struct {
 	// We also create the RPCServer, so users can register more services
 	// before calling StartActionLoop().
 	Tablet          *topodatapb.Tablet
-	FakeMysqlDaemon *fakemysqldaemon.FakeMysqlDaemon
+	FakeMysqlDaemon *mysqlctl.FakeMysqlDaemon
 	RPCServer       *grpc.Server
 
 	// The following fields are created when we start the event loop for
@@ -80,6 +92,8 @@ type fakeTablet struct {
 	StartHTTPServer bool
 	HTTPListener    net.Listener
 	HTTPServer      *http.Server
+
+	queryservice.QueryService
 }
 
 // TabletOption is an interface for changing tablet parameters.
@@ -133,13 +147,14 @@ func newFakeTablet(t *testing.T, wr *Wrangler, cell string, uid uint32, tabletTy
 	}
 
 	// create a FakeMysqlDaemon with the right information by default
-	fakeMysqlDaemon := fakemysqldaemon.NewFakeMysqlDaemon(db)
-	fakeMysqlDaemon.MysqlPort.Set(mysqlPort)
+	fakeMysqlDaemon := mysqlctl.NewFakeMysqlDaemon(db)
+	fakeMysqlDaemon.MysqlPort.Store(mysqlPort)
 
 	return &fakeTablet{
 		Tablet:          tablet,
 		FakeMysqlDaemon: fakeMysqlDaemon,
 		RPCServer:       grpc.NewServer(),
+		QueryService:    fakes.ErrorQueryService,
 	}
 }
 
@@ -152,7 +167,7 @@ func (ft *fakeTablet) StartActionLoop(t *testing.T, wr *Wrangler) {
 
 	// Listen on a random port for gRPC.
 	var err error
-	ft.Listener, err = net.Listen("tcp", ":0")
+	ft.Listener, err = net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Cannot listen: %v", err)
 	}
@@ -161,7 +176,7 @@ func (ft *fakeTablet) StartActionLoop(t *testing.T, wr *Wrangler) {
 	// If needed, listen on a random port for HTTP.
 	vtPort := ft.Tablet.PortMap["vt"]
 	if ft.StartHTTPServer {
-		ft.HTTPListener, err = net.Listen("tcp", ":0")
+		ft.HTTPListener, err = net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatalf("Cannot listen on http port: %v", err)
 		}
@@ -174,7 +189,7 @@ func (ft *fakeTablet) StartActionLoop(t *testing.T, wr *Wrangler) {
 	}
 	ft.Tablet.PortMap["vt"] = vtPort
 	ft.Tablet.PortMap["grpc"] = gRPCPort
-
+	ft.Tablet.Hostname = "127.0.0.1"
 	// Create a test tm on that port, and re-read the record
 	// (it has new ports and IP).
 	ft.TM = &tabletmanager.TabletManager{
@@ -183,8 +198,10 @@ func (ft *fakeTablet) StartActionLoop(t *testing.T, wr *Wrangler) {
 		MysqlDaemon:         ft.FakeMysqlDaemon,
 		DBConfigs:           &dbconfigs.DBConfigs{},
 		QueryServiceControl: tabletservermock.NewController(),
+		VDiffEngine:         vdiff2.NewEngine(wr.TopoServer(), ft.Tablet, collations.MySQL8(), sqlparser.NewTestParser()),
+		Env:                 vtenv.NewTestEnv(),
 	}
-	if err := ft.TM.Start(ft.Tablet, 0); err != nil {
+	if err := ft.TM.Start(ft.Tablet, nil); err != nil {
 		t.Fatal(err)
 	}
 	ft.Tablet = ft.TM.Tablet()
@@ -221,6 +238,9 @@ func (ft *fakeTablet) StopActionLoop(t *testing.T) {
 	if ft.StartHTTPServer {
 		ft.HTTPListener.Close()
 	}
+	if ft.RPCServer != nil {
+		ft.RPCServer.Stop()
+	}
 	ft.Listener.Close()
 	ft.TM.Stop()
 	ft.TM = nil
@@ -237,8 +257,14 @@ func (ft *fakeTablet) Target() querypb.Target {
 	}
 }
 
-func init() {
-	// enforce we will use the right protocol (gRPC) in all unit tests
-	*tmclient.TabletManagerProtocol = "grpc"
-	*tabletconn.TabletProtocol = "grpc"
+func (ft *fakeTablet) StreamHealth(ctx context.Context, callback func(*querypb.StreamHealthResponse) error) error {
+	return callback(&querypb.StreamHealthResponse{
+		Serving: true,
+		Target: &querypb.Target{
+			Keyspace:   ft.Tablet.Keyspace,
+			Shard:      ft.Tablet.Shard,
+			TabletType: ft.Tablet.Type,
+		},
+		RealtimeStats: &querypb.RealtimeStats{},
+	})
 }

@@ -94,19 +94,20 @@ func TestMain(m *testing.M) {
 
 		// List of users authorized to execute vschema ddl operations
 		clusterInstance.VtGateExtraArgs = []string{
-			"-vschema_ddl_authorized_users=%",
-			"-discovery_low_replication_lag", tabletUnhealthyThreshold.String(),
+			"--vschema_ddl_authorized_users=%",
+			"--enable-views",
+			"--discovery_low_replication_lag", tabletUnhealthyThreshold.String(),
 		}
 		// Set extra tablet args for lock timeout
 		clusterInstance.VtTabletExtraArgs = []string{
-			"-lock_tables_timeout", "5s",
-			"-watch_replication_stream",
-			"-enable_replication_reporter",
-			"-health_check_interval", tabletHealthcheckRefreshInterval.String(),
-			"-unhealthy_threshold", tabletUnhealthyThreshold.String(),
+			"--lock_tables_timeout", "5s",
+			"--watch_replication_stream",
+			"--heartbeat_enable",
+			"--health_check_interval", tabletHealthcheckRefreshInterval.String(),
+			"--unhealthy_threshold", tabletUnhealthyThreshold.String(),
+			"--twopc_enable",
+			"--twopc_abandon_age", "200",
 		}
-		// We do not need semiSync for this test case.
-		clusterInstance.EnableSemiSync = false
 
 		// Start keyspace
 		keyspace := &cluster.Keyspace{
@@ -176,9 +177,19 @@ func tmcStartReplication(ctx context.Context, tabletGrpcPort int) error {
 	return tmClient.StartReplication(ctx, vtablet, false)
 }
 
+func tmcResetReplicationParameters(ctx context.Context, tabletGrpcPort int) error {
+	vttablet := getTablet(tabletGrpcPort)
+	return tmClient.ResetReplicationParameters(ctx, vttablet)
+}
+
 func tmcPrimaryPosition(ctx context.Context, tabletGrpcPort int) (string, error) {
 	vtablet := getTablet(tabletGrpcPort)
 	return tmClient.PrimaryPosition(ctx, vtablet)
+}
+
+func tmcGetGlobalStatusVars(ctx context.Context, tabletGrpcPort int, variables []string) (map[string]string, error) {
+	vtablet := getTablet(tabletGrpcPort)
+	return tmClient.GetGlobalStatusVars(ctx, vtablet, variables)
 }
 
 func tmcStartReplicationUntilAfter(ctx context.Context, tabletGrpcPort int, positon string, waittime time.Duration) error {

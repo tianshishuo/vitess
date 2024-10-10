@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"math"
 
+	"vitess.io/vitess/go/mysql/capabilities"
+	"vitess.io/vitess/go/mysql/replication"
 	"vitess.io/vitess/go/vt/proto/vtrpc"
 
 	"vitess.io/vitess/go/vt/vterrors"
@@ -40,8 +42,8 @@ type mysqlGRFlavor struct {
 }
 
 // newMysqlGRFlavor creates a new mysqlGR flavor.
-func newMysqlGRFlavor() flavor {
-	return &mysqlGRFlavor{}
+func newMysqlGRFlavor(serverVersion string) flavor {
+	return &mysqlGRFlavor{mysqlFlavor{serverVersion: serverVersion}}
 }
 
 // startReplicationCommand returns the command to start the replication.
@@ -57,7 +59,12 @@ func (mysqlGRFlavor) restartReplicationCommands() []string {
 }
 
 // startReplicationUntilAfter is disabled in mysqlGRFlavor
-func (mysqlGRFlavor) startReplicationUntilAfter(pos Position) string {
+func (mysqlGRFlavor) startReplicationUntilAfter(pos replication.Position) string {
+	return ""
+}
+
+// startSQLThreadUntilAfter is disabled in mysqlGRFlavor
+func (mysqlGRFlavor) startSQLThreadUntilAfter(pos replication.Position) string {
 	return ""
 }
 
@@ -68,8 +75,17 @@ func (mysqlGRFlavor) stopReplicationCommand() string {
 	return ""
 }
 
+func (mysqlGRFlavor) resetReplicationCommand() string {
+	return ""
+}
+
 // stopIOThreadCommand is disabled in mysqlGRFlavor
 func (mysqlGRFlavor) stopIOThreadCommand() string {
+	return ""
+}
+
+// stopSQLThreadCommand is disabled in mysqlGRFlavor
+func (mysqlGRFlavor) stopSQLThreadCommand() string {
 	return ""
 }
 
@@ -83,8 +99,13 @@ func (mysqlGRFlavor) resetReplicationCommands(c *Conn) []string {
 	return []string{}
 }
 
+// resetReplicationParametersCommands is part of the Flavor interface.
+func (mysqlGRFlavor) resetReplicationParametersCommands(c *Conn) []string {
+	return []string{}
+}
+
 // setReplicationPositionCommands is disabled in mysqlGRFlavor
-func (mysqlGRFlavor) setReplicationPositionCommands(pos Position) []string {
+func (mysqlGRFlavor) setReplicationPositionCommands(pos replication.Position) []string {
 	return []string{}
 }
 
@@ -95,8 +116,8 @@ func (mysqlGRFlavor) setReplicationPositionCommands(pos Position) []string {
 // TODO: Right now the GR's lag is defined as the lag between a node processing a txn
 // and the time the txn was committed. We should consider reporting lag between current queueing txn timestamp
 // from replication_connection_status and the current processing txn's commit timestamp
-func (mysqlGRFlavor) status(c *Conn) (ReplicationStatus, error) {
-	res := ReplicationStatus{}
+func (mysqlGRFlavor) status(c *Conn) (replication.ReplicationStatus, error) {
+	res := replication.ReplicationStatus{}
 	// Get primary node information
 	query := `SELECT
 		MEMBER_HOST,
@@ -110,7 +131,7 @@ func (mysqlGRFlavor) status(c *Conn) (ReplicationStatus, error) {
 		return nil
 	})
 	if err != nil {
-		return ReplicationStatus{}, err
+		return replication.ReplicationStatus{}, err
 	}
 
 	query = `SELECT
@@ -133,7 +154,7 @@ func (mysqlGRFlavor) status(c *Conn) (ReplicationStatus, error) {
 		return nil
 	})
 	if err != nil {
-		return ReplicationStatus{}, err
+		return replication.ReplicationStatus{}, err
 	}
 	// if chanel is not set, it means the state is not ONLINE or RECOVERING
 	// return partial result early
@@ -141,32 +162,32 @@ func (mysqlGRFlavor) status(c *Conn) (ReplicationStatus, error) {
 		return res, nil
 	}
 
-	// Populate IOThreadRunning from replication_connection_status
+	// Populate IOState from replication_connection_status
 	query = fmt.Sprintf(`SELECT SERVICE_STATE
 		FROM performance_schema.replication_connection_status
 		WHERE CHANNEL_NAME='%s'`, chanel)
-	var ioThreadRunning bool
+	var connectionState replication.ReplicationState
 	err = fetchStatusForGroupReplication(c, query, func(values []sqltypes.Value) error {
-		ioThreadRunning = values[0].ToString() == "ON"
+		connectionState = replication.ReplicationStatusToState(values[0].ToString())
 		return nil
 	})
 	if err != nil {
-		return ReplicationStatus{}, err
+		return replication.ReplicationStatus{}, err
 	}
-	res.IOThreadRunning = ioThreadRunning
-	// Populate SQLThreadRunning from replication_connection_status
-	var sqlThreadRunning bool
+	res.IOState = connectionState
+	// Populate SQLState from replication_connection_status
+	var applierState replication.ReplicationState
 	query = fmt.Sprintf(`SELECT SERVICE_STATE
 		FROM performance_schema.replication_applier_status_by_coordinator
 		WHERE CHANNEL_NAME='%s'`, chanel)
 	err = fetchStatusForGroupReplication(c, query, func(values []sqltypes.Value) error {
-		sqlThreadRunning = values[0].ToString() == "ON"
+		applierState = replication.ReplicationStatusToState(values[0].ToString())
 		return nil
 	})
 	if err != nil {
-		return ReplicationStatus{}, err
+		return replication.ReplicationStatus{}, err
 	}
-	res.SQLThreadRunning = sqlThreadRunning
+	res.SQLState = applierState
 
 	// Collect lag information
 	// we use the difference between the last processed transaction's commit time
@@ -182,24 +203,23 @@ func (mysqlGRFlavor) status(c *Conn) (ReplicationStatus, error) {
 		return nil
 	})
 	if err != nil {
-		return ReplicationStatus{}, err
+		return replication.ReplicationStatus{}, err
 	}
 	return res, nil
 }
 
-func parsePrimaryGroupMember(res *ReplicationStatus, row []sqltypes.Value) {
-	res.SourceHost = row[0].ToString() /* MEMBER_HOST */
-	memberPort, _ := row[1].ToInt64()  /* MEMBER_PORT */
-	res.SourcePort = int(memberPort)
+func parsePrimaryGroupMember(res *replication.ReplicationStatus, row []sqltypes.Value) {
+	res.SourceHost = row[0].ToString()   /* MEMBER_HOST */
+	res.SourcePort, _ = row[1].ToInt32() /* MEMBER_PORT */
 }
 
-func parseReplicationApplierLag(res *ReplicationStatus, row []sqltypes.Value) {
-	lagSec, err := row[0].ToInt64()
+func parseReplicationApplierLag(res *replication.ReplicationStatus, row []sqltypes.Value) {
+	lagSec, err := row[0].ToUint32()
 	// if the error is not nil, ReplicationLagSeconds will remain to be MaxUint32
 	if err == nil {
 		// Only set where there is no error
 		// The value can be NULL when there is no replication applied yet
-		res.ReplicationLagSeconds = uint(lagSec)
+		res.ReplicationLagSeconds = lagSec
 	}
 }
 
@@ -218,21 +238,30 @@ func fetchStatusForGroupReplication(c *Conn, query string, onResult func([]sqlty
 	return onResult(qr.Rows[0])
 }
 
-// primaryStatus returns the result of 'SHOW MASTER STATUS',
+// primaryStatus returns the result of 'SHOW BINARY LOG STATUS',
 // with parsed executed position.
-func (mysqlGRFlavor) primaryStatus(c *Conn) (PrimaryStatus, error) {
+func (mysqlGRFlavor) primaryStatus(c *Conn) (replication.PrimaryStatus, error) {
 	return mysqlFlavor{}.primaryStatus(c)
+}
+
+// replicationNetTimeout is part of the Flavor interface.
+func (mysqlGRFlavor) replicationNetTimeout(c *Conn) (int32, error) {
+	return mysqlFlavor8{}.replicationNetTimeout(c)
+}
+
+func (mysqlGRFlavor) baseShowTables() string {
+	return mysqlFlavor{}.baseShowTables()
 }
 
 func (mysqlGRFlavor) baseShowTablesWithSizes() string {
 	return TablesWithSize80
 }
 
-// supportsFastDropTable is part of the Flavor interface.
-func (mysqlGRFlavor) supportsFastDropTable(c *Conn) (bool, error) {
-	return false, nil
+// supportsCapability is part of the Flavor interface.
+func (f mysqlGRFlavor) supportsCapability(capability capabilities.FlavorCapability) (bool, error) {
+	return capabilities.MySQLVersionHasCapability(f.serverVersion, capability)
 }
 
 func init() {
-	flavors[GRFlavorID] = newMysqlGRFlavor
+	flavorFuncs[GRFlavorID] = newMysqlGRFlavor
 }

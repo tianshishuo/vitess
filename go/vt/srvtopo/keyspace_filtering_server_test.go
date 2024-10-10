@@ -35,9 +35,9 @@ var (
 	stockCtx       = context.Background()
 	stockFilters   = []string{"bar", "baz"}
 	stockKeyspaces = map[string]*topodatapb.SrvKeyspace{
-		"foo": {ShardingColumnName: "foo"},
-		"bar": {ShardingColumnName: "bar"},
-		"baz": {ShardingColumnName: "baz"},
+		"foo": {},
+		"bar": {},
+		"baz": {},
 	}
 	stockVSchema = &vschemapb.SrvVSchema{
 		Keyspaces: map[string]*vschemapb.Keyspace{
@@ -48,12 +48,12 @@ var (
 	}
 )
 
-func newFiltering(filter []string) (*topo.Server, *srvtopotest.PassthroughSrvTopoServer, Server) {
+func newFiltering(ctx context.Context, filter []string) (*topo.Server, *srvtopotest.PassthroughSrvTopoServer, Server) {
 	testServer := srvtopotest.NewPassthroughSrvTopoServer()
 
-	testServer.TopoServer = memorytopo.NewServer(stockCell)
+	testServer.TopoServer = memorytopo.NewServer(ctx, stockCell)
 	testServer.SrvKeyspaceNames = []string{"foo", "bar", "baz"}
-	testServer.SrvKeyspace = &topodatapb.SrvKeyspace{ShardingColumnName: "test-column"}
+	testServer.SrvKeyspace = &topodatapb.SrvKeyspace{}
 	testServer.WatchedSrvVSchema = stockVSchema
 
 	filtering, _ := NewKeyspaceFilteringServer(testServer, filter)
@@ -71,7 +71,9 @@ func TestFilteringServerHandlesNilUnderlying(t *testing.T) {
 }
 
 func TestFilteringServerReturnsUnderlyingServer(t *testing.T) {
-	_, _, f := newFiltering(nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, _, f := newFiltering(ctx, nil)
 	got, gotErr := f.GetTopoServer()
 	if gotErr != nil {
 		t.Errorf("Got error getting topo.Server from FilteringServer")
@@ -108,17 +110,23 @@ func doTestGetSrvKeyspaceNames(
 }
 
 func TestFilteringServerGetSrvKeyspameNamesFiltersEverythingOut(t *testing.T) {
-	_, _, f := newFiltering(nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, _, f := newFiltering(ctx, nil)
 	doTestGetSrvKeyspaceNames(t, f, stockCell, []string{}, nil)
 }
 
 func TestFilteringServerGetSrvKeyspaceNamesFiltersKeyspaces(t *testing.T) {
-	_, _, f := newFiltering(stockFilters)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, _, f := newFiltering(ctx, stockFilters)
 	doTestGetSrvKeyspaceNames(t, f, stockCell, stockFilters, nil)
 }
 
 func TestFilteringServerGetSrvKeyspaceNamesPassesThroughErrors(t *testing.T) {
-	_, mock, f := newFiltering(stockFilters)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, mock, f := newFiltering(ctx, stockFilters)
 	wantErr := fmt.Errorf("some badcell error")
 	mock.SrvKeyspaceNamesError = wantErr
 	doTestGetSrvKeyspaceNames(t, f, "badcell", stockFilters, wantErr)
@@ -132,22 +140,7 @@ func doTestGetSrvKeyspace(
 	want *topodatapb.SrvKeyspace,
 	wantErr error,
 ) {
-	got, gotErr := f.GetSrvKeyspace(stockCtx, cell, ksName)
-
-	gotColumnName := ""
-	wantColumnName := ""
-	if got != nil {
-		gotColumnName = got.ShardingColumnName
-	}
-	if want != nil {
-		wantColumnName = want.ShardingColumnName
-	}
-
-	// a different pointer comes back so compare the expected return by proxy
-	// of a field we know the value of
-	if gotColumnName != wantColumnName {
-		t.Errorf("keyspace incorrect: got %v, want %v", got, want)
-	}
+	_, gotErr := f.GetSrvKeyspace(stockCtx, cell, ksName)
 
 	if wantErr != gotErr {
 		t.Errorf("returned error incorrect: got %v, want %v", gotErr, wantErr)
@@ -155,28 +148,36 @@ func doTestGetSrvKeyspace(
 }
 
 func TestFilteringServerGetSrvKeyspaceReturnsSelectedKeyspaces(t *testing.T) {
-	_, mock, f := newFiltering(stockFilters)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, mock, f := newFiltering(ctx, stockFilters)
 	mock.SrvKeyspace = stockKeyspaces["bar"]
 	doTestGetSrvKeyspace(t, f, stockCell, "bar", stockKeyspaces["bar"], nil)
 }
 
 func TestFilteringServerGetSrvKeyspaceErrorPassthrough(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	wantErr := fmt.Errorf("some error")
-	_, mock, f := newFiltering(stockFilters)
+	_, mock, f := newFiltering(ctx, stockFilters)
 	mock.SrvKeyspace = stockKeyspaces["bar"]
 	mock.SrvKeyspaceError = wantErr
 	doTestGetSrvKeyspace(t, f, "badcell", "bar", stockKeyspaces["bar"], wantErr)
 }
 
 func TestFilteringServerGetSrvKeyspaceFilters(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	wantErr := topo.NewError(topo.NoNode, "foo")
-	_, mock, f := newFiltering(stockFilters)
+	_, mock, f := newFiltering(ctx, stockFilters)
 	mock.SrvKeyspaceError = wantErr
 	doTestGetSrvKeyspace(t, f, stockCell, "foo", nil, wantErr)
 }
 
 func TestFilteringServerWatchSrvVSchemaFiltersPassthroughSrvVSchema(t *testing.T) {
-	_, mock, f := newFiltering(stockFilters)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, mock, f := newFiltering(ctx, stockFilters)
 
 	allowed := map[string]bool{}
 	for _, ks := range stockFilters {
@@ -211,8 +212,11 @@ func TestFilteringServerWatchSrvVSchemaFiltersPassthroughSrvVSchema(t *testing.T
 }
 
 func TestFilteringServerWatchSrvVSchemaHandlesNilSchema(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	wantErr := fmt.Errorf("some err")
-	_, mock, f := newFiltering(stockFilters)
+	_, mock, f := newFiltering(ctx, stockFilters)
 	mock.WatchedSrvVSchema = nil
 	mock.WatchedSrvVSchemaError = wantErr
 

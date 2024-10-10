@@ -24,7 +24,9 @@ import (
 	"time"
 
 	"vitess.io/vitess/go/vt/callerid"
+	"vitess.io/vitess/go/vt/dbconfigs"
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vtenv"
 	"vitess.io/vitess/go/vt/vterrors"
 
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tx"
@@ -39,12 +41,14 @@ import (
 )
 
 func TestTxPoolExecuteCommit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	db, txPool, _, closer := setup(t)
 	defer closer()
 
 	sql := "select 'this is a query'"
 	// begin a transaction and then return the connection
-	conn, _, err := txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
+	conn, _, _, err := txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
 	require.NoError(t, err)
 
 	id := conn.ReservedID()
@@ -73,10 +77,13 @@ func TestTxPoolExecuteCommit(t *testing.T) {
 }
 
 func TestTxPoolExecuteRollback(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	db, txPool, _, closer := setup(t)
 	defer closer()
 
-	conn, _, err := txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
+	conn, _, _, err := txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
 	require.NoError(t, err)
 	defer conn.Release(tx.TxRollback)
 
@@ -91,10 +98,13 @@ func TestTxPoolExecuteRollback(t *testing.T) {
 }
 
 func TestTxPoolExecuteRollbackOnClosedConn(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	db, txPool, _, closer := setup(t)
 	defer closer()
 
-	conn, _, err := txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
+	conn, _, _, err := txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
 	require.NoError(t, err)
 	defer conn.Release(tx.TxRollback)
 
@@ -108,13 +118,16 @@ func TestTxPoolExecuteRollbackOnClosedConn(t *testing.T) {
 }
 
 func TestTxPoolRollbackNonBusy(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	db, txPool, _, closer := setup(t)
 	defer closer()
 
 	// start two transactions, and mark one of them as unused
-	conn1, _, err := txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
+	conn1, _, _, err := txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
 	require.NoError(t, err)
-	conn2, _, err := txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
+	conn2, _, _, err := txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
 	require.NoError(t, err)
 	conn2.Unlock() // this marks conn2 as NonBusy
 
@@ -135,10 +148,13 @@ func TestTxPoolRollbackNonBusy(t *testing.T) {
 }
 
 func TestTxPoolTransactionIsolation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	db, txPool, _, closer := setup(t)
 	defer closer()
 
-	c2, _, err := txPool.Begin(ctx, &querypb.ExecuteOptions{TransactionIsolation: querypb.ExecuteOptions_READ_COMMITTED}, false, 0, nil)
+	c2, _, _, err := txPool.Begin(ctx, &querypb.ExecuteOptions{TransactionIsolation: querypb.ExecuteOptions_READ_COMMITTED}, false, 0, nil)
 	require.NoError(t, err)
 	c2.Release(tx.TxClose)
 
@@ -146,6 +162,9 @@ func TestTxPoolTransactionIsolation(t *testing.T) {
 }
 
 func TestTxPoolAutocommit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	db, txPool, _, closer := setup(t)
 	defer closer()
 
@@ -153,7 +172,7 @@ func TestTxPoolAutocommit(t *testing.T) {
 	// to mysql.
 	// This test is meaningful because if txPool.Begin were to send a BEGIN statement to the connection, it will fatal
 	// because is not in the list of expected queries (i.e db.AddQuery hasn't been called).
-	conn1, _, err := txPool.Begin(ctx, &querypb.ExecuteOptions{TransactionIsolation: querypb.ExecuteOptions_AUTOCOMMIT}, false, 0, nil)
+	conn1, _, _, err := txPool.Begin(ctx, &querypb.ExecuteOptions{TransactionIsolation: querypb.ExecuteOptions_AUTOCOMMIT}, false, 0, nil)
 	require.NoError(t, err)
 
 	// run a query to see it in the query log
@@ -173,7 +192,10 @@ func TestTxPoolAutocommit(t *testing.T) {
 // db connection. DBConn.Exec() is going to reconnect and retry automatically
 // due to this connection error and the BEGIN will succeed.
 func TestTxPoolBeginWithPoolConnectionError_Errno2006_Transient(t *testing.T) {
-	db, txPool := primeTxPoolWithConnection(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	db, txPool := primeTxPoolWithConnection(t, ctx)
 	defer db.Close()
 	defer txPool.Close()
 
@@ -182,26 +204,28 @@ func TestTxPoolBeginWithPoolConnectionError_Errno2006_Transient(t *testing.T) {
 	err := db.WaitForClose(2 * time.Second)
 	require.NoError(t, err)
 
-	txConn, _, err := txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
+	txConn, _, _, err := txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
 	require.NoError(t, err, "Begin should have succeeded after the retry in DBConn.Exec()")
 	txConn.Release(tx.TxCommit)
 }
 
 // primeTxPoolWithConnection is a helper function. It reconstructs the
 // scenario where future transactions are going to reuse an open db connection.
-func primeTxPoolWithConnection(t *testing.T) (*fakesqldb.DB, *TxPool) {
+func primeTxPoolWithConnection(t *testing.T, ctx context.Context) (*fakesqldb.DB, *TxPool) {
 	t.Helper()
 	db := fakesqldb.New(t)
 	txPool, _ := newTxPool()
 	// Set the capacity to 1 to ensure that the db connection is reused.
-	txPool.scp.conns.SetCapacity(1)
-	txPool.Open(db.ConnParams(), db.ConnParams(), db.ConnParams())
+	err := txPool.scp.conns.SetCapacity(context.Background(), 1)
+	require.NoError(t, err)
+	params := dbconfigs.New(db.ConnParams())
+	txPool.Open(params, params, params)
 
 	// Run a query to trigger a database connection. That connection will be
 	// reused by subsequent transactions.
 	db.AddQuery("begin", &sqltypes.Result{})
 	db.AddQuery("rollback", &sqltypes.Result{})
-	txConn, _, err := txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
+	txConn, _, _, err := txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
 	require.NoError(t, err)
 	txConn.Release(tx.TxCommit)
 
@@ -209,6 +233,9 @@ func primeTxPoolWithConnection(t *testing.T) (*fakesqldb.DB, *TxPool) {
 }
 
 func TestTxPoolBeginWithError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	db, txPool, limiter, closer := setup(t)
 	defer closer()
 	db.AddRejectedQuery("begin", errRejected)
@@ -221,7 +248,7 @@ func TestTxPoolBeginWithError(t *testing.T) {
 	}
 
 	ctxWithCallerID := callerid.NewContext(ctx, ef, im)
-	_, _, err := txPool.Begin(ctxWithCallerID, &querypb.ExecuteOptions{}, false, 0, nil)
+	_, _, _, err := txPool.Begin(ctxWithCallerID, &querypb.ExecuteOptions{}, false, 0, nil)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "error: rejected")
 	require.Equal(t, vtrpcpb.Code_UNKNOWN, vterrors.Code(err), "wrong error code for Begin error")
@@ -243,25 +270,15 @@ func TestTxPoolBeginWithError(t *testing.T) {
 		}, limiter.Actions())
 }
 
-func TestTxPoolBeginWithPreQueryError(t *testing.T) {
-	db, txPool, _, closer := setup(t)
-	defer closer()
-	db.AddRejectedQuery("pre_query", errRejected)
-	_, _, err := txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, []string{"pre_query"})
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "error: rejected")
-	require.Equal(t, vtrpcpb.Code_UNKNOWN, vterrors.Code(err), "wrong error code for Begin error")
-}
-
 func TestTxPoolCancelledContextError(t *testing.T) {
 	// given
 	db, txPool, _, closer := setup(t)
 	defer closer()
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
 	// when
-	_, _, err := txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
+	_, _, _, err := txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
 
 	// then
 	require.Error(t, err)
@@ -271,21 +288,23 @@ func TestTxPoolCancelledContextError(t *testing.T) {
 }
 
 func TestTxPoolWaitTimeoutError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	env := newEnv("TabletServerTest")
 	env.Config().TxPool.Size = 1
-	env.Config().TxPool.MaxWaiters = 0
-	env.Config().TxPool.TimeoutSeconds = 1
+	env.Config().TxPool.Timeout = time.Second
 	// given
 	db, txPool, _, closer := setupWithEnv(t, env)
 	defer closer()
 
 	// lock the only connection in the pool.
-	conn, _, err := txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
+	conn, _, _, err := txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
 	require.NoError(t, err)
 	defer conn.Unlock()
 
 	// try locking one more connection.
-	_, _, err = txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
+	_, _, _, err = txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
 
 	// then
 	require.Error(t, err)
@@ -297,12 +316,15 @@ func TestTxPoolWaitTimeoutError(t *testing.T) {
 }
 
 func TestTxPoolRollbackFailIsPassedThrough(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	sql := "alter table test_table add test_column int"
 	db, txPool, _, closer := setup(t)
 	defer closer()
 	db.AddRejectedQuery("rollback", errRejected)
 
-	conn1, _, err := txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
+	conn1, _, _, err := txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
 	require.NoError(t, err)
 
 	_, err = conn1.Exec(ctx, sql, 1, true)
@@ -317,9 +339,12 @@ func TestTxPoolRollbackFailIsPassedThrough(t *testing.T) {
 }
 
 func TestTxPoolGetConnRecentlyRemovedTransaction(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	db, txPool, _, _ := setup(t)
 	defer db.Close()
-	conn1, _, _ := txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
+	conn1, _, _, _ := txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
 	id := conn1.ReservedID()
 	conn1.Unlock()
 	txPool.Close()
@@ -327,7 +352,7 @@ func TestTxPoolGetConnRecentlyRemovedTransaction(t *testing.T) {
 	assertErrorMatch := func(id int64, reason string) {
 		conn, err := txPool.GetAndLock(id, "for query")
 		if err == nil { //
-			conn.Releasef("fail")
+			conn.ReleaseString("fail")
 			t.Errorf("expected to get an error")
 			return
 		}
@@ -339,23 +364,26 @@ func TestTxPoolGetConnRecentlyRemovedTransaction(t *testing.T) {
 	assertErrorMatch(id, "pool closed")
 
 	txPool, _ = newTxPool()
-	txPool.Open(db.ConnParams(), db.ConnParams(), db.ConnParams())
+	params := dbconfigs.New(db.ConnParams())
+	txPool.Open(params, params, params)
 
-	conn1, _, _ = txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
+	conn1, _, _, _ = txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
 	id = conn1.ReservedID()
 	_, err := txPool.Commit(ctx, conn1)
 	require.NoError(t, err)
 
-	conn1.Releasef("transaction committed")
+	conn1.ReleaseString("transaction committed")
 
 	assertErrorMatch(id, "transaction committed")
 
-	txPool, _ = newTxPool()
-	txPool.SetTimeout(1 * time.Millisecond)
-	txPool.Open(db.ConnParams(), db.ConnParams(), db.ConnParams())
+	env := txPool.env
+	env.Config().SetTxTimeoutForWorkload(1*time.Millisecond, querypb.ExecuteOptions_OLTP)
+	env.Config().SetTxTimeoutForWorkload(1*time.Millisecond, querypb.ExecuteOptions_OLAP)
+	txPool, _ = newTxPoolWithEnv(env)
+	txPool.Open(params, params, params)
 	defer txPool.Close()
 
-	conn1, _, err = txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
+	conn1, _, _, err = txPool.Begin(ctx, &querypb.ExecuteOptions{}, false, 0, nil)
 	require.NoError(t, err, "unable to start transaction: %v", err)
 	conn1.Unlock()
 	id = conn1.ReservedID()
@@ -371,7 +399,7 @@ func TestTxPoolCloseKillsStrayTransactions(t *testing.T) {
 	startingStray := txPool.env.Stats().InternalErrors.Counts()["StrayTransactions"]
 
 	// Start stray transaction.
-	conn, _, err := txPool.Begin(context.Background(), &querypb.ExecuteOptions{}, false, 0, nil)
+	conn, _, _, err := txPool.Begin(context.Background(), &querypb.ExecuteOptions{}, false, 0, nil)
 	require.NoError(t, err)
 	conn.Unlock()
 
@@ -382,10 +410,12 @@ func TestTxPoolCloseKillsStrayTransactions(t *testing.T) {
 }
 
 func TestTxTimeoutKillsTransactions(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	env := newEnv("TabletServerTest")
 	env.Config().TxPool.Size = 1
-	env.Config().TxPool.MaxWaiters = 0
-	env.Config().Oltp.TxTimeoutSeconds = 1
+	env.Config().Oltp.TxTimeout = time.Second
 	_, txPool, limiter, closer := setupWithEnv(t, env)
 	defer closer()
 	startingKills := txPool.env.Stats().KillCounters.Counts()["Transactions"]
@@ -400,14 +430,14 @@ func TestTxTimeoutKillsTransactions(t *testing.T) {
 	ctxWithCallerID := callerid.NewContext(ctx, ef, im)
 
 	// Start transaction.
-	conn, _, err := txPool.Begin(ctxWithCallerID, &querypb.ExecuteOptions{}, false, 0, nil)
+	conn, _, _, err := txPool.Begin(ctxWithCallerID, &querypb.ExecuteOptions{}, false, 0, nil)
 	require.NoError(t, err)
 	conn.Unlock()
 
 	// Let it time out and get killed by the tx killer.
 	time.Sleep(1200 * time.Millisecond)
 
-	// Verify that the tx killer rand.
+	// Verify that the tx killer ran.
 	require.Equal(t, int64(1), txPool.env.Stats().KillCounters.Counts()["Transactions"]-startingKills)
 
 	// Regression test for #6727: make sure the tx limiter is decremented when the tx killer closes
@@ -427,6 +457,336 @@ func TestTxTimeoutKillsTransactions(t *testing.T) {
 		}, limiter.Actions())
 }
 
+func TestTxTimeoutDoesNotKillShortLivedTransactions(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	env := newEnv("TabletServerTest")
+	env.Config().TxPool.Size = 1
+	env.Config().Oltp.TxTimeout = time.Second
+	_, txPool, _, closer := setupWithEnv(t, env)
+	defer closer()
+	startingKills := txPool.env.Stats().KillCounters.Counts()["Transactions"]
+
+	im := &querypb.VTGateCallerID{
+		Username: "user",
+	}
+	ef := &vtrpcpb.CallerID{
+		Principal: "principle",
+	}
+
+	ctxWithCallerID := callerid.NewContext(ctx, ef, im)
+
+	// Start transaction.
+	conn, _, _, err := txPool.Begin(ctxWithCallerID, &querypb.ExecuteOptions{}, false, 0, nil)
+	require.NoError(t, err)
+	conn.Unlock()
+
+	// Sleep for less than the tx timeout
+	time.Sleep(800 * time.Millisecond)
+
+	// Verify that the tx killer did not run.
+	require.Equal(t, int64(0), txPool.env.Stats().KillCounters.Counts()["Transactions"]-startingKills)
+}
+
+func TestTxTimeoutKillsOlapTransactions(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	env := newEnv("TabletServerTest")
+	env.Config().TxPool.Size = 1
+	env.Config().Oltp.TxTimeout = time.Second
+	env.Config().Olap.TxTimeout = 2 * time.Second
+	_, txPool, _, closer := setupWithEnv(t, env)
+	defer closer()
+	startingKills := txPool.env.Stats().KillCounters.Counts()["Transactions"]
+
+	im := &querypb.VTGateCallerID{
+		Username: "user",
+	}
+	ef := &vtrpcpb.CallerID{
+		Principal: "principle",
+	}
+
+	ctxWithCallerID := callerid.NewContext(ctx, ef, im)
+
+	// Start transaction.
+	conn, _, _, err := txPool.Begin(ctxWithCallerID, &querypb.ExecuteOptions{
+		Workload: querypb.ExecuteOptions_OLAP,
+	}, false, 0, nil)
+	require.NoError(t, err)
+	conn.Unlock()
+
+	// After the OLTP timeout elapses, the tx should not have been killed.
+	time.Sleep(1200 * time.Millisecond)
+	require.Equal(t, int64(0), txPool.env.Stats().KillCounters.Counts()["Transactions"]-startingKills)
+
+	// After the OLAP timeout elapses, the tx should have been killed.
+	time.Sleep(1000 * time.Millisecond)
+	require.Equal(t, int64(1), txPool.env.Stats().KillCounters.Counts()["Transactions"]-startingKills)
+}
+
+func TestTxTimeoutNotEnforcedForZeroLengthTimeouts(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	env := newEnv("TabletServerTest")
+	env.Config().TxPool.Size = 2
+	env.Config().Oltp.TxTimeout = 0
+	env.Config().Olap.TxTimeout = 0
+	_, txPool, _, closer := setupWithEnv(t, env)
+	defer closer()
+	startingKills := txPool.env.Stats().KillCounters.Counts()["Transactions"]
+
+	im := &querypb.VTGateCallerID{
+		Username: "user",
+	}
+	ef := &vtrpcpb.CallerID{
+		Principal: "principle",
+	}
+
+	ctxWithCallerID := callerid.NewContext(ctx, ef, im)
+
+	// Start transactions.
+	conn0, _, _, err := txPool.Begin(ctxWithCallerID, &querypb.ExecuteOptions{}, false, 0, nil)
+	require.NoError(t, err)
+	conn1, _, _, err := txPool.Begin(ctxWithCallerID, &querypb.ExecuteOptions{
+		Workload: querypb.ExecuteOptions_OLAP,
+	}, false, 0, nil)
+	require.NoError(t, err)
+	conn0.Unlock()
+	conn1.Unlock()
+
+	// Not really a great test, but we don't want to make unit tests take a
+	// long time by using a long sleep. Probably a better approach would be to
+	// either monkeypatch time.Now() or pass in a mock Clock to TxPool.
+	time.Sleep(2000 * time.Millisecond)
+
+	// OLTP tx is not killed.
+	require.Equal(t, int64(0), txPool.env.Stats().KillCounters.Counts()["Transactions"]-startingKills)
+	// OLAP tx is not killed.
+	require.Equal(t, int64(0), txPool.env.Stats().KillCounters.Counts()["Transactions"]-startingKills)
+}
+
+func TestTxTimeoutReservedConn(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	env := newEnv("TabletServerTest")
+	env.Config().TxPool.Size = 1
+	env.Config().Oltp.TxTimeout = time.Second
+	env.Config().Olap.TxTimeout = 2 * time.Second
+	_, txPool, _, closer := setupWithEnv(t, env)
+	defer closer()
+	startingRcKills := txPool.env.Stats().KillCounters.Counts()["ReservedConnection"]
+	startingTxKills := txPool.env.Stats().KillCounters.Counts()["Transactions"]
+
+	im := &querypb.VTGateCallerID{
+		Username: "user",
+	}
+	ef := &vtrpcpb.CallerID{
+		Principal: "principle",
+	}
+
+	ctxWithCallerID := callerid.NewContext(ctx, ef, im)
+
+	// Start OLAP transaction and return it to pool right away.
+	conn0, _, _, err := txPool.Begin(ctxWithCallerID, &querypb.ExecuteOptions{
+		Workload: querypb.ExecuteOptions_OLAP,
+	}, false, 0, nil)
+	require.NoError(t, err)
+	// Taint the connection.
+	conn0.Taint(ctxWithCallerID, nil)
+	conn0.Unlock()
+
+	// tx should not timeout after OLTP timeout.
+	time.Sleep(1200 * time.Millisecond)
+	require.Equal(t, int64(0), txPool.env.Stats().KillCounters.Counts()["ReservedConnection"]-startingRcKills)
+	require.Equal(t, int64(0), txPool.env.Stats().KillCounters.Counts()["Transactions"]-startingTxKills)
+
+	// tx should timeout after OLAP timeout.
+	time.Sleep(1000 * time.Millisecond)
+	require.Equal(t, int64(1), txPool.env.Stats().KillCounters.Counts()["ReservedConnection"]-startingRcKills)
+	require.Equal(t, int64(1), txPool.env.Stats().KillCounters.Counts()["Transactions"]-startingTxKills)
+}
+
+func TestTxTimeoutReusedReservedConn(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	env := newEnv("TabletServerTest")
+	env.Config().TxPool.Size = 1
+	env.Config().Oltp.TxTimeout = time.Second
+	env.Config().Olap.TxTimeout = 2 * time.Second
+	_, txPool, _, closer := setupWithEnv(t, env)
+	defer closer()
+	startingRcKills := txPool.env.Stats().KillCounters.Counts()["ReservedConnection"]
+	startingTxKills := txPool.env.Stats().KillCounters.Counts()["Transactions"]
+
+	im := &querypb.VTGateCallerID{
+		Username: "user",
+	}
+	ef := &vtrpcpb.CallerID{
+		Principal: "principle",
+	}
+
+	ctxWithCallerID := callerid.NewContext(ctx, ef, im)
+
+	// Start OLAP transaction and return it to pool right away.
+	conn0, _, _, err := txPool.Begin(ctxWithCallerID, &querypb.ExecuteOptions{
+		Workload: querypb.ExecuteOptions_OLAP,
+	}, false, 0, nil)
+	require.NoError(t, err)
+	// Taint the connection.
+	conn0.Taint(ctxWithCallerID, nil)
+	conn0.Unlock()
+
+	// Reuse underlying connection in an OLTP transaction.
+	conn1, _, _, err := txPool.Begin(ctxWithCallerID, &querypb.ExecuteOptions{}, false, conn0.ReservedID(), nil)
+	require.NoError(t, err)
+	require.Equal(t, conn1.ReservedID(), conn0.ReservedID())
+	conn1.Unlock()
+
+	// tx should timeout after OLTP timeout.
+	time.Sleep(1200 * time.Millisecond)
+	require.Equal(t, int64(1), txPool.env.Stats().KillCounters.Counts()["ReservedConnection"]-startingRcKills)
+	require.Equal(t, int64(1), txPool.env.Stats().KillCounters.Counts()["Transactions"]-startingTxKills)
+}
+
+func TestTxPoolBeginStatements(t *testing.T) {
+	_, txPool, _, closer := setup(t)
+	defer closer()
+
+	testCases := []struct {
+		txIsolationLevel querypb.ExecuteOptions_TransactionIsolation
+		txAccessModes    []querypb.ExecuteOptions_TransactionAccessMode
+		readOnly         bool
+
+		expBeginSQL string
+		expErr      string
+	}{{
+		txIsolationLevel: querypb.ExecuteOptions_DEFAULT,
+		expBeginSQL:      "begin",
+	}, {
+		txIsolationLevel: querypb.ExecuteOptions_DEFAULT,
+		readOnly:         true,
+		expBeginSQL:      "start transaction read only",
+	}, {
+		txIsolationLevel: querypb.ExecuteOptions_READ_UNCOMMITTED,
+		expBeginSQL:      "set transaction isolation level read uncommitted; begin",
+	}, {
+		txIsolationLevel: querypb.ExecuteOptions_READ_UNCOMMITTED,
+		readOnly:         true,
+		expBeginSQL:      "set transaction isolation level read uncommitted; start transaction read only",
+	}, {
+		txIsolationLevel: querypb.ExecuteOptions_READ_COMMITTED,
+		expBeginSQL:      "set transaction isolation level read committed; begin",
+	}, {
+		txIsolationLevel: querypb.ExecuteOptions_READ_COMMITTED,
+		readOnly:         true,
+		expBeginSQL:      "set transaction isolation level read committed; start transaction read only",
+	}, {
+		txIsolationLevel: querypb.ExecuteOptions_REPEATABLE_READ,
+		expBeginSQL:      "set transaction isolation level repeatable read; begin",
+	}, {
+		txIsolationLevel: querypb.ExecuteOptions_REPEATABLE_READ,
+		readOnly:         true,
+		expBeginSQL:      "set transaction isolation level repeatable read; start transaction read only",
+	}, {
+		txIsolationLevel: querypb.ExecuteOptions_SERIALIZABLE,
+		expBeginSQL:      "set transaction isolation level serializable; begin",
+	}, {
+		txIsolationLevel: querypb.ExecuteOptions_SERIALIZABLE,
+		readOnly:         true,
+		expBeginSQL:      "set transaction isolation level serializable; start transaction read only",
+	}, {
+		txIsolationLevel: querypb.ExecuteOptions_CONSISTENT_SNAPSHOT_READ_ONLY,
+		expBeginSQL:      "set session session_track_gtids = START_GTID; set transaction isolation level repeatable read; start transaction with consistent snapshot, read only",
+	}, {
+		txIsolationLevel: querypb.ExecuteOptions_CONSISTENT_SNAPSHOT_READ_ONLY,
+		readOnly:         true,
+		expBeginSQL:      "set session session_track_gtids = START_GTID; set transaction isolation level repeatable read; start transaction with consistent snapshot, read only",
+	}, {
+		txIsolationLevel: querypb.ExecuteOptions_AUTOCOMMIT,
+		expBeginSQL:      "",
+	}, {
+		txIsolationLevel: querypb.ExecuteOptions_AUTOCOMMIT,
+		readOnly:         true,
+		expBeginSQL:      "",
+	}, {
+		txIsolationLevel: querypb.ExecuteOptions_DEFAULT,
+		txAccessModes: []querypb.ExecuteOptions_TransactionAccessMode{
+			querypb.ExecuteOptions_CONSISTENT_SNAPSHOT,
+		},
+		expBeginSQL: "start transaction with consistent snapshot",
+	}, {
+		txIsolationLevel: querypb.ExecuteOptions_READ_COMMITTED,
+		txAccessModes: []querypb.ExecuteOptions_TransactionAccessMode{
+			querypb.ExecuteOptions_READ_ONLY,
+		},
+		expBeginSQL: "set transaction isolation level read committed; start transaction read only",
+	}, {
+		txIsolationLevel: querypb.ExecuteOptions_REPEATABLE_READ,
+		txAccessModes: []querypb.ExecuteOptions_TransactionAccessMode{
+			querypb.ExecuteOptions_READ_WRITE,
+		},
+		expBeginSQL: "set transaction isolation level repeatable read; start transaction read write",
+	}, {
+		txIsolationLevel: querypb.ExecuteOptions_SERIALIZABLE,
+		txAccessModes: []querypb.ExecuteOptions_TransactionAccessMode{
+			querypb.ExecuteOptions_CONSISTENT_SNAPSHOT,
+			querypb.ExecuteOptions_READ_WRITE,
+		},
+		expBeginSQL: "set transaction isolation level serializable; start transaction with consistent snapshot, read write",
+	}, {
+		// read write access mode set when readOnly is true. This should fail.
+		txIsolationLevel: querypb.ExecuteOptions_DEFAULT,
+		txAccessModes: []querypb.ExecuteOptions_TransactionAccessMode{
+			querypb.ExecuteOptions_CONSISTENT_SNAPSHOT,
+			querypb.ExecuteOptions_READ_WRITE,
+		},
+		readOnly: true,
+		expErr:   "cannot start read write transaction on a read only tablet",
+	}, {
+		txIsolationLevel: querypb.ExecuteOptions_DEFAULT,
+		txAccessModes: []querypb.ExecuteOptions_TransactionAccessMode{
+			querypb.ExecuteOptions_CONSISTENT_SNAPSHOT,
+			querypb.ExecuteOptions_READ_ONLY,
+		},
+		readOnly:    true,
+		expBeginSQL: "start transaction with consistent snapshot, read only",
+	}, {
+		txIsolationLevel: querypb.ExecuteOptions_REPEATABLE_READ,
+		txAccessModes: []querypb.ExecuteOptions_TransactionAccessMode{
+			querypb.ExecuteOptions_CONSISTENT_SNAPSHOT,
+		},
+		readOnly:    true,
+		expBeginSQL: "set transaction isolation level repeatable read; start transaction with consistent snapshot, read only",
+	}}
+
+	for _, tc := range testCases {
+		t.Run(fmt.Sprintf("%v:%v:readOnly:%v", tc.txIsolationLevel, tc.txAccessModes, tc.readOnly), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			options := &querypb.ExecuteOptions{
+				TransactionIsolation:  tc.txIsolationLevel,
+				TransactionAccessMode: tc.txAccessModes,
+			}
+			conn, beginSQL, _, err := txPool.Begin(ctx, options, tc.readOnly, 0, nil)
+			if tc.expErr != "" {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tc.expErr)
+				require.Nil(t, conn)
+				return
+			}
+			require.NoError(t, err)
+			conn.Release(tx.ConnRelease)
+			require.Equal(t, tc.expBeginSQL, beginSQL)
+		})
+	}
+}
+
 func newTxPool() (*TxPool, *fakeLimiter) {
 	return newTxPoolWithEnv(newEnv("TabletServerTest"))
 }
@@ -437,15 +797,14 @@ func newTxPoolWithEnv(env tabletenv.Env) (*TxPool, *fakeLimiter) {
 }
 
 func newEnv(exporterName string) tabletenv.Env {
-	config := tabletenv.NewDefaultConfig()
-	config.TxPool.Size = 300
-	config.Oltp.TxTimeoutSeconds = 30
-	config.TxPool.TimeoutSeconds = 40
-	config.TxPool.MaxWaiters = 500000
-	config.OltpReadPool.IdleTimeoutSeconds = 30
-	config.OlapReadPool.IdleTimeoutSeconds = 30
-	config.TxPool.IdleTimeoutSeconds = 30
-	env := tabletenv.NewEnv(config, exporterName)
+	cfg := tabletenv.NewDefaultConfig()
+	cfg.TxPool.Size = 300
+	cfg.Oltp.TxTimeout = 30 * time.Second
+	cfg.TxPool.Timeout = 40 * time.Second
+	cfg.OltpReadPool.IdleTimeout = 30 * time.Second
+	cfg.OlapReadPool.IdleTimeout = 30 * time.Second
+	cfg.TxPool.IdleTimeout = 30 * time.Second
+	env := tabletenv.NewEnv(vtenv.NewTestEnv(), cfg, exporterName)
 	return env
 }
 
@@ -494,7 +853,8 @@ func setup(t *testing.T) (*fakesqldb.DB, *TxPool, *fakeLimiter, func()) {
 	db.AddQueryPattern(".*", &sqltypes.Result{})
 
 	txPool, limiter := newTxPool()
-	txPool.Open(db.ConnParams(), db.ConnParams(), db.ConnParams())
+	params := dbconfigs.New(db.ConnParams())
+	txPool.Open(params, params, params)
 
 	return db, txPool, limiter, func() {
 		txPool.Close()
@@ -507,7 +867,8 @@ func setupWithEnv(t *testing.T, env tabletenv.Env) (*fakesqldb.DB, *TxPool, *fak
 	db.AddQueryPattern(".*", &sqltypes.Result{})
 
 	txPool, limiter := newTxPoolWithEnv(env)
-	txPool.Open(db.ConnParams(), db.ConnParams(), db.ConnParams())
+	params := dbconfigs.New(db.ConnParams())
+	txPool.Open(params, params, params)
 
 	return db, txPool, limiter, func() {
 		txPool.Close()

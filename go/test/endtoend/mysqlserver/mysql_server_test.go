@@ -19,6 +19,7 @@ package mysqlserver
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"io"
 	"net/http"
@@ -31,10 +32,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"vitess.io/vitess/go/mysql/sqlerror"
+
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/test/endtoend/cluster"
-
-	"database/sql"
 
 	_ "github.com/go-sql-driver/mysql"
 )
@@ -115,11 +116,11 @@ func TestTimeout(t *testing.T) {
 	require.Nilf(t, err, "unable to connect mysql: %v", err)
 	defer conn.Close()
 
-	_, err = conn.ExecuteFetch("SELECT SLEEP(5);", 1, false)
+	_, err = conn.ExecuteFetch("SELECT SLEEP(5)", 1, false)
 	require.NotNilf(t, err, "quiry timeout error expected")
-	mysqlErr, ok := err.(*mysql.SQLError)
+	mysqlErr, ok := err.(*sqlerror.SQLError)
 	require.Truef(t, ok, "invalid error type")
-	assert.Equal(t, 1317, mysqlErr.Number(), err)
+	assert.Equal(t, sqlerror.ERQueryInterrupted, mysqlErr.Number(), err)
 }
 
 // TestInvalidField tries to fetch invalid column and verifies the error.
@@ -131,11 +132,11 @@ func TestInvalidField(t *testing.T) {
 	require.Nilf(t, err, "unable to connect mysql: %v", err)
 	defer conn.Close()
 
-	_, err = conn.ExecuteFetch("SELECT invalid_field from vt_insert_test;", 1, false)
+	_, err = conn.ExecuteFetch("SELECT invalid_field from vt_insert_test", 1, false)
 	require.NotNil(t, err, "invalid field error expected")
-	mysqlErr, ok := err.(*mysql.SQLError)
+	mysqlErr, ok := err.(*sqlerror.SQLError)
 	require.Truef(t, ok, "invalid error type")
-	assert.Equal(t, 1054, mysqlErr.Number(), err)
+	assert.Equal(t, sqlerror.ERBadFieldError, mysqlErr.Number(), err)
 }
 
 // TestWarnings validates the behaviour of SHOW WARNINGS.
@@ -152,7 +153,7 @@ func TestWarnings(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, qr.Rows, "number of rows")
 
-	qr, err = conn.ExecuteFetch("SHOW WARNINGS;", 1, false)
+	qr, err = conn.ExecuteFetch("SHOW WARNINGS", 1, false)
 	require.NoError(t, err, "SHOW WARNINGS")
 	assert.EqualValues(t, 1, len(qr.Rows), "number of rows")
 	assert.Contains(t, qr.Rows[0][0].String(), "VARCHAR(\"Warning\")", qr.Rows)
@@ -163,7 +164,7 @@ func TestWarnings(t *testing.T) {
 	_, err = conn.ExecuteFetch("SELECT 1 from vt_insert_test limit 1", 1, false)
 	require.NoError(t, err)
 
-	qr, err = conn.ExecuteFetch("SHOW WARNINGS;", 1, false)
+	qr, err = conn.ExecuteFetch("SHOW WARNINGS", 1, false)
 	require.NoError(t, err)
 	assert.Empty(t, qr.Rows)
 
@@ -174,7 +175,7 @@ func TestWarnings(t *testing.T) {
 	_, err = conn.ExecuteFetch("SELECT 1 from vt_insert_test limit 1", 1, false)
 	require.NoError(t, err)
 
-	qr, err = conn.ExecuteFetch("SHOW WARNINGS;", 1, false)
+	qr, err = conn.ExecuteFetch("SHOW WARNINGS", 1, false)
 	require.NoError(t, err)
 	assert.Empty(t, qr.Rows)
 }

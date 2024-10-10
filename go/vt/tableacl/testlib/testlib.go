@@ -19,9 +19,8 @@ package testlib
 import (
 	"errors"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
-	"time"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	tableaclpb "vitess.io/vitess/go/vt/proto/tableacl"
@@ -31,7 +30,7 @@ import (
 
 // TestSuite tests a concrete acl.Factory implementation.
 func TestSuite(t *testing.T, factory acl.Factory) {
-	name := fmt.Sprintf("tableacl-test-%d", rand.Int63())
+	name := fmt.Sprintf("tableacl-test-%d", rand.Int64())
 	tableacl.Register(name, factory)
 	tableacl.SetDefaultACL(name)
 
@@ -126,8 +125,4 @@ func checkAccess(config *tableaclpb.Config, tableName string, role tableacl.Role
 		return fmt.Errorf("got %v, want %v", got, want)
 	}
 	return nil
-}
-
-func init() {
-	rand.Seed(time.Now().UnixNano())
 }

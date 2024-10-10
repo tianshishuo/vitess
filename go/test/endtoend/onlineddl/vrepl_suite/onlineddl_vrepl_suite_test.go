@@ -28,12 +28,14 @@ import (
 	"time"
 
 	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/mysql/config"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/schema"
 	"vitess.io/vitess/go/vt/sqlparser"
 
 	"vitess.io/vitess/go/test/endtoend/cluster"
 	"vitess.io/vitess/go/test/endtoend/onlineddl"
+	"vitess.io/vitess/go/test/endtoend/throttler"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -54,16 +56,21 @@ var (
 	beforeTableName       = `onlineddl_test_before`
 	afterTableName        = `onlineddl_test_after`
 	eventName             = `onlineddl_test`
+
+	testsFilter = ""
 )
 
 const (
-	testDataPath   = "testdata"
-	defaultSQLMode = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
+	testDataPath     = "testdata"
+	testFilterEnvVar = "ONLINEDDL_SUITE_TEST_FILTER"
 )
 
+// Use $VREPL_SUITE_TEST_FILTER environment variable to filter tests by name.
 func TestMain(m *testing.M) {
 	defer cluster.PanicHandler(nil)
 	flag.Parse()
+
+	testsFilter = os.Getenv(testFilterEnvVar)
 
 	exitcode, err := func() (int, error) {
 		clusterInstance = cluster.NewCluster(cell, hostname)
@@ -76,18 +83,16 @@ func TestMain(m *testing.M) {
 		}
 
 		clusterInstance.VtctldExtraArgs = []string{
-			"-schema_change_dir", schemaChangeDirectory,
-			"-schema_change_controller", "local",
-			"-schema_change_check_interval", "1",
-			"-online_ddl_check_interval", "2s",
+			"--schema_change_dir", schemaChangeDirectory,
+			"--schema_change_controller", "local",
+			"--schema_change_check_interval", "1s",
 		}
 
 		clusterInstance.VtTabletExtraArgs = []string{
-			"-enable-lag-throttler",
-			"-throttle_threshold", "1s",
-			"-heartbeat_enable",
-			"-heartbeat_interval", "250ms",
-			"-migration_check_interval", "5s",
+			"--heartbeat_interval", "250ms",
+			"--heartbeat_on_demand_duration", "5s",
+			"--migration_check_interval", "5s",
+			"--watch_replication_stream",
 		}
 
 		if err := clusterInstance.StartTopo(); err != nil {
@@ -105,8 +110,6 @@ func TestMain(m *testing.M) {
 		}
 
 		vtgateInstance := clusterInstance.NewVtgateInstance()
-		// set the gateway we want to use
-		vtgateInstance.GatewayImplementation = "tabletgateway"
 		// Start vtgate
 		if err := vtgateInstance.Setup(); err != nil {
 			return 1, err
@@ -129,11 +132,34 @@ func TestMain(m *testing.M) {
 
 }
 
-func TestSchemaChange(t *testing.T) {
+func TestVreplSuiteSchemaChanges(t *testing.T) {
 	defer cluster.PanicHandler(t)
 
 	shards := clusterInstance.Keyspaces[0].Shards
 	require.Equal(t, 1, len(shards))
+
+	throttler.EnableLagThrottlerAndWaitForStatus(t, clusterInstance)
+
+	fkOnlineDDLPossible := false
+	t.Run("check 'rename_table_preserve_foreign_key' variable", func(t *testing.T) {
+		// Online DDL is not possible on vanilla MySQL 8.0 for reasons described in https://vitess.io/blog/2021-06-15-online-ddl-why-no-fk/.
+		// However, Online DDL is made possible in via these changes:
+		// - https://github.com/planetscale/mysql-server/commit/bb777e3e86387571c044fb4a2beb4f8c60462ced
+		// - https://github.com/planetscale/mysql-server/commit/c2f1344a6863518d749f2eb01a4c74ca08a5b889
+		// as part of https://github.com/planetscale/mysql-server/releases/tag/8.0.34-ps3.
+		// Said changes introduce a new global/session boolean variable named 'rename_table_preserve_foreign_key'. It defaults 'false'/0 for backwards compatibility.
+		// When enabled, a `RENAME TABLE` to a FK parent "pins" the children's foreign keys to the table name rather than the table pointer. Which means after the RENAME,
+		// the children will point to the newly instated table rather than the original, renamed table.
+		// (Note: this applies to a particular type of RENAME where we swap tables, see the above blog post).
+		// For FK children, the MySQL changes simply ignore any Vitess-internal table.
+		//
+		// In this stress test, we enable Online DDL if the variable 'rename_table_preserve_foreign_key' is present. The Online DDL mechanism will in turn
+		// query for this variable, and manipulate it, when starting the migration and when cutting over.
+		rs, err := shards[0].Vttablets[0].VttabletProcess.QueryTablet("show global variables like 'rename_table_preserve_foreign_key'", keyspaceName, false)
+		require.NoError(t, err)
+		fkOnlineDDLPossible = len(rs.Rows) > 0
+		t.Logf("MySQL support for 'rename_table_preserve_foreign_key': %v", fkOnlineDDLPossible)
+	})
 
 	files, err := os.ReadDir(testDataPath)
 	require.NoError(t, err)
@@ -143,7 +169,7 @@ func TestSchemaChange(t *testing.T) {
 		}
 		// this is a test!
 		t.Run(f.Name(), func(t *testing.T) {
-			testSingle(t, f.Name())
+			testSingle(t, f.Name(), fkOnlineDDLPossible)
 		})
 	}
 }
@@ -162,7 +188,18 @@ func readTestFile(t *testing.T, testName string, fileName string) (content strin
 
 // testSingle is the main testing function for a single test in the suite.
 // It prepares the grounds, creates the test data, runs a migration, expects results/error, cleans up.
-func testSingle(t *testing.T, testName string) {
+func testSingle(t *testing.T, testName string, fkOnlineDDLPossible bool) {
+	if !strings.Contains(testName, testsFilter) {
+		t.Skipf("Skipping test %s due to filter: %s=%s", testName, testFilterEnvVar, testsFilter)
+		return
+	}
+	if _, exists := readTestFile(t, testName, "require_rename_table_preserve_foreign_key"); exists {
+		if !fkOnlineDDLPossible {
+			t.Skipf("Skipping test due to require_rename_table_preserve_foreign_key")
+			return
+		}
+	}
+
 	if ignoreVersions, exists := readTestFile(t, testName, "ignore_versions"); exists {
 		// ignoreVersions is a regexp
 		re, err := regexp.Compile(ignoreVersions)
@@ -179,7 +216,7 @@ func testSingle(t *testing.T, testName string) {
 		}
 	}
 
-	sqlMode := defaultSQLMode
+	sqlMode := config.DefaultSQLMode
 	if overrideSQLMode, exists := readTestFile(t, testName, "sql_mode"); exists {
 		sqlMode = overrideSQLMode
 	}
@@ -251,17 +288,17 @@ func testSingle(t *testing.T, testName string) {
 
 	if expectedErrorMessage, exists := readTestFile(t, testName, "expect_failure"); exists {
 		// Failure is expected!
-		assert.Equal(t, migrationStatus, string(schema.OnlineDDLStatusFailed))
+		assert.Contains(t, []string{string(schema.OnlineDDLStatusFailed), string(schema.OnlineDDLStatusCancelled)}, migrationStatus)
 		require.Contains(t, migrationMessage, expectedErrorMessage, "expected error message (%s) to contain (%s)", migrationMessage, expectedErrorMessage)
 		// no need to proceed to checksum or anything further
 		return
 	}
 	// We do not expect failure.
-	require.Equal(t, string(schema.OnlineDDLStatusComplete), migrationStatus)
+	require.Equal(t, string(schema.OnlineDDLStatusComplete), migrationStatus, migrationMessage)
 
 	if content, exists := readTestFile(t, testName, "expect_table_structure"); exists {
 		createStatement := getCreateTableStatement(t, afterTableName)
-		assert.Contains(t, createStatement, content, "expected SHOW CREATE TABLE to contain text in 'expect_table_structure' file")
+		assert.Regexpf(t, content, createStatement, "expected SHOW CREATE TABLE to match text in 'expect_table_structure' file")
 	}
 
 	{
@@ -320,7 +357,7 @@ func waitForMigration(t *testing.T, uuid string, timeout time.Duration) sqltypes
 		row := readMigration(t, uuid)
 		status = row["migration_status"].ToString()
 		switch status {
-		case string(schema.OnlineDDLStatusComplete), string(schema.OnlineDDLStatusFailed):
+		case string(schema.OnlineDDLStatusComplete), string(schema.OnlineDDLStatusFailed), string(schema.OnlineDDLStatusCancelled):
 			// migration is complete, either successful or not
 			return row
 		}

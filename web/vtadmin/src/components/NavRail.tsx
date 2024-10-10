@@ -17,10 +17,10 @@ import * as React from 'react';
 import { Link, NavLink } from 'react-router-dom';
 
 import style from './NavRail.module.scss';
-import logo from '../img/vitess-icon-color.svg';
 import { useClusters, useGates, useKeyspaces, useSchemas, useTablets, useVtctlds, useWorkflows } from '../hooks/api';
 import { Icon, Icons } from './Icon';
 import { getTableDefinitions } from '../util/tableDefinitions';
+import VitessLogo from './VitessLogo';
 
 export const NavRail = () => {
     const { data: clusters = [] } = useClusters();
@@ -36,42 +36,38 @@ export const NavRail = () => {
     return (
         <div className={style.container}>
             <Link className={style.logoContainer} to="/">
-                <img alt="Vitess logo" className="h-16 mx-auto" src={logo} height={40}></img>
+                <VitessLogo className="h-[40px]" />
             </Link>
 
             <div className={style.navLinks}>
                 <ul className={style.navList}>
                     <li>
-                        <NavRailLink icon={Icons.chart} text="Dashboard" to="/dashboard" count={0} />
+                        <NavRailLink hotkey="C" text="Clusters" to="/clusters" count={clusters.length} />
                     </li>
                     <li>
-                        <NavRailLink icon={Icons.wrench} text="Workflows" to="/workflows" count={workflows.length} />
+                        <NavRailLink hotkey="G" text="Gates" to="/gates" count={gates.length} />
+                    </li>
+                    <li>
+                        <NavRailLink hotkey="K" text="Keyspaces" to="/keyspaces" count={keyspaces.length} />
+                    </li>
+                    <li>
+                        <NavRailLink hotkey="S" text="Schemas" to="/schemas" count={tds.length} />
+                    </li>
+                    <li>
+                        <NavRailLink hotkey="T" text="Tablets" to="/tablets" count={tablets.length} />
+                    </li>
+                    <li>
+                        <NavRailLink hotkey="V" text="vtctlds" to="/vtctlds" count={vtctlds.length} />
+                    </li>
+                    <li>
+                        <NavRailLink hotkey="W" text="Workflows" to="/workflows" count={workflows.length} />
                     </li>
                 </ul>
 
                 <ul className={style.navList}>
                     <li>
-                        {/* FIXME replace this with a C when we have one */}
-                        <NavRailLink icon={Icons.keyR} text="Clusters" to="/clusters" count={clusters.length} />
+                        <NavRailLink hotkey="T" text="Transactions" to="/transactions" />
                     </li>
-                    <li>
-                        <NavRailLink icon={Icons.keyG} text="Gates" to="/gates" count={gates.length} />
-                    </li>
-                    <li>
-                        <NavRailLink icon={Icons.keyK} text="Keyspaces" to="/keyspaces" count={keyspaces.length} />
-                    </li>
-                    <li>
-                        <NavRailLink icon={Icons.keyS} text="Schemas" to="/schemas" count={tds.length} />
-                    </li>
-                    <li>
-                        <NavRailLink icon={Icons.keyT} text="Tablets" to="/tablets" count={tablets.length} />
-                    </li>
-                    <li>
-                        <NavRailLink icon={Icons.keyV} text="vtctlds" to="/vtctlds" count={vtctlds.length} />
-                    </li>
-                </ul>
-
-                <ul className={style.navList}>
                     <li>
                         <NavRailLink icon={Icons.download} text="Backups" to="/backups" />
                     </li>
@@ -79,18 +75,7 @@ export const NavRail = () => {
                         <NavRailLink icon={Icons.runQuery} text="VTExplain" to="/vtexplain" />
                     </li>
                     <li>
-                        <NavRailLink icon={Icons.gear} text="Settings" to="/settings" />
-                    </li>
-                </ul>
-            </div>
-
-            <div className={style.footerContainer}>
-                <ul className={style.navList}>
-                    <li>
-                        <NavRailLink icon={Icons.bug} text="Debug" to="/debug" />
-                    </li>
-                    <li>
-                        <NavRailLink icon={Icons.keyboard} text="Shortcuts" to="/shortcuts" />
+                        <NavRailLink icon={Icons.topology} text="Topology" to="/topology" />
                     </li>
                 </ul>
             </div>
@@ -98,11 +83,20 @@ export const NavRail = () => {
     );
 };
 
-const NavRailLink = ({ count, icon, text, to }: { count?: number; icon: Icons; text: string; to: string }) => {
+interface LinkProps {
+    count?: number;
+    hotkey?: string;
+    icon?: Icons;
+    text: string;
+    to: string;
+}
+
+const NavRailLink = ({ count, hotkey, icon, text, to }: LinkProps) => {
     return (
         <NavLink activeClassName={style.navLinkActive} className={style.navLink} to={to}>
-            <Icon className={style.icon} icon={icon} />
-            <span>{text}</span>
+            {icon && <Icon className={style.icon} icon={icon} />}
+            {hotkey && !icon && <div className={style.hotkey} data-hotkey={hotkey.toUpperCase()} />}
+            <div className="ml-4">{text}</div>
             {typeof count === 'number' && <div className={style.badge}>{count}</div>}
         </NavLink>
     );

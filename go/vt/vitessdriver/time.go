@@ -35,11 +35,11 @@ var isoTimeLength = len(isoTimeFormat)
 // parseISOTime pases a time string in MySQL's textual datetime format.
 // This is very similar to ISO8601, with some differences:
 //
-// - There is no T separator between the date and time sections;
-//   a space is used instead.
-// - There is never a timezone section in the string, as these datetimes
-//   are not timezone-aware. There isn't a Z value for UTC times for
-//   the same reason.
+//   - There is no T separator between the date and time sections;
+//     a space is used instead.
+//   - There is never a timezone section in the string, as these datetimes
+//     are not timezone-aware. There isn't a Z value for UTC times for
+//     the same reason.
 //
 // Note that this function can handle both DATE (which should _always_ have
 // a length of 10) and DATETIME strings (which have a variable length, 18+
@@ -74,8 +74,8 @@ func parseISOTime(tstr string, loc *time.Location, minLen, maxLen int) (t time.T
 	return time.ParseInLocation(isoTimeFormat[:tlen], tstr, loc)
 }
 
-// DatetimeToNative converts a Datetime Value into a time.Time
-func DatetimeToNative(v sqltypes.Value, loc *time.Location) (time.Time, error) {
+// datetimeToNative converts a Datetime Value into a time.Time
+func datetimeToNative(v sqltypes.Value, loc *time.Location) (time.Time, error) {
 	// Valid format string offsets for a DATETIME
 	//  |DATETIME          |19+
 	//  |------------------|------|
@@ -83,11 +83,11 @@ func DatetimeToNative(v sqltypes.Value, loc *time.Location) (time.Time, error) {
 	return parseISOTime(v.ToString(), loc, 19, isoTimeLength)
 }
 
-// DateToNative converts a Date Value into a time.Time.
+// dateToNative converts a Date Value into a time.Time.
 // Note that there's no specific type in the Go stdlib to represent
 // dates without time components, so the returned Time will have
 // their hours/mins/seconds zeroed out.
-func DateToNative(v sqltypes.Value, loc *time.Location) (time.Time, error) {
+func dateToNative(v sqltypes.Value, loc *time.Location) (time.Time, error) {
 	// Valid format string offsets for a DATE
 	//  |DATE     |10
 	//  |---------|

@@ -26,16 +26,16 @@ import (
 	"strings"
 	"testing"
 
-	"vitess.io/vitess/go/mysql"
-	"vitess.io/vitess/go/sqltypes"
-	"vitess.io/vitess/go/vt/schemadiff"
-	"vitess.io/vitess/go/vt/sqlparser"
-
-	"vitess.io/vitess/go/test/endtoend/cluster"
-	"vitess.io/vitess/go/test/endtoend/onlineddl"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/test/endtoend/cluster"
+	"vitess.io/vitess/go/test/endtoend/onlineddl"
+	"vitess.io/vitess/go/test/endtoend/throttler"
+	"vitess.io/vitess/go/vt/schemadiff"
+	"vitess.io/vitess/go/vt/sqlparser"
 )
 
 var (
@@ -52,8 +52,8 @@ var (
 )
 
 const (
-	testDataPath   = "../../onlineddl/vrepl_suite/testdata"
-	defaultSQLMode = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
+	testDataPath          = "../../onlineddl/vrepl_suite/testdata"
+	sqlModeAllowsZeroDate = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
 )
 
 type testTableSchema struct {
@@ -82,18 +82,16 @@ func TestMain(m *testing.M) {
 		}
 
 		clusterInstance.VtctldExtraArgs = []string{
-			"-schema_change_dir", schemaChangeDirectory,
-			"-schema_change_controller", "local",
-			"-schema_change_check_interval", "1",
-			"-online_ddl_check_interval", "2s",
+			"--schema_change_dir", schemaChangeDirectory,
+			"--schema_change_controller", "local",
+			"--schema_change_check_interval", "1s",
 		}
 
 		clusterInstance.VtTabletExtraArgs = []string{
-			"-enable-lag-throttler",
-			"-throttle_threshold", "1s",
-			"-heartbeat_enable",
-			"-heartbeat_interval", "250ms",
-			"-migration_check_interval", "5s",
+			"--heartbeat_interval", "250ms",
+			"--heartbeat_on_demand_duration", "5s",
+			"--migration_check_interval", "5s",
+			"--watch_replication_stream",
 		}
 
 		if err := clusterInstance.StartTopo(); err != nil {
@@ -111,8 +109,6 @@ func TestMain(m *testing.M) {
 		}
 
 		vtgateInstance := clusterInstance.NewVtgateInstance()
-		// set the gateway we want to use
-		vtgateInstance.GatewayImplementation = "tabletgateway"
 		// Start vtgate
 		if err := vtgateInstance.Setup(); err != nil {
 			return 1, err
@@ -135,11 +131,13 @@ func TestMain(m *testing.M) {
 
 }
 
-func TestSchemaChange(t *testing.T) {
+func TestSchemadiffSchemaChanges(t *testing.T) {
 	defer cluster.PanicHandler(t)
 
 	shards := clusterInstance.Keyspaces[0].Shards
 	require.Equal(t, 1, len(shards))
+
+	throttler.EnableLagThrottlerAndWaitForStatus(t, clusterInstance)
 
 	files, err := os.ReadDir(testDataPath)
 	require.NoError(t, err)
@@ -197,8 +195,13 @@ func testSingle(t *testing.T, testName string) {
 		t.Skip("expect_failure found. Irrelevant to this suite")
 		return
 	}
+	if _, exists := readTestFile(t, testName, "skip_schemadiff"); exists {
+		// irrelevant to this suite.
+		t.Skip("skip_schemadiff found. Irrelevant to this suite")
+		return
+	}
 
-	sqlModeQuery := fmt.Sprintf("set @@global.sql_mode='%s'", defaultSQLMode)
+	sqlModeQuery := fmt.Sprintf("set @@global.sql_mode='%s'", sqlModeAllowsZeroDate)
 	_ = mysqlExec(t, sqlModeQuery, "")
 	_ = mysqlExec(t, "set @@global.event_scheduler=0", "")
 
@@ -240,14 +243,23 @@ func testSingle(t *testing.T, testName string) {
 	require.NotEmpty(t, toCreateTable)
 
 	if content, exists := readTestFile(t, testName, "expect_table_structure"); exists {
-		assert.Contains(t, toCreateTable, content, "expected SHOW CREATE TABLE to contain text in 'expect_table_structure' file")
+		switch {
+		case strings.HasPrefix(testName, "autoinc"):
+			// In schemadiff_vrepl test, we run a direct ALTER TABLE. This is as opposed to
+			// vrepl_suite runnign a vreplication Online DDL. This matters, because AUTO_INCREMENT
+			// values in the resulting table are different between the two approaches!
+			// So for schemadiff_vrepl tests we ignore any AUTO_INCREMENT requirements,
+			// they're just not interesting for this test.
+		default:
+			assert.Regexpf(t, content, toCreateTable, "expected SHOW CREATE TABLE to match text in 'expect_table_structure' file")
+		}
 	}
 
 	fromTestTableSchemas = append(fromTestTableSchemas, &testTableSchema{
 		testName:    testName,
 		tableSchema: fromCreateTable,
 	})
-	toTestTableSchemas = append(fromTestTableSchemas, &testTableSchema{
+	toTestTableSchemas = append(toTestTableSchemas, &testTableSchema{
 		testName:    testName,
 		tableSchema: toCreateTable,
 	})
@@ -257,7 +269,8 @@ func testSingle(t *testing.T, testName string) {
 		hints.AutoIncrementStrategy = schemadiff.AutoIncrementApplyAlways
 	}
 	t.Run("validate diff", func(t *testing.T) {
-		validateDiff(t, fromCreateTable, toCreateTable, hints)
+		_, allowSchemadiffNormalization := readTestFile(t, testName, "allow_schemadiff_normalization")
+		validateDiff(t, fromCreateTable, toCreateTable, allowSchemadiffNormalization, hints)
 	})
 }
 
@@ -267,8 +280,8 @@ func testSingle(t *testing.T, testName string) {
 // 	hints := &schemadiff.DiffHints{AutoIncrementStrategy: schemadiff.AutoIncrementIgnore}
 // 	// count := 20
 // 	// for i := 0; i < count; i++ {
-// 	// 	fromTestTableSchema := fromTestTableSchemas[rand.Intn(len(fromTestTableSchemas))]
-// 	// 	toTestTableSchema := toTestTableSchemas[rand.Intn(len(toTestTableSchemas))]
+// 	// 	fromTestTableSchema := fromTestTableSchemas[rand.IntN(len(fromTestTableSchemas))]
+// 	// 	toTestTableSchema := toTestTableSchemas[rand.IntN(len(toTestTableSchemas))]
 // 	// 	testName := fmt.Sprintf("%s/%s", fromTestTableSchema.testName, toTestTableSchema.testName)
 // 	// 	t.Run(testName, func(t *testing.T) {
 // 	// 		validateDiff(t, fromTestTableSchema.tableSchema, toTestTableSchema.tableSchema, hints)
@@ -329,26 +342,27 @@ func ignoreAutoIncrement(t *testing.T, createTable string) string {
 	return result
 }
 
-func validateDiff(t *testing.T, fromCreateTable string, toCreateTable string, hints *schemadiff.DiffHints) {
+func validateDiff(t *testing.T, fromCreateTable string, toCreateTable string, allowSchemadiffNormalization bool, hints *schemadiff.DiffHints) {
 	// turn the "from" and "to" create statement strings (which we just read via SHOW CREATE TABLE into sqlparser.CreateTable statement)
-	fromStmt, err := sqlparser.Parse(fromCreateTable)
+	env := schemadiff.NewTestEnv()
+	fromStmt, err := env.Parser().ParseStrictDDL(fromCreateTable)
 	require.NoError(t, err)
 	fromCreateTableStatement, ok := fromStmt.(*sqlparser.CreateTable)
 	require.True(t, ok)
 
-	toStmt, err := sqlparser.Parse(toCreateTable)
+	toStmt, err := env.Parser().ParseStrictDDL(toCreateTable)
 	require.NoError(t, err)
 	toCreateTableStatement, ok := toStmt.(*sqlparser.CreateTable)
 	require.True(t, ok)
 
 	// The actual diff logic here!
-	diff, err := schemadiff.DiffTables(fromCreateTableStatement, toCreateTableStatement, hints)
+	diff, err := schemadiff.DiffTables(env, fromCreateTableStatement, toCreateTableStatement, hints)
 	assert.NoError(t, err)
 
 	// The diff can be empty or there can be an actual ALTER TABLE statement
 	diffedAlterQuery := ""
 	if diff != nil && !diff.IsEmpty() {
-		diffedAlterQuery = sqlparser.String(diff.Statement())
+		diffedAlterQuery = diff.CanonicalStatementString()
 	}
 
 	// Validate the diff! The way we do it is:
@@ -366,16 +380,49 @@ func validateDiff(t *testing.T, fromCreateTable string, toCreateTable string, hi
 		toCreateTable = ignoreAutoIncrement(t, toCreateTable)
 		resultCreateTable = ignoreAutoIncrement(t, resultCreateTable)
 	}
+
+	// Next, the big test: does the result table, applied by schemadiff's evaluated ALTER, look exactly like
+	// the table generated by the test's own ALTER statement?
+
+	// But wait, there's caveats.
+	if toCreateTable != resultCreateTable {
+		// schemadiff's ALTER statement can normalize away CHARACTER SET and COLLATION definitions:
+		// when altering a column's CHARTSET&COLLATION into the table's values, schemadiff just strips the
+		// CHARSET and COLLATION clauses out of the `MODIFY COLUMN ...` statement. This is valid.
+		// However, MySQL outputs two different SHOW CREATE TABLE statements, even though the table
+		// structure is identical. And so we accept that there can be a normalization issue.
+		if allowSchemadiffNormalization {
+			{
+				stmt, err := env.Parser().ParseStrictDDL(toCreateTable)
+				require.NoError(t, err)
+				createTableStatement, ok := stmt.(*sqlparser.CreateTable)
+				require.True(t, ok)
+				c, err := schemadiff.NewCreateTableEntity(env, createTableStatement)
+				require.NoError(t, err)
+				toCreateTable = c.Create().CanonicalStatementString()
+			}
+			{
+				stmt, err := env.Parser().ParseStrictDDL(resultCreateTable)
+				require.NoError(t, err)
+				createTableStatement, ok := stmt.(*sqlparser.CreateTable)
+				require.True(t, ok)
+				c, err := schemadiff.NewCreateTableEntity(env, createTableStatement)
+				require.NoError(t, err)
+				resultCreateTable = c.Create().CanonicalStatementString()
+			}
+		}
+	}
+
 	// The actual validation test here:
 	assert.Equal(t, toCreateTable, resultCreateTable, "mismatched table structure. ALTER query was: %s", diffedAlterQuery)
 
 	// Also, let's see that our diff agrees there's no change:
-	resultStmt, err := sqlparser.Parse(resultCreateTable)
+	resultStmt, err := env.Parser().ParseStrictDDL(resultCreateTable)
 	require.NoError(t, err)
 	resultCreateTableStatement, ok := resultStmt.(*sqlparser.CreateTable)
 	require.True(t, ok)
 
-	resultDiff, err := schemadiff.DiffTables(toCreateTableStatement, resultCreateTableStatement, hints)
+	resultDiff, err := schemadiff.DiffTables(env, toCreateTableStatement, resultCreateTableStatement, hints)
 	assert.NoError(t, err)
 	assert.Nil(t, resultDiff)
 }

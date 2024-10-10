@@ -25,6 +25,8 @@ import (
 	"strings"
 	"time"
 
+	"vitess.io/vitess/go/vt/log"
+
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/vt/mysqlctl"
 )
@@ -61,11 +63,11 @@ func (ctl *Mysqlctl) Setup() error {
 
 	cmd := exec.CommandContext(ctx,
 		ctl.Binary,
-		"-alsologtostderr",
-		"-tablet_uid", fmt.Sprintf("%d", ctl.UID),
-		"-mysql_port", fmt.Sprintf("%d", ctl.Port),
+		"--alsologtostderr",
+		"--tablet_uid", fmt.Sprintf("%d", ctl.UID),
+		"--mysql_port", fmt.Sprintf("%d", ctl.Port),
 		"init",
-		"-init_db_sql_file", ctl.InitFile,
+		"--init_db_sql_file", ctl.InitFile,
 	)
 
 	myCnf := strings.Join(ctl.MyCnf, ":")
@@ -86,9 +88,9 @@ func (ctl *Mysqlctl) Start() error {
 
 	cmd := exec.CommandContext(ctx,
 		ctl.Binary,
-		"-alsologtostderr",
-		"-tablet_uid", fmt.Sprintf("%d", ctl.UID),
-		"-mysql_port", fmt.Sprintf("%d", ctl.Port),
+		"--alsologtostderr",
+		"--tablet_uid", fmt.Sprintf("%d", ctl.UID),
+		"--mysql_port", fmt.Sprintf("%d", ctl.Port),
 		"start",
 	)
 
@@ -97,7 +99,7 @@ func (ctl *Mysqlctl) Start() error {
 	cmd.Env = append(cmd.Env, os.Environ()...)
 	cmd.Env = append(cmd.Env, ctl.Env...)
 	cmd.Env = append(cmd.Env, fmt.Sprintf("EXTRA_MY_CNF=%s", myCnf))
-
+	log.Infof("Starting MySQL using: %+v", cmd.Env)
 	_, err := cmd.Output()
 	return err
 }
@@ -109,9 +111,9 @@ func (ctl *Mysqlctl) TearDown() error {
 
 	cmd := exec.CommandContext(ctx,
 		ctl.Binary,
-		"-alsologtostderr",
-		"-tablet_uid", fmt.Sprintf("%d", ctl.UID),
-		"-mysql_port", fmt.Sprintf("%d", ctl.Port),
+		"--alsologtostderr",
+		"--tablet_uid", fmt.Sprintf("%d", ctl.UID),
+		"--mysql_port", fmt.Sprintf("%d", ctl.Port),
 		"shutdown",
 	)
 

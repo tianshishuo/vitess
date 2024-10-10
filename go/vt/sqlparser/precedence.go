@@ -38,13 +38,12 @@ const (
 	P14
 	P15
 	P16
-	P17
 )
 
 // precedenceFor returns the precedence of an expression.
 //
-// * NOTE: If you change anything here, update sql.y to keep them consistent.
-//   Also make sure to add the new constructs to random_expr.go so we have test coverage for the new expressions *
+//   - NOTE: If you change anything here, update sql.y to keep them consistent.
+//     Also make sure to add the new constructs to random_expr.go so we have test coverage for the new expressions *
 func precedenceFor(in Expr) Precendence {
 	switch node := in.(type) {
 	case *OrExpr:
@@ -59,7 +58,7 @@ func precedenceFor(in Expr) Precendence {
 		return P12
 	case *ComparisonExpr:
 		switch node.Operator {
-		case EqualOp, NotEqualOp, GreaterThanOp, GreaterEqualOp, LessThanOp, LessEqualOp, LikeOp, InOp, RegexpOp:
+		case EqualOp, NotEqualOp, GreaterThanOp, GreaterEqualOp, LessThanOp, LessEqualOp, LikeOp, InOp, RegexpOp, NullSafeEqualOp:
 			return P11
 		}
 	case *IsExpr:
@@ -83,13 +82,9 @@ func precedenceFor(in Expr) Precendence {
 		switch node.Operator {
 		case UPlusOp, UMinusOp:
 			return P4
-		case BangOp:
+		default:
 			return P3
 		}
-	case *IntervalExpr:
-		return P1
-	case *ExtractedSubquery:
-		return precedenceFor(node.alternative)
 	}
 
 	return Syntactic

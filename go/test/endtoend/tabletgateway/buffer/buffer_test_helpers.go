@@ -33,7 +33,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
 	"sync"
 	"testing"
@@ -67,11 +67,11 @@ const (
 	updateRowID       = 2
 )
 
-//threadParams is set of params passed into read and write threads
+// threadParams is set of params passed into read and write threads
 type threadParams struct {
 	quit                       bool
 	rpcs                       int        // Number of queries successfully executed.
-	errors                     int        // Number of failed queries.
+	errors                     []error    // Errors returned by the queries.
 	waitForNotification        chan bool  // Channel used to notify the main thread that this thread executed
 	notifyLock                 sync.Mutex // notifyLock guards the two fields notifyAfterNSuccessfulRpcs/rpcsSoFar.
 	notifyAfterNSuccessfulRpcs int        // If 0, notifications are disabled
@@ -96,14 +96,14 @@ func (c *threadParams) threadRun(wg *sync.WaitGroup, vtParams *mysql.ConnParams)
 	if c.reservedConn {
 		_, err = conn.ExecuteFetch("set default_week_format = 1", 1000, true)
 		if err != nil {
-			c.errors++
+			c.errors = append(c.errors, err)
 			log.Errorf("error setting default_week_format: %v", err)
 		}
 	}
 	for !c.quit {
 		err = c.executeFunction(c, conn)
 		if err != nil {
-			c.errors++
+			c.errors = append(c.errors, err)
 			log.Errorf("error executing function %s: %v", c.typ, err)
 		}
 		c.rpcs++
@@ -174,7 +174,7 @@ func updateExecute(c *threadParams, conn *mysql.Conn) error {
 	// Sleep between [0, 1] seconds to prolong the time the transaction is in
 	// flight. This is more realistic because applications are going to keep
 	// their transactions open for longer as well.
-	dur := time.Duration(rand.Int31n(1000)) * time.Millisecond
+	dur := time.Duration(rand.Int32N(1000)) * time.Millisecond
 	if c.slowQueries {
 		dur = dur + 1*time.Second
 	}
@@ -216,7 +216,7 @@ func (bt *BufferingTest) createCluster() (*cluster.LocalProcessCluster, int) {
 	clusterInstance := cluster.NewCluster(cell, hostname)
 
 	// Start topo server
-	clusterInstance.VtctldExtraArgs = []string{"-remote_operation_timeout", "30s", "-topo_etcd_lease_ttl", "40"}
+	clusterInstance.VtctldExtraArgs = []string{"--remote_operation_timeout", "30s", "--topo_etcd_lease_ttl", "40"}
 	if err := clusterInstance.StartTopo(); err != nil {
 		return nil, 1
 	}
@@ -227,22 +227,22 @@ func (bt *BufferingTest) createCluster() (*cluster.LocalProcessCluster, int) {
 		SchemaSQL: sqlSchema,
 		VSchema:   bt.VSchema,
 	}
-	clusterInstance.VtTabletExtraArgs = []string{"-health_check_interval", "1s",
-		"-queryserver-config-transaction-timeout", "20",
+	clusterInstance.VtTabletExtraArgs = []string{
+		"--health_check_interval", "1s",
+		"--queryserver-config-transaction-timeout", "20s",
 	}
 	if err := clusterInstance.StartUnshardedKeyspace(*keyspace, 1, false); err != nil {
 		return nil, 1
 	}
 
 	clusterInstance.VtGateExtraArgs = []string{
-		"-enable_buffer",
+		"--enable_buffer",
 		// Long timeout in case failover is slow.
-		"-buffer_window", "10m",
-		"-buffer_max_failover_duration", "10m",
-		"-buffer_min_time_between_failovers", "20m",
-		"-gateway_implementation", "tabletgateway",
-		"-buffer_implementation", "keyspace_events",
-		"-tablet_refresh_interval", "1s",
+		"--buffer_window", "10m",
+		"--buffer_max_failover_duration", "10m",
+		"--buffer_min_time_between_failovers", "20m",
+		"--tablet_refresh_interval", "1s",
+		"--buffer_drain_concurrency", "4",
 	}
 	clusterInstance.VtGateExtraArgs = append(clusterInstance.VtGateExtraArgs, bt.VtGateExtraArgs...)
 
@@ -251,7 +251,6 @@ func (bt *BufferingTest) createCluster() (*cluster.LocalProcessCluster, int) {
 	if err := clusterInstance.StartVtgate(); err != nil {
 		return nil, 1
 	}
-	rand.Seed(time.Now().UnixNano())
 	return clusterInstance, 0
 }
 
@@ -288,7 +287,7 @@ func (bt *BufferingTest) Test(t *testing.T) {
 	// Healthcheck interval on tablet is set to 1s, so sleep for 2s
 	time.Sleep(2 * time.Second)
 	conn, err := mysql.Connect(context.Background(), &vtParams)
-	require.Nil(t, err)
+	require.NoError(t, err)
 	defer conn.Close()
 
 	// Insert two rows for the later threads (critical read, update).
@@ -344,17 +343,20 @@ func (bt *BufferingTest) Test(t *testing.T) {
 	updateThreadInstance.stop()
 
 	// Both threads must not see any error
-	assert.Zero(t, readThreadInstance.errors, "found errors in read queries")
-	assert.Zero(t, updateThreadInstance.errors, "found errors in tx queries")
+	assert.Empty(t, readThreadInstance.errors, "found errors in read queries")
+	assert.Empty(t, updateThreadInstance.errors, "found errors in tx queries")
 
 	//At least one thread should have been buffered.
 	//This may fail if a failover is too fast. Add retries then.
 	resp, err := http.Get(clusterInstance.VtgateProcess.VerifyURL)
-	require.Nil(t, err)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
 	require.Equal(t, 200, resp.StatusCode)
 
 	var metadata VTGateBufferingStats
-	respByte, _ := io.ReadAll(resp.Body)
+	respByte, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
 	err = json.Unmarshal(respByte, &metadata)
 	require.NoError(t, err)
 

@@ -18,6 +18,7 @@ package vindexes
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 
 	"vitess.io/vitess/go/sqltypes"
@@ -25,19 +26,24 @@ import (
 )
 
 var (
-	_ SingleColumn = (*Binary)(nil)
-	_ Reversible   = (*Binary)(nil)
-	_ Hashing      = (*Binary)(nil)
+	_ SingleColumn    = (*Binary)(nil)
+	_ Reversible      = (*Binary)(nil)
+	_ Hashing         = (*Binary)(nil)
+	_ ParamValidating = (*Binary)(nil)
 )
 
 // Binary is a vindex that converts binary bits to a keyspace id.
 type Binary struct {
-	name string
+	name          string
+	unknownParams []string
 }
 
-// NewBinary creates a new Binary.
-func NewBinary(name string, _ map[string]string) (Vindex, error) {
-	return &Binary{name: name}, nil
+// newBinary creates a new Binary.
+func newBinary(name string, params map[string]string) (Vindex, error) {
+	return &Binary{
+		name:          name,
+		unknownParams: FindUnknownParams(params, nil),
+	}, nil
 }
 
 // String returns the name of the vindex.
@@ -61,7 +67,7 @@ func (vind *Binary) NeedsVCursor() bool {
 }
 
 // Verify returns true if ids maps to ksids.
-func (vind *Binary) Verify(_ VCursor, ids []sqltypes.Value, ksids [][]byte) ([]bool, error) {
+func (vind *Binary) Verify(ctx context.Context, vcursor VCursor, ids []sqltypes.Value, ksids [][]byte) ([]bool, error) {
 	out := make([]bool, 0, len(ids))
 	for i, id := range ids {
 		idBytes, err := vind.Hash(id)
@@ -74,7 +80,7 @@ func (vind *Binary) Verify(_ VCursor, ids []sqltypes.Value, ksids [][]byte) ([]b
 }
 
 // Map can map ids to key.Destination objects.
-func (vind *Binary) Map(cursor VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
+func (vind *Binary) Map(ctx context.Context, vcursor VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
 	out := make([]key.Destination, 0, len(ids))
 	for _, id := range ids {
 		idBytes, err := vind.Hash(id)
@@ -102,6 +108,11 @@ func (*Binary) ReverseMap(_ VCursor, ksids [][]byte) ([]sqltypes.Value, error) {
 	return reverseIds, nil
 }
 
+// UnknownParams implements the ParamValidating interface.
+func (vind *Binary) UnknownParams() []string {
+	return vind.unknownParams
+}
+
 func init() {
-	Register("binary", NewBinary)
+	Register("binary", newBinary)
 }

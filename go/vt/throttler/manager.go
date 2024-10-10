@@ -64,16 +64,16 @@ type managerImpl struct {
 	// mu guards all fields in this group.
 	mu sync.Mutex
 	// throttlers tracks all running throttlers (by their name).
-	throttlers map[string]*Throttler
+	throttlers map[string]Throttler
 }
 
 func newManager() *managerImpl {
 	return &managerImpl{
-		throttlers: make(map[string]*Throttler),
+		throttlers: make(map[string]Throttler),
 	}
 }
 
-func (m *managerImpl) registerThrottler(name string, throttler *Throttler) error {
+func (m *managerImpl) registerThrottler(name string, throttler Throttler) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -205,9 +205,9 @@ func (m *managerImpl) throttlerNamesLocked() []string {
 	return names
 }
 
-// Log returns the most recent changes of the MaxReplicationLag module.
+// log returns the most recent changes of the MaxReplicationLag module.
 // There will be one result for each processed replication lag record.
-func (m *managerImpl) Log(throttlerName string) ([]result, error) {
+func (m *managerImpl) log(throttlerName string) ([]Result, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

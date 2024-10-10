@@ -1,4 +1,4 @@
-///bin/true; exec /usr/bin/env go run "$0" "$@"
+// /bin/true; exec /usr/bin/env go run "$0" "$@"
 
 /*
  * Copyright 2019 The Vitess Authors.
@@ -27,10 +27,12 @@ run against a given flavor, it may take some time for the corresponding
 bootstrap image (vitess/bootstrap:<flavor>) to be downloaded.
 
 It is meant to be run from the Vitess root, like so:
-  $ go run test.go [args]
+
+	$ go run test.go [args]
 
 For a list of options, run:
-  $ go run test.go --help
+
+	$ go run test.go --help
 */
 package main
 
@@ -49,6 +51,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -73,8 +76,8 @@ For example:
 
 // Flags
 var (
-	flavor           = flag.String("flavor", "mysql57", "comma-separated bootstrap flavor(s) to run against (when using Docker mode). Available flavors: all,"+flavors)
-	bootstrapVersion = flag.String("bootstrap-version", "4", "the version identifier to use for the docker images")
+	flavor           = flag.String("flavor", "mysql80", "comma-separated bootstrap flavor(s) to run against (when using Docker mode). Available flavors: all,"+flavors)
+	bootstrapVersion = flag.String("bootstrap-version", "37", "the version identifier to use for the docker images")
 	runCount         = flag.Int("runs", 1, "run each test this many times")
 	retryMax         = flag.Int("retry", 3, "max number of retries, to detect flaky tests")
 	logPass          = flag.Bool("log-pass", false, "log test output even if it passes")
@@ -90,8 +93,12 @@ var (
 	follow           = flag.Bool("follow", false, "print test output as it runs, instead of waiting to see if it passes or fails")
 	parallel         = flag.Int("parallel", 1, "number of tests to run in parallel")
 	skipBuild        = flag.Bool("skip-build", false, "skip running 'make build'. Assumes pre-existing binaries exist")
-
-	remoteStats = flag.String("remote-stats", "", "url to send remote stats")
+	partialKeyspace  = flag.Bool("partial-keyspace", false, "add a second keyspace for sharded tests and mark first shard as moved to this keyspace in the shard routing rules")
+	// `go run test.go --dry-run --skip-build` to quickly test this file and see what tests will run
+	dryRun       = flag.Bool("dry-run", false, "For each test to be run, it will output the test attributes, but NOT run the tests. Useful while debugging changes to test.go (this file)")
+	remoteStats  = flag.String("remote-stats", "", "url to send remote stats")
+	buildVTAdmin = flag.Bool("build-vtadmin", false, "Enable or disable VTAdmin build during 'make build'")
+	buildTag     = flag.String("build-tag", "", "Build tag to create a custom debug build")
 )
 
 var (
@@ -105,7 +112,7 @@ const (
 	configFileName = "test/config.json"
 
 	// List of flavors for which a bootstrap Docker image is available.
-	flavors = "mysql56,mysql57,mysql80,mariadb,mariadb103,percona,percona57,percona80"
+	flavors = "mysql80,percona80"
 )
 
 // Config is the overall object serialized in test/config.json.
@@ -162,6 +169,11 @@ func (t *Test) hasAnyTag(want []string) bool {
 // dataDir is the VTDATAROOT to use for this run.
 // returns the combined stdout+stderr and error.
 func (t *Test) run(dir, dataDir string) ([]byte, error) {
+	if *dryRun {
+		fmt.Printf("Will run in dir %s(%s): %+v\n", dir, dataDir, t)
+		t.pass++
+		return nil, nil
+	}
 	testCmd := t.Command
 	if len(testCmd) == 0 {
 		if strings.Contains(fmt.Sprintf("%v", t.File), ".go") {
@@ -174,12 +186,10 @@ func (t *Test) run(dir, dataDir string) ([]byte, error) {
 			testCmd = []string{"test/" + t.File, "-v", "--skip-build", "--keep-logs"}
 			testCmd = append(testCmd, t.Args...)
 		}
-		testCmd = append(testCmd, extraArgs...)
-		if *docker {
-			// Teardown is unnecessary since Docker kills everything.
-			// Go cluster doesn't recognize 'skip-teardown' flag so commenting it out for now.
-			// testCmd = append(testCmd, "--skip-teardown")
+		if *partialKeyspace {
+			testCmd = append(testCmd, "--partial-keyspace")
 		}
+		testCmd = append(testCmd, extraArgs...)
 	}
 
 	var cmd *exec.Cmd
@@ -192,6 +202,9 @@ func (t *Test) run(dir, dataDir string) ([]byte, error) {
 		} else {
 			// If there is no cache, we have to call 'make build' before each test.
 			args = []string{t.flavor, t.bootstrapVersion, "make build && " + testArgs}
+			if !*buildVTAdmin {
+				args[len(args)-1] = "NOVTADMINBUILD=1 " + args[len(args)-1]
+			}
 		}
 
 		cmd = exec.Command(path.Join(dir, "docker/test/run.sh"), args...)
@@ -243,12 +256,46 @@ func (t *Test) run(dir, dataDir string) ([]byte, error) {
 	return buf.Bytes(), runErr
 }
 
-func (t *Test) logf(format string, v ...interface{}) {
+func (t *Test) logf(format string, v ...any) {
 	if *runCount > 1 {
 		log.Printf("%v.%v[%v/%v]: %v", t.flavor, t.name, t.runIndex+1, *runCount, fmt.Sprintf(format, v...))
 	} else {
 		log.Printf("%v.%v: %v", t.flavor, t.name, fmt.Sprintf(format, v...))
 	}
+}
+
+func loadOneConfig(fileName string) (*Config, error) {
+	config2 := &Config{}
+	configData, err := os.ReadFile(fileName)
+	if err != nil {
+		log.Fatalf("Can't read config file %s: %v", fileName, err)
+		return nil, err
+	}
+	if err := json.Unmarshal(configData, config2); err != nil {
+		log.Fatalf("Can't parse config file: %v", err)
+		return nil, err
+	}
+	return config2, nil
+
+}
+
+// Get test configs.
+func loadConfig() (*Config, error) {
+	config := &Config{Tests: make(map[string]*Test)}
+	matches, _ := filepath.Glob("test/config*.json")
+	for _, configFile := range matches {
+		config2, err := loadOneConfig(configFile)
+		if err != nil {
+			return nil, err
+		}
+		if config2 == nil {
+			log.Fatalf("could not load config file: %s", configFile)
+		}
+		for key, val := range config2.Tests {
+			config.Tests[key] = val
+		}
+	}
+	return config, nil
 }
 
 func main() {
@@ -292,19 +339,14 @@ func main() {
 	log.SetOutput(io.MultiWriter(os.Stderr, logFile))
 	log.Printf("Output directory: %v", outDir)
 
-	// Get test configs.
-	configData, err := os.ReadFile(configFileName)
-	if err != nil {
-		log.Fatalf("Can't read config file: %v", err)
-	}
-	var config Config
-	if err := json.Unmarshal(configData, &config); err != nil {
-		log.Fatalf("Can't parse config file: %v", err)
+	var config *Config
+	if config, err = loadConfig(); err != nil {
+		log.Fatalf("Could not load test config: %+v", err)
 	}
 
 	flavors := []string{"local"}
 
-	if *docker {
+	if *docker && !*dryRun {
 		log.Printf("Bootstrap flavor(s): %v", *flavor)
 
 		flavors = strings.Split(*flavor, ",")
@@ -337,7 +379,7 @@ func main() {
 	// Pick the tests to run.
 	var testArgs []string
 	testArgs, extraArgs = splitArgs(flag.Args(), "--")
-	tests := selectedTests(testArgs, &config)
+	tests := selectedTests(testArgs, config)
 
 	// Duplicate tests for run count.
 	if *runCount > 1 {
@@ -367,7 +409,7 @@ func main() {
 
 	vtRoot := "."
 	tmpDir := ""
-	if *docker {
+	if *docker && !*dryRun {
 		// Copy working repo to tmpDir.
 		// This doesn't work outside Docker since it messes up GOROOT.
 		tmpDir, err = os.MkdirTemp(os.TempDir(), "vt_")
@@ -388,8 +430,16 @@ func main() {
 	} else {
 		// Since we're sharing the working dir, do the build once for all tests.
 		log.Printf("Running make build...")
-		if out, err := exec.Command("make", "build").CombinedOutput(); err != nil {
-			log.Fatalf("make build failed: %v\n%s", err, out)
+		command := exec.Command("make", "build")
+		if !*buildVTAdmin {
+			command.Env = append(os.Environ(), "NOVTADMINBUILD=1")
+		}
+		if *buildTag != "" {
+			command.Env = append(command.Env, fmt.Sprintf(`EXTRA_BUILD_TAGS=%s`, *buildTag))
+		}
+		if out, err := command.CombinedOutput(); err != nil {
+			log.Fatalf("make build failed; exit code: %d, error: %v\n%s",
+				command.ProcessState.ExitCode(), err, out)
 		}
 	}
 
@@ -617,9 +667,11 @@ type TestStats struct {
 func sendStats(values url.Values) {
 	if *remoteStats != "" {
 		log.Printf("Sending remote stats to %v", *remoteStats)
-		if _, err := http.PostForm(*remoteStats, values); err != nil {
+		resp, err := http.PostForm(*remoteStats, values)
+		if err != nil {
 			log.Printf("Can't send remote stats: %v", err)
 		}
+		defer resp.Body.Close()
 	}
 }
 

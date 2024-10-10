@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+	http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,11 +16,10 @@ limitations under the License.
 package topotests
 
 import (
+	"context"
 	"testing"
 
 	"google.golang.org/protobuf/proto"
-
-	"context"
 
 	"vitess.io/vitess/go/vt/topo/memorytopo"
 
@@ -29,14 +28,18 @@ import (
 )
 
 func TestRebuildVSchema(t *testing.T) {
-	ctx := context.Background()
 	emptySrvVSchema := &vschemapb.SrvVSchema{
-		RoutingRules: &vschemapb.RoutingRules{},
+		MirrorRules:       &vschemapb.MirrorRules{},
+		RoutingRules:      &vschemapb.RoutingRules{},
+		ShardRoutingRules: &vschemapb.ShardRoutingRules{},
 	}
 
 	// Set up topology.
 	cells := []string{"cell1", "cell2"}
-	ts := memorytopo.NewServer(cells...)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ts := memorytopo.NewServer(ctx, cells...)
+	defer ts.Close()
 
 	// Rebuild with no keyspace / no vschema
 	if err := ts.RebuildSrvVSchema(ctx, cells); err != nil {
@@ -50,7 +53,9 @@ func TestRebuildVSchema(t *testing.T) {
 
 	// create a keyspace, rebuild, should see an empty entry
 	emptyKs1SrvVSchema := &vschemapb.SrvVSchema{
-		RoutingRules: &vschemapb.RoutingRules{},
+		MirrorRules:       &vschemapb.MirrorRules{},
+		RoutingRules:      &vschemapb.RoutingRules{},
+		ShardRoutingRules: &vschemapb.ShardRoutingRules{},
 		Keyspaces: map[string]*vschemapb.Keyspace{
 			"ks1": {},
 		},
@@ -78,7 +83,9 @@ func TestRebuildVSchema(t *testing.T) {
 		t.Errorf("RebuildVSchema failed: %v", err)
 	}
 	wanted1 := &vschemapb.SrvVSchema{
-		RoutingRules: &vschemapb.RoutingRules{},
+		MirrorRules:       &vschemapb.MirrorRules{},
+		RoutingRules:      &vschemapb.RoutingRules{},
+		ShardRoutingRules: &vschemapb.ShardRoutingRules{},
 		Keyspaces: map[string]*vschemapb.Keyspace{
 			"ks1": keyspace1,
 		},
@@ -118,7 +125,9 @@ func TestRebuildVSchema(t *testing.T) {
 		t.Errorf("RebuildVSchema failed: %v", err)
 	}
 	wanted2 := &vschemapb.SrvVSchema{
-		RoutingRules: &vschemapb.RoutingRules{},
+		MirrorRules:       &vschemapb.MirrorRules{},
+		RoutingRules:      &vschemapb.RoutingRules{},
+		ShardRoutingRules: &vschemapb.ShardRoutingRules{},
 		Keyspaces: map[string]*vschemapb.Keyspace{
 			"ks1": keyspace1,
 			"ks2": keyspace2,
@@ -155,7 +164,9 @@ func TestRebuildVSchema(t *testing.T) {
 		t.Errorf("RebuildVSchema failed: %v", err)
 	}
 	wanted3 := &vschemapb.SrvVSchema{
-		RoutingRules: rr,
+		MirrorRules:       &vschemapb.MirrorRules{},
+		RoutingRules:      rr,
+		ShardRoutingRules: &vschemapb.ShardRoutingRules{},
 		Keyspaces: map[string]*vschemapb.Keyspace{
 			"ks1": keyspace1,
 			"ks2": keyspace2,

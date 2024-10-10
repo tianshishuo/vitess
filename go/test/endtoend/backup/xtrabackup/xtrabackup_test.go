@@ -19,10 +19,60 @@ package vtctlbackup
 import (
 	"testing"
 
+	"vitess.io/vitess/go/vt/mysqlctl"
+
 	backup "vitess.io/vitess/go/test/endtoend/backup/vtctlbackup"
 )
 
 // TestXtraBackup - tests the backup using xtrabackup
 func TestXtrabackup(t *testing.T) {
-	backup.TestBackup(t, backup.XtraBackup, "tar", 0)
+	backup.TestBackup(t, backup.XtraBackup, "tar", 0, nil, nil)
+}
+
+func TestXtrabackupWithZstdCompression(t *testing.T) {
+	defer setDefaultCompressionFlag()
+	cDetails := &backup.CompressionDetails{
+		CompressorEngineName:    "zstd",
+		ExternalCompressorCmd:   "zstd",
+		ExternalCompressorExt:   ".zst",
+		ExternalDecompressorCmd: "zstd -d",
+	}
+
+	backup.TestBackup(t, backup.XtraBackup, "tar", 0, cDetails, []string{"TestReplicaBackup"})
+}
+
+func TestXtrabackupWithExternalZstdCompression(t *testing.T) {
+	defer setDefaultCompressionFlag()
+	cDetails := &backup.CompressionDetails{
+		CompressorEngineName:    "external",
+		ExternalCompressorCmd:   "zstd",
+		ExternalCompressorExt:   ".zst",
+		ExternalDecompressorCmd: "zstd -d",
+	}
+
+	backup.TestBackup(t, backup.XtraBackup, "tar", 0, cDetails, []string{"TestReplicaBackup"})
+}
+
+func TestXtrabackupWithExternalZstdCompressionAndManifestedDecompressor(t *testing.T) {
+	defer setDefaultCompressionFlag()
+	cDetails := &backup.CompressionDetails{
+		CompressorEngineName:            "external",
+		ExternalCompressorCmd:           "zstd",
+		ExternalCompressorExt:           ".zst",
+		ManifestExternalDecompressorCmd: "zstd -d",
+	}
+
+	backup.TestBackup(t, backup.XtraBackup, "tar", 0, cDetails, []string{"TestReplicaBackup"})
+}
+
+func TestDoNotDemoteNewlyPromotedPrimaryIfReparentingDuringBackup(t *testing.T) {
+	backup.TestBackup(t, backup.XtraBackup, "xbstream", 0, nil, []string{"DoNotDemoteNewlyPromotedPrimaryIfReparentingDuringBackup"})
+}
+
+func setDefaultCompressionFlag() {
+	mysqlctl.CompressionEngineName = "pgzip"
+	mysqlctl.ExternalCompressorCmd = ""
+	mysqlctl.ExternalCompressorExt = ""
+	mysqlctl.ExternalDecompressorCmd = ""
+	mysqlctl.ManifestExternalDecompressorCmd = ""
 }

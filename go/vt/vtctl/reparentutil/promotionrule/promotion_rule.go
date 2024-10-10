@@ -21,7 +21,6 @@ import (
 )
 
 // CandidatePromotionRule describe the promotion preference/rule for an instance.
-// It maps to promotion_rule column in candidate_database_instance
 type CandidatePromotionRule string
 
 const (
@@ -38,6 +37,12 @@ var promotionRuleOrderMap = map[CandidatePromotionRule]int{
 	Neutral:   2,
 	PreferNot: 3,
 	MustNot:   4,
+}
+
+// AllPromotionRules returns all the CandidatePromotionRules in a list
+// sorted by their priority.
+func AllPromotionRules() []CandidatePromotionRule {
+	return []CandidatePromotionRule{Must, Prefer, Neutral, PreferNot, MustNot}
 }
 
 func (this *CandidatePromotionRule) BetterThan(other CandidatePromotionRule) bool {

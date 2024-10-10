@@ -18,29 +18,26 @@ limitations under the License.
 package grpcvtgateservice
 
 import (
-	"flag"
+	"context"
 
+	"github.com/spf13/pflag"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/peer"
 
-	"context"
-
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/callerid"
 	"vitess.io/vitess/go/vt/callinfo"
-	"vitess.io/vitess/go/vt/servenv"
-	"vitess.io/vitess/go/vt/topo/topoproto"
-	"vitess.io/vitess/go/vt/vterrors"
-	"vitess.io/vitess/go/vt/vtgate"
-	"vitess.io/vitess/go/vt/vtgate/vtgateservice"
-
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
 	vtgateservicepb "vitess.io/vitess/go/vt/proto/vtgateservice"
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/vtgate"
+	"vitess.io/vitess/go/vt/vtgate/vtgateservice"
 )
 
 const (
@@ -48,8 +45,24 @@ const (
 )
 
 var (
-	useEffective = flag.Bool("grpc_use_effective_callerid", false, "If set, and SSL is not used, will set the immediate caller id from the effective caller id's principal.")
+	useEffective                    bool
+	useEffectiveGroups              bool
+	useStaticAuthenticationIdentity bool
+
+	sendSessionInStreaming bool
 )
+
+func registerFlags(fs *pflag.FlagSet) {
+	fs.BoolVar(&useEffective, "grpc_use_effective_callerid", false, "If set, and SSL is not used, will set the immediate caller id from the effective caller id's principal.")
+	fs.BoolVar(&useEffectiveGroups, "grpc-use-effective-groups", false, "If set, and SSL is not used, will set the immediate caller's security groups from the effective caller id's groups.")
+	fs.BoolVar(&useStaticAuthenticationIdentity, "grpc-use-static-authentication-callerid", false, "If set, will set the immediate caller id to the username authenticated by the static auth plugin.")
+	fs.BoolVar(&sendSessionInStreaming, "grpc-send-session-in-streaming", false, "If set, will send the session as last packet in streaming api to support transactions in streaming")
+}
+
+func init() {
+	servenv.OnParseFor("vtgate", registerFlags)
+	servenv.OnParseFor("vtcombo", registerFlags)
+}
 
 // VTGate is the public structure that is exported via gRPC
 type VTGate struct {
@@ -57,13 +70,13 @@ type VTGate struct {
 	server vtgateservice.VTGateService
 }
 
-// immediateCallerID tries to extract the common name as well as the (domain) subject
+// immediateCallerIDFromCert tries to extract the common name as well as the (domain) subject
 // alternative names of the certificate that was used to connect to vtgate.
 // If it fails for any reason, it will return "".
 // That immediate caller id is then inserted into a Context,
 // and will be used when talking to vttablet.
 // vttablet in turn can use table ACLs to validate access is authorized.
-func immediateCallerID(ctx context.Context) (string, []string) {
+func immediateCallerIDFromCert(ctx context.Context) (string, []string) {
 	p, ok := peer.FromContext(ctx)
 	if !ok {
 		return "", nil
@@ -85,19 +98,41 @@ func immediateCallerID(ctx context.Context) (string, []string) {
 	return cert.Subject.CommonName, cert.DNSNames
 }
 
+// immediateCallerIdFromStaticAuthentication extracts the username of the current
+// static authentication context and returns that to the caller.
+func immediateCallerIdFromStaticAuthentication(ctx context.Context) (string, []string) {
+	if immediate := servenv.StaticAuthUsernameFromContext(ctx); immediate != "" {
+		return immediate, nil
+	}
+
+	return "", nil
+}
+
 // withCallerIDContext creates a context that extracts what we need
 // from the incoming call and can be forwarded for use when talking to vttablet.
 func withCallerIDContext(ctx context.Context, effectiveCallerID *vtrpcpb.CallerID) context.Context {
-	immediate, dnsNames := immediateCallerID(ctx)
-	if immediate == "" && *useEffective && effectiveCallerID != nil {
+	// The client cert common name (if using mTLS)
+	immediate, securityGroups := immediateCallerIDFromCert(ctx)
+
+	// The effective caller id (if --grpc_use_effective_callerid=true)
+	if immediate == "" && useEffective && effectiveCallerID != nil {
 		immediate = effectiveCallerID.Principal
+		if useEffectiveGroups && len(effectiveCallerID.Groups) > 0 {
+			securityGroups = effectiveCallerID.Groups
+		}
 	}
+
+	// The static auth username (if --grpc-use-static-authentication-callerid=true)
+	if immediate == "" && useStaticAuthenticationIdentity {
+		immediate, securityGroups = immediateCallerIdFromStaticAuthentication(ctx)
+	}
+
 	if immediate == "" {
 		immediate = unsecureClient
 	}
 	return callerid.NewContext(callinfo.GRPCCallInfo(ctx),
 		effectiveCallerID,
-		&querypb.VTGateCallerID{Username: immediate, Groups: dnsNames})
+		&querypb.VTGateCallerID{Username: immediate, Groups: securityGroups})
 }
 
 // Execute is the RPC version of vtgateservice.VTGateService method
@@ -110,13 +145,7 @@ func (vtg *VTGate) Execute(ctx context.Context, request *vtgatepb.ExecuteRequest
 	if session == nil {
 		session = &vtgatepb.Session{Autocommit: true}
 	}
-	if session.TargetString == "" && request.TabletType != topodatapb.TabletType_UNKNOWN {
-		session.TargetString = request.KeyspaceShard + "@" + topoproto.TabletTypeLString(request.TabletType)
-	}
-	if session.Options == nil {
-		session.Options = request.Options
-	}
-	session, result, err := vtg.server.Execute(ctx, session, request.Query.Sql, request.Query.BindVariables)
+	session, result, err := vtg.server.Execute(ctx, nil, session, request.Query.Sql, request.Query.BindVariables)
 	return &vtgatepb.ExecuteResponse{
 		Result:  sqltypes.ResultToProto3(result),
 		Session: session,
@@ -139,12 +168,6 @@ func (vtg *VTGate) ExecuteBatch(ctx context.Context, request *vtgatepb.ExecuteBa
 	if session == nil {
 		session = &vtgatepb.Session{Autocommit: true}
 	}
-	if session.TargetString == "" {
-		session.TargetString = request.KeyspaceShard + "@" + topoproto.TabletTypeLString(request.TabletType)
-	}
-	if session.Options == nil {
-		session.Options = request.Options
-	}
 	session, results, err := vtg.server.ExecuteBatch(ctx, session, sqlQueries, bindVars)
 	return &vtgatepb.ExecuteBatchResponse{
 		Results: sqltypes.QueryResponsesToProto3(results),
@@ -164,21 +187,31 @@ func (vtg *VTGate) StreamExecute(request *vtgatepb.StreamExecuteRequest, stream 
 		session = &vtgatepb.Session{Autocommit: true}
 	}
 
-	// Do not set target if the tablet_type is not set correctly.
-	if session.TargetString == "" && request.TabletType != topodatapb.TabletType_UNKNOWN {
-		session.TargetString = request.KeyspaceShard + "@" + topoproto.TabletTypeLString(request.TabletType)
-	}
-	if session.Options == nil {
-		session.Options = request.Options
-	}
-	vtgErr := vtg.server.StreamExecute(ctx, session, request.Query.Sql, request.Query.BindVariables, func(value *sqltypes.Result) error {
+	session, vtgErr := vtg.server.StreamExecute(ctx, nil, session, request.Query.Sql, request.Query.BindVariables, func(value *sqltypes.Result) error {
 		// Send is not safe to call concurrently, but vtgate
 		// guarantees that it's not.
 		return stream.Send(&vtgatepb.StreamExecuteResponse{
 			Result: sqltypes.ResultToProto3(value),
 		})
 	})
-	return vterrors.ToGRPC(vtgErr)
+
+	var errs []error
+	if vtgErr != nil {
+		errs = append(errs, vtgErr)
+	}
+
+	if sendSessionInStreaming {
+		// even if there is an error, session could have been modified.
+		// So, this needs to be sent back to the client. Session is sent in the last stream response.
+		lastErr := stream.Send(&vtgatepb.StreamExecuteResponse{
+			Session: session,
+		})
+		if lastErr != nil {
+			errs = append(errs, lastErr)
+		}
+	}
+
+	return vterrors.ToGRPC(vterrors.Aggregate(errs))
 }
 
 // Prepare is the RPC version of vtgateservice.VTGateService method
@@ -212,18 +245,6 @@ func (vtg *VTGate) CloseSession(ctx context.Context, request *vtgatepb.CloseSess
 	return &vtgatepb.CloseSessionResponse{
 		Error: vterrors.ToVTRPC(err),
 	}, nil
-}
-
-// ResolveTransaction is the RPC version of vtgateservice.VTGateService method
-func (vtg *VTGate) ResolveTransaction(ctx context.Context, request *vtgatepb.ResolveTransactionRequest) (response *vtgatepb.ResolveTransactionResponse, err error) {
-	defer vtg.server.HandlePanic(&err)
-	ctx = withCallerIDContext(ctx, request.CallerId)
-	vtgErr := vtg.server.ResolveTransaction(ctx, request.Dtid)
-	response = &vtgatepb.ResolveTransactionResponse{}
-	if vtgErr == nil {
-		return response, nil
-	}
-	return nil, vterrors.ToGRPC(vtgErr)
 }
 
 // VStream is the RPC version of vtgateservice.VTGateService method

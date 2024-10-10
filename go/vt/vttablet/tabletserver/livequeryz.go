@@ -21,7 +21,8 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
-	"text/template"
+
+	"github.com/google/safehtml/template"
 
 	"vitess.io/vitess/go/acl"
 	"vitess.io/vitess/go/vt/log"
@@ -98,13 +99,13 @@ func livequeryzTerminateHandler(queryLists []*QueryList, w http.ResponseWriter, 
 		return
 	}
 	connID := r.FormValue("connID")
-	c, err := strconv.Atoi(connID)
+	c, err := strconv.ParseInt(connID, 10, 64)
 	if err != nil {
 		http.Error(w, "invalid connID", http.StatusInternalServerError)
 		return
 	}
 	for _, ql := range queryLists {
-		if ql.Terminate(int64(c)) {
+		if ql.Terminate(c) {
 			break
 		}
 	}

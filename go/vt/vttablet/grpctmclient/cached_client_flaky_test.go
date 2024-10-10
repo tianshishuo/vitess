@@ -20,10 +20,11 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,7 +33,6 @@ import (
 	"golang.org/x/net/nettest"
 	"google.golang.org/grpc"
 
-	"vitess.io/vitess/go/sync2"
 	"vitess.io/vitess/go/vt/vttablet/grpctmserver"
 	"vitess.io/vitess/go/vt/vttablet/tabletmanager"
 	"vitess.io/vitess/go/vt/vttablet/tmrpctest"
@@ -117,7 +117,7 @@ func BenchmarkCachedConnClientSteadyState(b *testing.B) {
 						ctx, cancel := context.WithTimeout(ctx, time.Second*5)
 						defer cancel()
 
-						x := rand.Intn(len(tablets))
+						x := rand.IntN(len(tablets))
 						err := client.Ping(ctx, tablets[x])
 						assert.NoError(b, err)
 					}()
@@ -185,7 +185,7 @@ func BenchmarkCachedConnClientSteadyStateRedials(b *testing.B) {
 						ctx, cancel := context.WithTimeout(ctx, time.Second*5)
 						defer cancel()
 
-						x := rand.Intn(len(tablets))
+						x := rand.IntN(len(tablets))
 						err := client.Ping(ctx, tablets[x])
 						assert.NoError(b, err)
 					}()
@@ -320,8 +320,7 @@ func TestCachedConnClient(t *testing.T) {
 	client := NewCachedConnClient(poolSize)
 	defer client.Close()
 
-	dialAttempts := sync2.NewAtomicInt64(0)
-	dialErrors := sync2.NewAtomicInt64(0)
+	var dialAttempts, dialErrors atomic.Int64
 
 	longestDials := make(chan time.Duration, numGoroutines)
 
@@ -341,10 +340,10 @@ func TestCachedConnClient(t *testing.T) {
 					longestDials <- longestDial
 					return
 				case <-time.After(jitter):
-					jitter = time.Millisecond * (time.Duration(rand.Intn(11) + 50))
+					jitter = time.Millisecond * (time.Duration(rand.IntN(11) + 50))
 					attempts++
 
-					tablet := tablets[rand.Intn(len(tablets))]
+					tablet := tablets[rand.IntN(len(tablets))]
 					start := time.Now()
 					_, closer, err := client.dialer.dial(context.Background(), tablet)
 					if err != nil {
@@ -375,7 +374,7 @@ func TestCachedConnClient(t *testing.T) {
 		}
 	}
 
-	attempts, errors := dialAttempts.Get(), dialErrors.Get()
+	attempts, errors := dialAttempts.Load(), dialErrors.Load()
 	assert.Less(t, float64(errors)/float64(attempts), 0.001, fmt.Sprintf("fewer than 0.1%% of dial attempts should fail (attempts = %d, errors = %d, max running procs = %d)", attempts, errors, procs))
 	assert.Less(t, errors, int64(1), "at least one dial attempt failed (attempts = %d, errors = %d)", attempts, errors)
 	assert.Less(t, longestDial.Milliseconds(), int64(50))

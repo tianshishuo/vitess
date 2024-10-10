@@ -17,23 +17,26 @@ limitations under the License.
 package engine
 
 import (
-	"vitess.io/vitess/go/vt/sqlparser"
-	"vitess.io/vitess/go/vt/vtgate/evalengine"
+	"context"
+	"sync"
 
 	"vitess.io/vitess/go/sqltypes"
-
 	querypb "vitess.io/vitess/go/vt/proto/query"
+	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vtgate/evalengine"
 )
 
 var _ Primitive = (*Filter)(nil)
 
 // Filter is a primitive that performs the FILTER operation.
 type Filter struct {
+	noTxNeeded
+
 	Predicate    evalengine.Expr
 	ASTPredicate sqlparser.Expr
 	Input        Primitive
 
-	noTxNeeded
+	Truncate int
 }
 
 // RouteType returns a description of the query routing type used by the primitive
@@ -52,12 +55,12 @@ func (f *Filter) GetTableName() string {
 }
 
 // TryExecute satisfies the Primitive interface.
-func (f *Filter) TryExecute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
-	result, err := f.Input.TryExecute(vcursor, bindVars, wantfields)
+func (f *Filter) TryExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
+	result, err := vcursor.ExecutePrimitive(ctx, f.Input, bindVars, wantfields)
 	if err != nil {
 		return nil, err
 	}
-	env := evalengine.EnvWithBindVars(bindVars, vcursor.ConnCollation())
+	env := evalengine.NewExpressionEnv(ctx, bindVars, vcursor)
 	var rows [][]sqltypes.Value
 	for _, row := range result.Rows {
 		env.Row = row
@@ -65,30 +68,32 @@ func (f *Filter) TryExecute(vcursor VCursor, bindVars map[string]*querypb.BindVa
 		if err != nil {
 			return nil, err
 		}
-		intEvalResult, err := evalResult.Value().ToInt64()
-		if err != nil {
-			return nil, err
-		}
-		if intEvalResult == 1 {
+
+		if evalResult.ToBoolean() {
 			rows = append(rows, row)
 		}
 	}
 	result.Rows = rows
-	return result, nil
+	return result.Truncate(f.Truncate), nil
 }
 
 // TryStreamExecute satisfies the Primitive interface.
-func (f *Filter) TryStreamExecute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
-	env := evalengine.EnvWithBindVars(bindVars, vcursor.ConnCollation())
+func (f *Filter) TryStreamExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
+	var mu sync.Mutex
+
+	env := evalengine.NewExpressionEnv(ctx, bindVars, vcursor)
 	filter := func(results *sqltypes.Result) error {
 		var rows [][]sqltypes.Value
+
+		mu.Lock()
+		defer mu.Unlock()
 		for _, row := range results.Rows {
 			env.Row = row
 			evalResult, err := env.Evaluate(f.Predicate)
 			if err != nil {
 				return err
 			}
-			intEvalResult, err := evalResult.Value().ToInt64()
+			intEvalResult, err := evalResult.Value(vcursor.ConnCollation()).ToInt64()
 			if err != nil {
 				return err
 			}
@@ -97,24 +102,26 @@ func (f *Filter) TryStreamExecute(vcursor VCursor, bindVars map[string]*querypb.
 			}
 		}
 		results.Rows = rows
-		return callback(results)
+		return callback(results.Truncate(f.Truncate))
 	}
-	return f.Input.TryStreamExecute(vcursor, bindVars, wantfields, filter)
+
+	return vcursor.StreamExecutePrimitive(ctx, f.Input, bindVars, wantfields, filter)
 }
 
 // GetFields implements the Primitive interface.
-func (f *Filter) GetFields(vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
-	return f.Input.GetFields(vcursor, bindVars)
+func (f *Filter) GetFields(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
+	return f.Input.GetFields(ctx, vcursor, bindVars)
 }
 
 // Inputs returns the input to limit
-func (f *Filter) Inputs() []Primitive {
-	return []Primitive{f.Input}
+func (f *Filter) Inputs() ([]Primitive, []map[string]any) {
+	return []Primitive{f.Input}, nil
 }
 
 func (f *Filter) description() PrimitiveDescription {
-	other := map[string]interface{}{
-		"Predicate": sqlparser.String(f.ASTPredicate),
+	other := map[string]any{
+		"Predicate":     sqlparser.String(f.ASTPredicate),
+		"ResultColumns": f.Truncate,
 	}
 
 	return PrimitiveDescription{

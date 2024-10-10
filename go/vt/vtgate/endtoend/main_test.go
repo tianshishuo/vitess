@@ -18,84 +18,27 @@ package endtoend
 
 import (
 	"context"
-	"flag"
+	_ "embed"
 	"fmt"
 	"os"
 	"testing"
 
+	_flag "vitess.io/vitess/go/internal/flag"
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
-	"vitess.io/vitess/go/vt/vttest"
-
 	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
 	vttestpb "vitess.io/vitess/go/vt/proto/vttest"
+	"vitess.io/vitess/go/vt/vttest"
 )
 
 var (
-	cluster        *vttest.LocalCluster
-	vtParams       mysql.ConnParams
-	mysqlParams    mysql.ConnParams
-	grpcAddress    string
-	tabletHostName = flag.String("tablet_hostname", "", "the tablet hostname")
+	cluster     *vttest.LocalCluster
+	vtParams    mysql.ConnParams
+	mysqlParams mysql.ConnParams
+	grpcAddress string
 
-	schema = `
-create table t1(
-	id1 bigint,
-	id2 bigint,
-	primary key(id1)
-) Engine=InnoDB;
-
-create table t1_id2_idx(
-	id2 bigint,
-	keyspace_id varbinary(10),
-	primary key(id2)
-) Engine=InnoDB;
-
-create table vstream_test(
-	id bigint,
-	val bigint,
-	primary key(id)
-) Engine=InnoDB;
-
-create table aggr_test(
-	id bigint,
-	val1 varchar(16),
-	val2 bigint,
-	primary key(id)
-) Engine=InnoDB;
-
-create table t2(
-	id3 bigint,
-	id4 bigint,
-	primary key(id3)
-) Engine=InnoDB;
-
-create table t2_id4_idx(
-	id bigint not null auto_increment,
-	id4 bigint,
-	id3 bigint,
-	primary key(id),
-	key idx_id4(id4)
-) Engine=InnoDB;
-
-create table t1_last_insert_id(
-	id bigint not null auto_increment,
-	id1 bigint,
-	primary key(id)
-) Engine=InnoDB;
-
-create table t1_row_count(
-	id bigint not null,
-	id1 bigint,
-	primary key(id)
-) Engine=InnoDB;
-
-create table t1_sharded(
-	id1 bigint,
-	id2 bigint,
-	primary key(id1)
-) Engine=InnoDB;
-`
+	//go:embed schema.sql
+	Schema string
 
 	vschema = &vschemapb.Keyspace{
 		Sharded: true,
@@ -131,6 +74,24 @@ create table t1_sharded(
 				}, {
 					Column: "id2",
 					Name:   "t1_id2_vdx",
+				}},
+			},
+			"t1_copy_basic": {
+				ColumnVindexes: []*vschemapb.ColumnVindex{{
+					Column: "id1",
+					Name:   "hash",
+				}},
+			},
+			"t1_copy_all": {
+				ColumnVindexes: []*vschemapb.ColumnVindex{{
+					Column: "id1",
+					Name:   "hash",
+				}},
+			},
+			"t1_copy_resume": {
+				ColumnVindexes: []*vschemapb.ColumnVindex{{
+					Column: "id1",
+					Name:   "hash",
 				}},
 			},
 			"t1_sharded": {
@@ -192,33 +153,84 @@ create table t1_sharded(
 					Name:   "hash",
 				}},
 			},
+			"oltp_test": {
+				ColumnVindexes: []*vschemapb.ColumnVindex{{
+					Column: "id",
+					Name:   "hash",
+				}},
+				Columns: []*vschemapb.Column{{
+					Name: "c",
+					Type: sqltypes.Char,
+				}, {
+					Name: "pad",
+					Type: sqltypes.Char,
+				}},
+			},
+		},
+	}
+
+	schema2 = `
+create table t1_copy_all_ks2(
+	id1 bigint,
+	id2 bigint,
+	primary key(id1)
+) Engine=InnoDB;
+`
+
+	vschema2 = &vschemapb.Keyspace{
+		Sharded: true,
+		Vindexes: map[string]*vschemapb.Vindex{
+			"hash": {
+				Type: "hash",
+			},
+		},
+		Tables: map[string]*vschemapb.Table{
+			"t1_copy_all_ks2": {
+				ColumnVindexes: []*vschemapb.ColumnVindex{{
+					Column: "id1",
+					Name:   "hash",
+				}},
+			},
 		},
 	}
 )
 
 func TestMain(m *testing.M) {
-	flag.Parse()
+	_flag.ParseFlagsForTest()
 
 	exitCode := func() int {
 		var cfg vttest.Config
 		cfg.Topology = &vttestpb.VTTestTopology{
-			Keyspaces: []*vttestpb.Keyspace{{
-				Name: "ks",
-				Shards: []*vttestpb.Shard{{
-					Name: "-80",
-				}, {
-					Name: "80-",
-				}},
-			}},
+			Keyspaces: []*vttestpb.Keyspace{
+				{
+					Name: "ks",
+					Shards: []*vttestpb.Shard{{
+						Name: "-80",
+					}, {
+						Name: "80-",
+					}},
+				},
+				{
+					Name: "ks2",
+					Shards: []*vttestpb.Shard{{
+						Name: "-80",
+					}, {
+						Name: "80-",
+					}},
+				},
+			},
 		}
-		if err := cfg.InitSchemas("ks", schema, vschema); err != nil {
+		if err := cfg.InitSchemas("ks", Schema, vschema); err != nil {
 			fmt.Fprintf(os.Stderr, "%v\n", err)
 			os.RemoveAll(cfg.SchemaDir)
 			return 1
 		}
 		defer os.RemoveAll(cfg.SchemaDir)
-
-		cfg.TabletHostName = *tabletHostName
+		if err := cfg.InitSchemas("ks2", schema2, vschema2); err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.RemoveAll(cfg.SchemaDir)
+			return 1
+		}
 
 		cluster = &vttest.LocalCluster{
 			Config: cfg,

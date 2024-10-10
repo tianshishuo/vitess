@@ -17,11 +17,11 @@ limitations under the License.
 package engine
 
 import (
+	"context"
 	"fmt"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
-	"vitess.io/vitess/go/vt/proto/query"
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/schema"
@@ -34,21 +34,20 @@ var _ Primitive = (*RevertMigration)(nil)
 
 // RevertMigration represents the instructions to perform an online schema change via vtctld
 type RevertMigration struct {
+	noTxNeeded
+	noInputs
+
 	Keyspace          *vindexes.Keyspace
 	Stmt              *sqlparser.RevertMigration
 	Query             string
 	TargetDestination key.Destination
-
-	noTxNeeded
-
-	noInputs
 }
 
 func (v *RevertMigration) description() PrimitiveDescription {
 	return PrimitiveDescription{
 		OperatorType: "RevertMigration",
 		Keyspace:     v.Keyspace,
-		Other: map[string]interface{}{
+		Other: map[string]any{
 			"query": v.Query,
 		},
 	}
@@ -70,7 +69,7 @@ func (v *RevertMigration) GetTableName() string {
 }
 
 // TryExecute implements the Primitive interface
-func (v *RevertMigration) TryExecute(vcursor VCursor, bindVars map[string]*query.BindVariable, wantfields bool) (result *sqltypes.Result, err error) {
+func (v *RevertMigration) TryExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (result *sqltypes.Result, err error) {
 	result = &sqltypes.Result{
 		Fields: []*querypb.Field{
 			{
@@ -81,34 +80,25 @@ func (v *RevertMigration) TryExecute(vcursor VCursor, bindVars map[string]*query
 		Rows: [][]sqltypes.Value{},
 	}
 
-	sql := fmt.Sprintf("revert %s", v.Stmt.UUID)
-
 	ddlStrategySetting, err := schema.ParseDDLStrategy(vcursor.Session().GetDDLStrategy())
 	if err != nil {
 		return nil, err
 	}
 	ddlStrategySetting.Strategy = schema.DDLStrategyOnline // and we keep the options as they were
-	onlineDDL, err := schema.NewOnlineDDL(v.GetKeyspaceName(), "", sql, ddlStrategySetting, fmt.Sprintf("vtgate:%s", vcursor.Session().GetSessionUUID()), "")
+	onlineDDL, err := schema.NewOnlineDDL(v.GetKeyspaceName(), "", v.Query, ddlStrategySetting, fmt.Sprintf("vtgate:%s", vcursor.Session().GetSessionUUID()), "", vcursor.Environment().Parser())
 	if err != nil {
 		return result, err
 	}
 
-	if ddlStrategySetting.IsSkipTopo() {
-		s := Send{
-			Keyspace:          v.Keyspace,
-			TargetDestination: v.TargetDestination,
-			Query:             onlineDDL.SQL,
-			IsDML:             false,
-			SingleShardOnly:   false,
-		}
-		if _, err := vcursor.ExecutePrimitive(&s, bindVars, wantfields); err != nil {
-			return result, err
-		}
-	} else {
-		// Submit a request entry in topo. vtctld will take it from there
-		if err := vcursor.SubmitOnlineDDL(onlineDDL); err != nil {
-			return result, err
-		}
+	s := Send{
+		Keyspace:          v.Keyspace,
+		TargetDestination: v.TargetDestination,
+		Query:             onlineDDL.SQL,
+		IsDML:             false,
+		SingleShardOnly:   false,
+	}
+	if _, err := vcursor.ExecutePrimitive(ctx, &s, bindVars, wantfields); err != nil {
+		return result, err
 	}
 	result.Rows = append(result.Rows, []sqltypes.Value{
 		sqltypes.NewVarChar(onlineDDL.UUID),
@@ -117,15 +107,15 @@ func (v *RevertMigration) TryExecute(vcursor VCursor, bindVars map[string]*query
 }
 
 // TryStreamExecute implements the Primitive interface
-func (v *RevertMigration) TryStreamExecute(vcursor VCursor, bindVars map[string]*query.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
-	results, err := v.TryExecute(vcursor, bindVars, wantfields)
+func (v *RevertMigration) TryStreamExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
+	results, err := v.TryExecute(ctx, vcursor, bindVars, wantfields)
 	if err != nil {
 		return err
 	}
 	return callback(results)
 }
 
-//GetFields implements the Primitive interface
-func (v *RevertMigration) GetFields(vcursor VCursor, bindVars map[string]*query.BindVariable) (*sqltypes.Result, error) {
+// GetFields implements the Primitive interface
+func (v *RevertMigration) GetFields(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
 	return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "[BUG] GetFields is not reachable")
 }

@@ -44,25 +44,24 @@ As contributors gain experience and familiarity with the project, their profile 
 
 ## Maintainers
 
-[Maintainers](https://github.com/vitessio/vitess/blob/main/MAINTAINERS.md) are community members who have shown that they are committed to the continued development of the project through ongoing engagement with the community. Maintainer-ship allows contributors to more easily carry on with their project related activities by giving them direct access to the project’s resources. That is, they can make changes directly to project outputs, without having to submit changes via pull requests.
+[Maintainers](https://github.com/vitessio/vitess/blob/main/MAINTAINERS.md) are community members who have shown that they are committed to the continued development of the project through ongoing engagement with the community. Maintainer-ship allows contributors to more easily carry on with their project related activities by giving them direct access to the project’s resources.
 
 This does not mean that a maintainer is free to do what they want. In fact, maintainers have no more authority over the project than contributors. While maintainer-ship indicates a valued member of the community who has demonstrated a healthy respect for the project’s aims and objectives, their work continues to be reviewed by the community before acceptance in an official release.
 
-A maintainer is not allowed to merge their change without approval from another person. However, a small number of maintainers are allowed to sidestep this rule under justifiable circumstances. For example:
+A maintainer is not allowed to merge their change without approval from other maintainers. However, a small number of maintainers are allowed to sidestep this rule under justifiable circumstances. For example:
 
-* If a CI tool is broken, they may override the tool to still submit the change.
-* Minor typos or fixes for broken tests.
-* The change was approved through other means than the standard process.
+* If a CI tool is broken, they may override the tool to merge pull requests.
+* The change is a critical security fix and was approved through other means than the standard process.
 
 Anyone can become a maintainer; there are no special requirements, other than to have shown a willingness and ability to participate in the project as a team player. Typically, a potential maintainer will need to show that they have an understanding of the project, its objectives and its strategy. They will also have provided valuable contributions to the project over a period of time.
 
-New maintainers can be nominated by any existing maintainer. Once they have been nominated, there will be a vote by the steering committee. Maintainer voting is one of the few activities that takes place on the project’s private management list. This is to allow committee members to freely express their opinions about a nominee without causing embarrassment. Once the vote has been held, the aggregated voting results are published on the public mailing list. The nominee is entitled to request an explanation of any ‘no’ votes against them, regardless of the outcome of the vote. This explanation will be provided by the Steering Committee Chair (see below) and will be anonymous and constructive in nature.
+New maintainers can be nominated by any existing maintainer. Once they have been nominated, there will be a vote by the maintainer team to decide whether to accept or reject the nomination.
 
-Nominees may decline their appointment as a maintainer. However, this is unusual, as the project does not expect any specific time or resource commitment from its community members. The intention behind the role of maintainer is to allow people to contribute to the project more easily, not to tie them in to the project in any formal way.
+Nominees may decline their appointment as a maintainer. The project does not expect any specific time or resource commitment from its community members, however it is expected that maintainers are evangelists for the project.
 
-It is important to recognise that maintainer-ship is a privilege, not a right. That privilege must be earned and once earned it can be removed by the Steering Committee for conduct inconsistent with the [Guiding Principles](https://github.com/vitessio/vitess/blob/main/GUIDING_PRINCIPLES.md) or if they drop below a level of commitment and engagement required to be a maintainer, as determined by the Steering Committee. The Steering Committee also reserves the right to remove a person for any other reason inconsistent with the goals of the project.
+It is important to recognise that maintainer-ship is a privilege, not a right. That privilege must be earned and once earned it can be removed by the [Steering Committee](https://github.com/vitessio/vitess/blob/main/STEERING.md) for conduct inconsistent with the [Guiding Principles](https://github.com/vitessio/vitess/blob/main/GUIDING_PRINCIPLES.md) or if they drop below a level of commitment and engagement required to be a maintainer, as determined by the Steering Committee. The Steering Committee also reserves the right to remove a person for any other reason inconsistent with the goals of the project.
 
-A maintainer who shows an above-average level of contribution to the project, particularly with respect to its strategic direction and long-term health, may be nominated to become a member of the Steering Committee. This role is described in the [Steering Committee document](https://github.com/vitessio/vitess/blob/main/STEERING.md).
+A maintainer who shows an above-average level of contribution to the project, particularly with respect to its strategic direction and long-term health, may be nominated to become a member of the Steering Committee.
 
 # Support
 
@@ -73,7 +72,7 @@ Anyone can contribute to the project, regardless of their skills, as there are m
 
 The Slack workspace is the most appropriate place for a contributor to ask for help when making their first contribution.
 
-# Decision Making Process
+# Decision-Making Process
 
 Decisions about the future of the project are made by the Steering Committee. New proposals and ideas can be brought to the Committee’s attention through the Slack workspace or by filing an issue. If necessary, the Committee will seek input from others to come to the final decision.
 

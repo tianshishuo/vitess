@@ -14,6 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-source ./env.sh
+source ../common/env.sh
 
-vtctlclient Reshard -v1 -tablet_types=PRIMARY main.main2regions '0' '-40,40-80,80-c0,c0-'
+vtctldclient reshard --workflow main2regions --target-keyspace main create --source-shards '0' --target-shards '-40,40-80,80-c0,c0-' --tablet-types=PRIMARY

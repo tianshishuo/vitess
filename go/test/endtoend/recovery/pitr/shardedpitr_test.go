@@ -19,16 +19,24 @@ package pitr
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
+	"path"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"vitess.io/vitess/go/constants/sidecar"
+	"vitess.io/vitess/go/json2"
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/test/endtoend/cluster"
+	"vitess.io/vitess/go/test/endtoend/utils"
 	"vitess.io/vitess/go/vt/log"
+
+	vtctldatapb "vitess.io/vitess/go/vt/proto/vtctldata"
 )
 
 var (
@@ -40,27 +48,32 @@ var (
 var (
 	clusterInstance *cluster.LocalProcessCluster
 
-	primary       *cluster.Vttablet
-	replica       *cluster.Vttablet
-	shard0Primary *cluster.Vttablet
-	shard0Replica *cluster.Vttablet
-	shard1Primary *cluster.Vttablet
-	shard1Replica *cluster.Vttablet
+	primary        *cluster.Vttablet
+	replica1       *cluster.Vttablet
+	replica2       *cluster.Vttablet
+	shard0Primary  *cluster.Vttablet
+	shard0Replica1 *cluster.Vttablet
+	shard0Replica2 *cluster.Vttablet
+	shard1Primary  *cluster.Vttablet
+	shard1Replica1 *cluster.Vttablet
+	shard1Replica2 *cluster.Vttablet
 
-	cell           = "zone1"
-	hostname       = "localhost"
-	binlogHost     = "127.0.0.1"
-	keyspaceName   = "ks"
-	restoreKS1Name = "restoreks1"
-	restoreKS2Name = "restoreks2"
-	restoreKS3Name = "restoreks3"
-	shardName      = "0"
-	shard0Name     = "-80"
-	shard1Name     = "80-"
-	dbName         = "vt_ks"
-	mysqlUserName  = "vt_dba"
-	mysqlPassword  = "password"
-	vSchema        = `{
+	cell                   = "zone1"
+	hostname               = "localhost"
+	binlogHost             = "127.0.0.1"
+	keyspaceName           = "ks"
+	restoreKS1Name         = "restoreks1"
+	restoreKS2Name         = "restoreks2"
+	restoreKS3Name         = "restoreks3"
+	shardName              = "0"
+	shard0Name             = "-80"
+	shard1Name             = "80-"
+	dbName                 = "vt_ks"
+	mysqlUserName          = "vt_dba"
+	mysqlPassword          = "VtDbaPass"
+	dbCredentialFile       = ""
+	initDBFileWithPassword = ""
+	vSchema                = `{
 		"sharded": true,
 		"vindexes": {
 			"hash_index": {
@@ -79,13 +92,14 @@ var (
 		}
 	}`
 	commonTabletArg = []string{
-		"-vreplication_healthcheck_topology_refresh", "1s",
-		"-vreplication_healthcheck_retry_delay", "1s",
-		"-vreplication_retry_delay", "1s",
-		"-degraded_threshold", "5s",
-		"-lock_tables_timeout", "5s",
-		"-watch_replication_stream",
-		"-serving_state_grace_period", "1s"}
+		"--vreplication_retry_delay", "1s",
+		"--degraded_threshold", "5s",
+		"--lock_tables_timeout", "5s",
+		"--watch_replication_stream",
+		"--serving_state_grace_period", "1s"}
+
+	defaultTimeout = 30 * time.Second
+	defaultTick    = 1 * time.Second
 )
 
 // Test pitr (Point in time recovery).
@@ -116,7 +130,7 @@ func TestPITRRecovery(t *testing.T) {
 	initializeCluster(t)
 	defer clusterInstance.Teardown()
 
-	//start the binlog server and point it to primary
+	// start the binlog server and point it to primary
 	bs := startBinlogServer(t, primary)
 	defer bs.stop()
 
@@ -127,10 +141,10 @@ func TestPITRRecovery(t *testing.T) {
 	insertRow(t, 1, "prd-1", false)
 	insertRow(t, 2, "prd-2", false)
 
-	cluster.VerifyRowsInTabletForTable(t, replica, keyspaceName, 2, "product")
+	cluster.VerifyRowsInTabletForTable(t, replica1, keyspaceName, 2, "product")
 
 	// backup the replica
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("Backup", replica.Alias)
+	err = clusterInstance.VtctldClientProcess.ExecuteCommand("Backup", replica1.Alias)
 	require.NoError(t, err)
 
 	// check that the backup shows up in the listing
@@ -153,11 +167,11 @@ func TestPITRRecovery(t *testing.T) {
 	// starting resharding process
 	performResharding(t)
 
-	//start the binlog server and point it to shard0Primary
+	// start the binlog server and point it to shard0Primary
 	bs0 := startBinlogServer(t, shard0Primary)
 	defer bs0.stop()
 
-	//start the binlog server and point it to shard1Primary
+	// start the binlog server and point it to shard1Primary
 	bs1 := startBinlogServer(t, shard1Primary)
 	defer bs1.stop()
 
@@ -166,14 +180,14 @@ func TestPITRRecovery(t *testing.T) {
 	}
 
 	// wait till all the shards have required data
-	cluster.VerifyRowsInTabletForTable(t, shard0Replica, keyspaceName, 6, "product")
-	cluster.VerifyRowsInTabletForTable(t, shard1Replica, keyspaceName, 4, "product")
+	cluster.VerifyRowsInTabletForTable(t, shard0Replica1, keyspaceName, 6, "product")
+	cluster.VerifyRowsInTabletForTable(t, shard1Replica1, keyspaceName, 4, "product")
 
 	// take the backup (to simulate the regular backup)
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("Backup", shard0Replica.Alias)
+	err = clusterInstance.VtctldClientProcess.ExecuteCommand("Backup", shard0Replica1.Alias)
 	require.NoError(t, err)
 	// take the backup (to simulate the regular backup)
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("Backup", shard1Replica.Alias)
+	err = clusterInstance.VtctldClientProcess.ExecuteCommand("Backup", shard1Replica1.Alias)
 	require.NoError(t, err)
 
 	backups, err := clusterInstance.ListBackups(keyspaceName + "/-80")
@@ -284,50 +298,44 @@ func TestPITRRecovery(t *testing.T) {
 }
 
 func performResharding(t *testing.T) {
-	err := clusterInstance.VtctlclientProcess.ApplyVSchema(keyspaceName, vSchema)
+	err := clusterInstance.VtctldClientProcess.ApplyVSchema(keyspaceName, vSchema)
 	require.NoError(t, err)
 
-	err = clusterInstance.VtctlProcess.ExecuteCommand("InitShardPrimary", "-force", "ks/-80", shard0Primary.Alias)
+	err = clusterInstance.VtctldClientProcess.ExecuteCommand("Reshard", "create", "--source-shards=0", "--target-shards=-80,80-", "--target-keyspace", "ks", "--workflow", "reshardWorkflow")
 	require.NoError(t, err)
 
-	err = clusterInstance.VtctlProcess.ExecuteCommand("InitShardPrimary", "-force", "ks/80-", shard1Primary.Alias)
+	waitTimeout := 30 * time.Second
+	shard0Primary.VttabletProcess.WaitForVReplicationToCatchup(t, "ks.reshardWorkflow", dbName, sidecar.DefaultName, waitTimeout)
+	shard1Primary.VttabletProcess.WaitForVReplicationToCatchup(t, "ks.reshardWorkflow", dbName, sidecar.DefaultName, waitTimeout)
+
+	waitForNoWorkflowLag(t, clusterInstance, "ks", "reshardWorkflow")
+
+	err = clusterInstance.VtctldClientProcess.ExecuteCommand("Reshard", "SwitchTraffic", "--tablet-types=rdonly", "--target-keyspace", "ks", "--workflow", "reshardWorkflow")
 	require.NoError(t, err)
 
-	// we need to create the schema, and the worker will do data copying
-	for _, keyspaceShard := range []string{"ks/-80", "ks/80-"} {
-		err = clusterInstance.VtctlclientProcess.ExecuteCommand("CopySchemaShard", "ks/0", keyspaceShard)
-		require.NoError(t, err)
-	}
-
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("Reshard", "-v1", "ks.reshardWorkflow", "0", "-80,80-")
-	require.NoError(t, err)
-
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("SwitchReads", "-tablet_type=rdonly", "ks.reshardWorkflow")
-	require.NoError(t, err)
-
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("SwitchReads", "-tablet_type=replica", "ks.reshardWorkflow")
+	err = clusterInstance.VtctldClientProcess.ExecuteCommand("Reshard", "SwitchTraffic", "--tablet-types=replica", "--target-keyspace", "ks", "--workflow", "reshardWorkflow")
 	require.NoError(t, err)
 
 	// then serve primary from the split shards
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("SwitchWrites", "ks.reshardWorkflow")
+	err = clusterInstance.VtctldClientProcess.ExecuteCommand("Reshard", "SwitchTraffic", "--tablet-types=primary", "--target-keyspace", "ks", "--workflow", "reshardWorkflow")
 	require.NoError(t, err)
 
 	// remove the original tablets in the original shard
-	removeTablets(t, []*cluster.Vttablet{primary, replica})
+	removeTablets(t, []*cluster.Vttablet{primary, replica1, replica2})
 
-	for _, tablet := range []*cluster.Vttablet{replica} {
-		err = clusterInstance.VtctlclientProcess.ExecuteCommand("DeleteTablet", tablet.Alias)
+	for _, tablet := range []*cluster.Vttablet{replica1, replica2} {
+		err = clusterInstance.VtctldClientProcess.ExecuteCommand("DeleteTablets", tablet.Alias)
 		require.NoError(t, err)
 	}
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("DeleteTablet", "-allow_primary", primary.Alias)
+	err = clusterInstance.VtctldClientProcess.ExecuteCommand("DeleteTablets", "--allow-primary", primary.Alias)
 	require.NoError(t, err)
 
 	// rebuild the serving graph, all mentions of the old shards should be gone
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("RebuildKeyspaceGraph", "ks")
+	err = clusterInstance.VtctldClientProcess.ExecuteCommand("RebuildKeyspaceGraph", "ks")
 	require.NoError(t, err)
 
 	// delete the original shard
-	err = clusterInstance.VtctlclientProcess.ExecuteCommand("DeleteShard", "ks/0")
+	err = clusterInstance.VtctldClientProcess.ExecuteCommand("DeleteShards", "ks/0")
 	require.NoError(t, err)
 
 	// Restart vtgate process
@@ -371,7 +379,6 @@ func removeTablets(t *testing.T, tablets []*cluster.Vttablet) {
 
 func initializeCluster(t *testing.T) {
 	clusterInstance = cluster.NewCluster(cell, hostname)
-	clusterInstance.VtctldExtraArgs = append(clusterInstance.VtctldExtraArgs, "-durability_policy=semi_sync")
 
 	// Start topo server
 	err := clusterInstance.StartTopo()
@@ -395,25 +402,48 @@ func initializeCluster(t *testing.T) {
 
 	// Defining all the tablets
 	primary = clusterInstance.NewVttabletInstance("replica", 0, "")
-	replica = clusterInstance.NewVttabletInstance("replica", 0, "")
+	replica1 = clusterInstance.NewVttabletInstance("replica", 0, "")
+	replica2 = clusterInstance.NewVttabletInstance("replica", 0, "")
 	shard0Primary = clusterInstance.NewVttabletInstance("replica", 0, "")
-	shard0Replica = clusterInstance.NewVttabletInstance("replica", 0, "")
+	shard0Replica1 = clusterInstance.NewVttabletInstance("replica", 0, "")
+	shard0Replica2 = clusterInstance.NewVttabletInstance("replica", 0, "")
 	shard1Primary = clusterInstance.NewVttabletInstance("replica", 0, "")
-	shard1Replica = clusterInstance.NewVttabletInstance("replica", 0, "")
+	shard1Replica1 = clusterInstance.NewVttabletInstance("replica", 0, "")
+	shard1Replica2 = clusterInstance.NewVttabletInstance("replica", 0, "")
 
-	shard.Vttablets = []*cluster.Vttablet{primary, replica}
-	shard0.Vttablets = []*cluster.Vttablet{shard0Primary, shard0Replica}
-	shard1.Vttablets = []*cluster.Vttablet{shard1Primary, shard1Replica}
+	shard.Vttablets = []*cluster.Vttablet{primary, replica1, replica2}
+	shard0.Vttablets = []*cluster.Vttablet{shard0Primary, shard0Replica1, shard0Replica2}
+	shard1.Vttablets = []*cluster.Vttablet{shard1Primary, shard1Replica1, shard1Replica2}
+
+	dbCredentialFile = cluster.WriteDbCredentialToTmp(clusterInstance.TmpDirectory)
+	extraArgs := []string{"--db-credentials-file", dbCredentialFile}
+	commonTabletArg = append(commonTabletArg, "--db-credentials-file", dbCredentialFile)
 
 	clusterInstance.VtTabletExtraArgs = append(clusterInstance.VtTabletExtraArgs, commonTabletArg...)
-	clusterInstance.VtTabletExtraArgs = append(clusterInstance.VtTabletExtraArgs, "-restore_from_backup", "-enable_semi_sync")
+	clusterInstance.VtTabletExtraArgs = append(clusterInstance.VtTabletExtraArgs, "--restore_from_backup")
 
 	err = clusterInstance.SetupCluster(keyspace, []cluster.Shard{*shard, *shard0, *shard1})
 	require.NoError(t, err)
+	vtctldClientProcess := cluster.VtctldClientProcessInstance("localhost", clusterInstance.VtctldProcess.GrpcPort, clusterInstance.TmpDirectory)
+	out, err := vtctldClientProcess.ExecuteCommandWithOutput("SetKeyspaceDurabilityPolicy", keyspaceName, "--durability-policy=semi_sync")
+	require.NoError(t, err, out)
+
+	initDb, _ := os.ReadFile(path.Join(os.Getenv("VTROOT"), "/config/init_db.sql"))
+	sql := string(initDb)
+	// The original init_db.sql does not have any passwords. Here we update the init file with passwords
+	sql, err = utils.GetInitDBSQL(sql, cluster.GetPasswordUpdateSQL(clusterInstance), "")
+	require.NoError(t, err, "expected to load init_db file")
+	initDBFileWithPassword = path.Join(clusterInstance.TmpDirectory, "init_db_with_passwords.sql")
+	err = os.WriteFile(initDBFileWithPassword, []byte(sql), 0660)
+	require.NoError(t, err, "expected to load init_db file")
+
 	// Start MySql
 	var mysqlCtlProcessList []*exec.Cmd
 	for _, shard := range clusterInstance.Keyspaces[0].Shards {
 		for _, tablet := range shard.Vttablets {
+			tablet.MysqlctlProcess.InitDBFile = initDBFileWithPassword
+			tablet.VttabletProcess.DbPassword = mysqlPassword
+			tablet.MysqlctlProcess.ExtraArgs = extraArgs
 			proc, err := tablet.MysqlctlProcess.StartProcess()
 			require.NoError(t, err)
 			mysqlCtlProcessList = append(mysqlCtlProcessList, proc)
@@ -426,25 +456,23 @@ func initializeCluster(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	queryCmds := []string{
-		fmt.Sprintf("CREATE USER '%s'@'%%' IDENTIFIED BY '%s';", mysqlUserName, mysqlPassword),
-		fmt.Sprintf("GRANT ALL ON *.* TO '%s'@'%%';", mysqlUserName),
-		fmt.Sprintf("GRANT GRANT OPTION ON *.* TO '%s'@'%%';", mysqlUserName),
-		fmt.Sprintf("create database %s;", "vt_ks"),
-		"FLUSH PRIVILEGES;",
-	}
-
-	for _, tablet := range []*cluster.Vttablet{primary, replica, shard0Primary, shard0Replica, shard1Primary, shard1Replica} {
-		for _, query := range queryCmds {
-			_, err = tablet.VttabletProcess.QueryTablet(query, keyspace.Name, false)
+	for _, shard := range clusterInstance.Keyspaces[0].Shards {
+		for _, tablet := range shard.Vttablets {
+			err = tablet.VttabletProcess.Setup()
 			require.NoError(t, err)
 		}
-
-		err = tablet.VttabletProcess.Setup()
-		require.NoError(t, err)
 	}
 
-	err = clusterInstance.VtctlclientProcess.InitShardPrimary(keyspaceName, shard.Name, cell, primary.TabletUID)
+	err = clusterInstance.VtctldClientProcess.InitShardPrimary(keyspaceName, shard.Name, cell, primary.TabletUID)
+	require.NoError(t, err)
+
+	err = clusterInstance.VtctldClientProcess.InitShardPrimary(keyspaceName, shard0.Name, cell, shard0Primary.TabletUID)
+	require.NoError(t, err)
+
+	err = clusterInstance.VtctldClientProcess.InitShardPrimary(keyspaceName, shard1.Name, cell, shard1Primary.TabletUID)
+	require.NoError(t, err)
+
+	err = clusterInstance.StartVTOrc(keyspaceName)
 	require.NoError(t, err)
 
 	// Start vtgate
@@ -472,9 +500,9 @@ func insertRow(t *testing.T, id int, productName string, isSlow bool) {
 }
 
 func createRestoreKeyspace(t *testing.T, timeToRecover, restoreKeyspaceName string) {
-	output, err := clusterInstance.VtctlclientProcess.ExecuteCommandWithOutput("CreateKeyspace",
-		"-keyspace_type=SNAPSHOT", "-base_keyspace="+keyspaceName,
-		"-snapshot_time", timeToRecover, restoreKeyspaceName)
+	output, err := clusterInstance.VtctldClientProcess.ExecuteCommandWithOutput("CreateKeyspace",
+		"--type=SNAPSHOT", "--base-keyspace="+keyspaceName,
+		"--snapshot-timestamp", timeToRecover, restoreKeyspaceName)
 	log.Info(output)
 	require.NoError(t, err)
 }
@@ -492,8 +520,14 @@ func testTabletRecovery(t *testing.T, binlogServer *binLogServer, lookupTimeout,
 }
 
 func launchRecoveryTablet(t *testing.T, tablet *cluster.Vttablet, binlogServer *binLogServer, lookupTimeout, restoreKeyspaceName, shardName string) {
-	tablet.MysqlctlProcess = *cluster.MysqlCtlProcessInstance(tablet.TabletUID, tablet.MySQLPort, clusterInstance.TmpDirectory)
-	err := tablet.MysqlctlProcess.Start()
+	mysqlctlProcess, err := cluster.MysqlCtlProcessInstance(tablet.TabletUID, tablet.MySQLPort, clusterInstance.TmpDirectory)
+	require.NoError(t, err)
+	tablet.MysqlctlProcess = *mysqlctlProcess
+	extraArgs := []string{"--db-credentials-file", dbCredentialFile}
+	tablet.MysqlctlProcess.InitDBFile = initDBFileWithPassword
+	tablet.VttabletProcess.DbPassword = mysqlPassword
+	tablet.MysqlctlProcess.ExtraArgs = extraArgs
+	err = tablet.MysqlctlProcess.Start()
 	require.NoError(t, err)
 
 	tablet.VttabletProcess = cluster.VttabletProcessInstance(
@@ -509,32 +543,28 @@ func launchRecoveryTablet(t *testing.T, tablet *cluster.Vttablet, binlogServer *
 		clusterInstance.Hostname,
 		clusterInstance.TmpDirectory,
 		clusterInstance.VtTabletExtraArgs,
-		clusterInstance.EnableSemiSync,
 		clusterInstance.DefaultCharset)
 	tablet.Alias = tablet.VttabletProcess.TabletPath
 	tablet.VttabletProcess.SupportsBackup = true
 	tablet.VttabletProcess.Keyspace = restoreKeyspaceName
-	tablet.VttabletProcess.EnableSemiSync = true
 	tablet.VttabletProcess.ExtraArgs = []string{
-		"-disable_active_reparents",
-		"-enable_replication_reporter=false",
-		"-init_db_name_override", dbName,
-		"-init_tablet_type", "replica",
-		"-init_keyspace", restoreKeyspaceName,
-		"-init_shard", shardName,
-		"-binlog_host", binlogServer.hostname,
-		"-binlog_port", fmt.Sprintf("%d", binlogServer.port),
-		"-binlog_user", binlogServer.username,
-		"-binlog_password", binlogServer.password,
-		"-pitr_gtid_lookup_timeout", lookupTimeout,
-		"-vreplication_healthcheck_topology_refresh", "1s",
-		"-vreplication_healthcheck_retry_delay", "1s",
-		"-vreplication_tablet_type", "replica",
-		"-vreplication_retry_delay", "1s",
-		"-degraded_threshold", "5s",
-		"-lock_tables_timeout", "5s",
-		"-watch_replication_stream",
-		"-serving_state_grace_period", "1s",
+		"--disable_active_reparents",
+		"--enable_replication_reporter=false",
+		"--init_db_name_override", dbName,
+		"--init_tablet_type", "replica",
+		"--init_keyspace", restoreKeyspaceName,
+		"--init_shard", shardName,
+		"--binlog_host", binlogServer.hostname,
+		"--binlog_port", fmt.Sprintf("%d", binlogServer.port),
+		"--binlog_user", binlogServer.username,
+		"--binlog_password", binlogServer.password,
+		"--pitr_gtid_lookup_timeout", lookupTimeout,
+		"--vreplication_retry_delay", "1s",
+		"--degraded_threshold", "5s",
+		"--lock_tables_timeout", "5s",
+		"--watch_replication_stream",
+		"--serving_state_grace_period", "1s",
+		"--db-credentials-file", dbCredentialFile,
 	}
 	tablet.VttabletProcess.ServingStatus = ""
 
@@ -542,4 +572,32 @@ func launchRecoveryTablet(t *testing.T, tablet *cluster.Vttablet, binlogServer *
 	require.NoError(t, err)
 
 	tablet.VttabletProcess.WaitForTabletStatusesForTimeout([]string{"SERVING"}, 20*time.Second)
+}
+
+// waitForNoWorkflowLag waits for the VReplication workflow's MaxVReplicationTransactionLag
+// value to be 0.
+func waitForNoWorkflowLag(t *testing.T, vc *cluster.LocalProcessCluster, ks string, workflow string) {
+	var lag int64
+	timer := time.NewTimer(defaultTimeout)
+	defer timer.Stop()
+	for {
+		output, err := vc.VtctldClientProcess.ExecuteCommandWithOutput("Workflow", "--keyspace", ks, "show", "--workflow", workflow)
+		require.NoError(t, err)
+
+		var resp vtctldatapb.GetWorkflowsResponse
+		err = json2.UnmarshalPB([]byte(output), &resp)
+		require.NoError(t, err)
+		require.GreaterOrEqual(t, len(resp.Workflows), 1, "responce should have at least one workflow")
+		lag = resp.Workflows[0].MaxVReplicationTransactionLag
+		if lag == 0 {
+			return
+		}
+		select {
+		case <-timer.C:
+			require.FailNow(t, fmt.Sprintf("workflow %q did not eliminate VReplication lag before the timeout of %s; last seen MaxVReplicationTransactionLag: %d",
+				strings.Join([]string{ks, workflow}, "."), defaultTimeout, lag))
+		default:
+			time.Sleep(defaultTick)
+		}
+	}
 }

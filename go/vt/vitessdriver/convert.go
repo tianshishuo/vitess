@@ -21,27 +21,41 @@ import (
 	"fmt"
 	"time"
 
-	"vitess.io/vitess/go/vt/vtgate/evalengine"
-
 	"vitess.io/vitess/go/sqltypes"
 	querypb "vitess.io/vitess/go/vt/proto/query"
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vterrors"
 )
 
 type converter struct {
 	location *time.Location
 }
 
-func (cv *converter) ToNative(v sqltypes.Value) (interface{}, error) {
-	switch v.Type() {
-	case sqltypes.Datetime, sqltypes.Timestamp:
-		return DatetimeToNative(v, cv.location)
-	case sqltypes.Date:
-		return DateToNative(v, cv.location)
+func (cv *converter) ToNative(v sqltypes.Value) (any, error) {
+	var out any
+	var err error
+	switch {
+	case v.Type() == sqltypes.Null:
+		// no-op
+	case v.IsSigned():
+		return v.ToInt64()
+	case v.IsUnsigned():
+		return v.ToUint64()
+	case v.IsFloat():
+		return v.ToFloat64()
+	case v.Type() == sqltypes.Datetime, v.Type() == sqltypes.Timestamp:
+		return datetimeToNative(v, cv.location)
+	case v.Type() == sqltypes.Date:
+		return dateToNative(v, cv.location)
+	case v.IsQuoted() || v.Type() == sqltypes.Bit || v.Type() == sqltypes.Decimal:
+		out, err = v.ToBytes()
+	case v.Type() == sqltypes.Expression:
+		err = vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "%v cannot be converted to a go type", v)
 	}
-	return evalengine.ToNative(v)
+	return out, err
 }
 
-func (cv *converter) BuildBindVariable(v interface{}) (*querypb.BindVariable, error) {
+func (cv *converter) BuildBindVariable(v any) (*querypb.BindVariable, error) {
 	if t, ok := v.(time.Time); ok {
 		return sqltypes.ValueBindVariable(NewDatetime(t, cv.location)), nil
 	}
@@ -109,12 +123,16 @@ func (cv *converter) bindVarsFromNamedValues(args []driver.NamedValue) (map[stri
 	return bindVars, nil
 }
 
-func newConverter(cfg *Configuration) (c *converter, err error) {
-	c = &converter{
-		location: time.UTC,
+func newConverter(cfg *Configuration) (*converter, error) {
+	c := &converter{location: time.UTC}
+	if cfg.DefaultLocation == "" {
+		return c, nil
 	}
-	if cfg.DefaultLocation != "" {
-		c.location, err = time.LoadLocation(cfg.DefaultLocation)
+
+	loc, err := time.LoadLocation(cfg.DefaultLocation)
+	if err != nil {
+		return nil, err
 	}
-	return
+	c.location = loc
+	return c, nil
 }

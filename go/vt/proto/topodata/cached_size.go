@@ -27,10 +27,6 @@ func (cached *KeyRange) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(96)
 	}
-	// field unknownFields []byte
-	{
-		size += hack.RuntimeAllocSize(int64(cap(cached.unknownFields)))
-	}
 	// field Start []byte
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Start)))
@@ -39,5 +35,19 @@ func (cached *KeyRange) CachedSize(alloc bool) int64 {
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.End)))
 	}
+	return size
+}
+func (cached *ThrottledAppRule) CachedSize(alloc bool) int64 {
+	if cached == nil {
+		return int64(0)
+	}
+	size := int64(0)
+	if alloc {
+		size += int64(80)
+	}
+	// field Name string
+	size += hack.RuntimeAllocSize(int64(len(cached.Name)))
+	// field ExpiresAt *vitess.io/vitess/go/vt/proto/vttime.Time
+	size += cached.ExpiresAt.CachedSize(true)
 	return size
 }

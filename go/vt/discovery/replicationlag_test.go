@@ -19,6 +19,7 @@ package discovery
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"vitess.io/vitess/go/test/utils"
 
@@ -26,13 +27,26 @@ import (
 	"vitess.io/vitess/go/vt/topo"
 )
 
+func init() {
+	lowReplicationLag.Set(30 * time.Second)
+	highReplicationLagMinServing.Set(2 * time.Hour)
+	minNumTablets.Set(2)
+	legacyReplicationLagAlgorithm.Set(true)
+}
+
+// testSetLegacyReplicationLagAlgorithm is a test helper function, if this is used by a production code path, something is wrong.
+func testSetLegacyReplicationLagAlgorithm(newLegacy bool) {
+	legacyReplicationLagAlgorithm.Set(newLegacy)
+}
+
 // testSetMinNumTablets is a test helper function, if this is used by a production code path, something is wrong.
 func testSetMinNumTablets(newMin int) {
-	*minNumTablets = newMin
+	minNumTablets.Set(newMin)
 }
 
 func TestFilterByReplicationLagUnhealthy(t *testing.T) {
-	// 1 healthy serving tablet, 1 not healhty
+	defer utils.EnsureNoLeaks(t)
+	// 1 healthy serving tablet, 1 not healthy
 	ts1 := &TabletHealth{
 		Tablet:  topo.NewTablet(1, "cell", "host1"),
 		Serving: true,
@@ -49,6 +63,7 @@ func TestFilterByReplicationLagUnhealthy(t *testing.T) {
 }
 
 func TestFilterByReplicationLag(t *testing.T) {
+	defer utils.EnsureNoLeaks(t)
 	// Use simplified logic
 	testSetLegacyReplicationLagAlgorithm(false)
 
@@ -125,6 +140,7 @@ func TestFilterByReplicationLag(t *testing.T) {
 }
 
 func TestFilterByReplicationLagThreeTabletMin(t *testing.T) {
+	defer utils.EnsureNoLeaks(t)
 	// Use at least 3 tablets if possible
 	testSetMinNumTablets(3)
 	// lags of (1s, 1s, 10m, 11m) - returns at least32 items where the slightly delayed ones that are returned are the 10m and 11m ones.
@@ -181,6 +197,7 @@ func TestFilterByReplicationLagThreeTabletMin(t *testing.T) {
 }
 
 func TestFilterStatsByReplicationLagOneTabletMin(t *testing.T) {
+	defer utils.EnsureNoLeaks(t)
 	// Use at least 1 tablets if possible
 	testSetMinNumTablets(1)
 	// lags of (1s, 100m) - return only healthy tablet if that is all that is available.

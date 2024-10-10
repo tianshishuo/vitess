@@ -17,10 +17,13 @@ limitations under the License.
 package tabletserver
 
 import (
+	"context"
 	"testing"
 	"time"
 
-	"context"
+	"github.com/stretchr/testify/require"
+
+	"vitess.io/vitess/go/vt/sqlparser"
 )
 
 type testConn struct {
@@ -43,18 +46,20 @@ func (tc *testConn) IsKilled() bool {
 }
 
 func TestQueryList(t *testing.T) {
-	ql := NewQueryList("test")
+	ql := NewQueryList("test", sqlparser.NewTestParser())
 	connID := int64(1)
 	qd := NewQueryDetail(context.Background(), &testConn{id: connID})
-	ql.Add(qd)
+	err := ql.Add(qd)
+	require.NoError(t, err)
 
-	if qd1, ok := ql.queryDetails[connID]; !ok || qd1.connID != connID {
+	if qd1, ok := ql.queryDetails[connID]; !ok || qd1[0].connID != connID {
 		t.Errorf("failed to add to QueryList")
 	}
 
 	conn2ID := int64(2)
 	qd2 := NewQueryDetail(context.Background(), &testConn{id: conn2ID})
-	ql.Add(qd2)
+	err = ql.Add(qd2)
+	require.NoError(t, err)
 
 	rows := ql.AppendQueryzRows(nil)
 	if len(rows) != 2 || rows[0].ConnID != 1 || rows[1].ConnID != 2 {
@@ -65,4 +70,48 @@ func TestQueryList(t *testing.T) {
 	if _, ok := ql.queryDetails[connID]; ok {
 		t.Errorf("failed to remove from QueryList")
 	}
+}
+
+func TestQueryListChangeConnIDInMiddle(t *testing.T) {
+	ql := NewQueryList("test", sqlparser.NewTestParser())
+	connID := int64(1)
+	qd1 := NewQueryDetail(context.Background(), &testConn{id: connID})
+	err := ql.Add(qd1)
+	require.NoError(t, err)
+
+	conn := &testConn{id: connID}
+	qd2 := NewQueryDetail(context.Background(), conn)
+	err = ql.Add(qd2)
+	require.NoError(t, err)
+
+	require.Len(t, ql.queryDetails[1], 2)
+
+	// change the connID in the middle
+	conn.id = 2
+
+	// remove the same object.
+	ql.Remove(qd2)
+
+	require.Len(t, ql.queryDetails[1], 1)
+	require.Equal(t, qd1, ql.queryDetails[1][0])
+	require.NotEqual(t, qd2, ql.queryDetails[1][0])
+}
+
+func TestClusterAction(t *testing.T) {
+	ql := NewQueryList("test", sqlparser.NewTestParser())
+	connID := int64(1)
+	qd1 := NewQueryDetail(context.Background(), &testConn{id: connID})
+
+	ql.SetClusterAction(ClusterActionInProgress)
+	ql.SetClusterAction(ClusterActionNoQueries)
+	err := ql.Add(qd1)
+	require.ErrorContains(t, err, "operation not allowed in state SHUTTING_DOWN")
+
+	ql.SetClusterAction(ClusterActionNotInProgress)
+	err = ql.Add(qd1)
+	require.NoError(t, err)
+	// If the current state is not in progress, then setting no queries, shouldn't change anything.
+	ql.SetClusterAction(ClusterActionNoQueries)
+	err = ql.Add(qd1)
+	require.NoError(t, err)
 }

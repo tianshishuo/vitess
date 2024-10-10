@@ -24,9 +24,12 @@ import { DataTable } from '../dataTable/DataTable';
 import { ContentContainer } from '../layout/ContentContainer';
 import { WorkspaceHeader } from '../layout/WorkspaceHeader';
 import { WorkspaceTitle } from '../layout/WorkspaceTitle';
+import { QueryLoadingPlaceholder } from '../placeholders/QueryLoadingPlaceholder';
 
 export const Vtctlds = () => {
-    const { data: vtctlds = [], ...q } = useVtctlds();
+    const vtctldsQuery = useVtctlds();
+    const { data: vtctlds = [] } = vtctldsQuery;
+
     const { value: filter, updateValue: updateFilter } = useSyncedURLParam('filter');
 
     const data = useMemo(() => {
@@ -34,7 +37,6 @@ export const Vtctlds = () => {
             cluster: v.cluster?.name,
             clusterID: v.cluster?.id,
             hostname: v.hostname,
-            fqdn: v.FQDN,
         }));
 
         const filtered = filterNouns(filter, mapped);
@@ -47,15 +49,7 @@ export const Vtctlds = () => {
             return (
                 <tr key={row.hostname}>
                     <DataCell>
-                        <div className="font-bold">
-                            {row.fqdn ? (
-                                <a href={`//${row.fqdn}`} rel="noopener noreferrer" target="_blank">
-                                    {row.hostname}
-                                </a>
-                            ) : (
-                                row.hostname
-                            )}
-                        </div>
+                        <div className="font-bold">{row.hostname}</div>
                     </DataCell>
                     <DataCell>
                         {row.cluster}
@@ -81,9 +75,7 @@ export const Vtctlds = () => {
                     value={filter || ''}
                 />
                 <DataTable columns={['Hostname', 'Cluster']} data={data} renderRows={renderRows} />
-
-                {/* TODO skeleton placeholder */}
-                {!!q.isLoading && <div className="text-center">Loading</div>}
+                <QueryLoadingPlaceholder query={vtctldsQuery} />
             </ContentContainer>
         </div>
     );

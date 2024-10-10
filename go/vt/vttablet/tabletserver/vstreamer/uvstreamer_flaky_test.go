@@ -51,7 +51,9 @@ import (
 	"testing"
 	"time"
 
+	"vitess.io/vitess/go/mysql/collations"
 	"vitess.io/vitess/go/vt/dbconfigs"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/throttle/throttlerapp"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/proto/query"
@@ -67,13 +69,14 @@ const (
 	bulkInsertQuery  = "insert into %s (id%d1, id%d2) values "
 	insertQuery      = "insert into %s (id%d1, id%d2) values (%d, %d)"
 	numInitialRows   = 10
+	copyPhaseStart   = "Copy Start"
 )
 
-type state struct {
+type TestState struct {
 	tables []string
 }
 
-var testState = &state{}
+var testState = &TestState{}
 
 var positions map[string]string
 var allEvents []*binlogdatapb.VEvent
@@ -124,7 +127,7 @@ func TestVStreamCopyFilterValidations(t *testing.T) {
 			require.Error(t, uvs.init(), expectedError)
 			return
 		}
-		require.Equal(t, len(expected), len(uvs.plans))
+		require.Equalf(t, len(expected), len(uvs.plans), "Plans: %+v", uvs.plans)
 		for _, tableName := range expected {
 			require.True(t, uvs.plans[tableName].tablePK.TableName == tableName)
 			if tablePKs == nil {
@@ -152,7 +155,7 @@ func TestVStreamCopyFilterValidations(t *testing.T) {
 
 	tablePKs := []*binlogdatapb.TableLastPK{{
 		TableName: "t1",
-		Lastpk:    getQRFromLastPK([]*query.Field{{Name: "id11", Type: query.Type_INT32}}, []sqltypes.Value{sqltypes.NewInt32(10)}),
+		Lastpk:    getQRFromLastPK([]*query.Field{{Name: "id11", Type: query.Type_INT32, Charset: collations.CollationBinaryID, Flags: uint32(query.MySqlFlag_BINARY_FLAG | query.MySqlFlag_NUM_FLAG)}}, []sqltypes.Value{sqltypes.NewInt32(10)}),
 	}}
 	testCases = append(testCases, &TestCase{[]*binlogdatapb.Rule{{Match: "t1"}}, tablePKs, []string{"t1"}, ""})
 
@@ -171,7 +174,6 @@ func TestVStreamCopyCompleteFlow(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	engine.se.Reload(context.Background())
 
 	defer execStatements(t, []string{
 		"drop table t1",
@@ -182,6 +184,7 @@ func TestVStreamCopyCompleteFlow(t *testing.T) {
 	uvstreamerTestMode = true
 	defer func() { uvstreamerTestMode = false }()
 	initialize(t)
+
 	if err := engine.se.Reload(context.Background()); err != nil {
 		t.Fatal("Error reloading schema")
 	}
@@ -190,6 +193,12 @@ func TestVStreamCopyCompleteFlow(t *testing.T) {
 	var tablePKs []*binlogdatapb.TableLastPK
 	for i, table := range testState.tables {
 		rules = append(rules, getRule(table))
+
+		// for table t2, let tablepk be nil, so that we don't send events for the insert in initTables()
+		if table == "t2" {
+			continue
+		}
+
 		tablePKs = append(tablePKs, getTablePK(table, i+1))
 	}
 	filter := &binlogdatapb.Filter{
@@ -197,7 +206,7 @@ func TestVStreamCopyCompleteFlow(t *testing.T) {
 	}
 
 	// Test event called after t1 copy is complete
-	callbacks["OTHER.*Copy Start t2"] = func() {
+	callbacks[fmt.Sprintf("OTHER.*%s t2", copyPhaseStart)] = func() {
 		conn, err := env.Mysqld.GetDbaConnection(ctx)
 		require.NoError(t, err)
 		defer conn.Close()
@@ -211,7 +220,7 @@ func TestVStreamCopyCompleteFlow(t *testing.T) {
 
 	}
 
-	callbacks["OTHER.*Copy Start t3"] = func() {
+	callbacks[fmt.Sprintf("OTHER.*%s t3", copyPhaseStart)] = func() {
 		conn, err := env.Mysqld.GetDbaConnection(ctx)
 		require.NoError(t, err)
 		defer conn.Close()
@@ -226,30 +235,30 @@ func TestVStreamCopyCompleteFlow(t *testing.T) {
 
 	}
 
-	callbacks["OTHER.*Copy Done"] = func() {
+	callbacks["COPY_COMPLETED"] = func() {
 		log.Info("Copy done, inserting events to stream")
 		insertRow(t, "t1", 1, numInitialRows+4)
 		insertRow(t, "t2", 2, numInitialRows+3)
 		// savepoints should not be sent in the event stream
-		execStatement(t, `
-begin;
-insert into t3 (id31, id32) values (12, 360);
-savepoint a;
-insert into t3 (id31, id32) values (13, 390);
-rollback work to savepoint a;
-savepoint b;
-insert into t3 (id31, id32) values (13, 390);
-release savepoint b;
-commit;"
-`)
+		execStatements(t, []string{
+			"begin",
+			"insert into t3 (id31, id32) values (12, 360)",
+			"savepoint a",
+			"insert into t3 (id31, id32) values (13, 390)",
+			"rollback work to savepoint a",
+			"savepoint b",
+			"insert into t3 (id31, id32) values (13, 390)",
+			"release savepoint b",
+			"commit",
+		})
 	}
 
 	numCopyEvents := 3 /*t1,t2,t3*/ * (numInitialRows + 1 /*FieldEvent*/ + 1 /*LastPKEvent*/ + 1 /*TestEvent: Copy Start*/ + 2 /*begin,commit*/ + 3 /* LastPK Completed*/)
-	numCopyEvents += 2                                    /* GTID + Test event after all copy is done */
-	numCatchupEvents := 3 * 5                             /*2 t1, 1 t2 : BEGIN+FIELD+ROW+GTID+COMMIT*/
+	numCopyEvents += 2                                    /* GTID + Event after all copy is done */
+	numCatchupEvents := 3 * 5                             /* 2 t1, 1 t2 : BEGIN+FIELD+ROW+GTID+COMMIT */
 	numFastForwardEvents := 5                             /*t1:FIELD+ROW*/
 	numMisc := 1                                          /* t2 insert during t1 catchup that comes in t2 copy */
-	numReplicateEvents := 2*5 /* insert into t1/t2 */ + 8 /* begin/field/2 inserts/gtid/commit + 2 savepoints */
+	numReplicateEvents := 2*5 /* insert into t1/t2 */ + 6 /* begin/field/2 inserts/gtid/commit */
 	numExpectedEvents := numCopyEvents + numCatchupEvents + numFastForwardEvents + numMisc + numReplicateEvents
 
 	var lastRowEventSeen bool
@@ -289,18 +298,29 @@ commit;"
 }
 
 func validateReceivedEvents(t *testing.T) {
+	inCopyPhase := false
 	for i, ev := range allEvents {
 		ev.Timestamp = 0
-		if ev.Type == binlogdatapb.VEventType_FIELD {
+		switch ev.Type {
+		case binlogdatapb.VEventType_OTHER:
+			if strings.Contains(ev.Gtid, copyPhaseStart) {
+				inCopyPhase = true
+			}
+		case binlogdatapb.VEventType_FIELD:
 			for j := range ev.FieldEvent.Fields {
 				ev.FieldEvent.Fields[j].Flags = 0
 				ev.FieldEvent.Keyspace = ""
 				ev.FieldEvent.Shard = ""
+				// We always set this in the copy phase. In the
+				// running phase we only set it IF the table has
+				// an ENUM or SET column.
+				ev.FieldEvent.EnumSetStringValues = inCopyPhase
 			}
-		}
-		if ev.Type == binlogdatapb.VEventType_ROW {
+		case binlogdatapb.VEventType_ROW:
 			ev.RowEvent.Keyspace = ""
 			ev.RowEvent.Shard = ""
+		case binlogdatapb.VEventType_COPY_COMPLETED:
+			inCopyPhase = false
 		}
 		got := ev.String()
 		want := env.RemoveAnyDeprecatedDisplayWidths(expectedEvents[i])
@@ -313,9 +333,11 @@ func validateReceivedEvents(t *testing.T) {
 
 func resetMetrics(t *testing.T) {
 	engine.vstreamerEventsStreamed.Reset()
+	engine.vstreamerCompressedTransactionsDecoded.Reset()
 	engine.resultStreamerNumRows.Reset()
 	engine.rowStreamerNumRows.Reset()
 	engine.vstreamerPhaseTimings.Reset()
+	engine.rowStreamerWaits.Reset()
 }
 
 func validateMetrics(t *testing.T) {
@@ -325,6 +347,7 @@ func validateMetrics(t *testing.T) {
 	require.Equal(t, engine.vstreamerPhaseTimings.Counts()["VStreamerTest.copy"], int64(3))
 	require.Equal(t, engine.vstreamerPhaseTimings.Counts()["VStreamerTest.catchup"], int64(2))
 	require.Equal(t, engine.vstreamerPhaseTimings.Counts()["VStreamerTest.fastforward"], int64(2))
+	require.Equal(t, engine.rowStreamerWaits.Counts()["VStreamerTest.waitForMySQL"], int64(0))
 }
 
 func insertMultipleRows(t *testing.T, table string, idx int, numRows int) {
@@ -396,7 +419,7 @@ func getRule(table string) *binlogdatapb.Rule {
 }
 
 func getTablePK(table string, idx int) *binlogdatapb.TableLastPK {
-	fields := []*query.Field{{Name: fmt.Sprintf("id%d1", idx), Type: query.Type_INT32}}
+	fields := []*query.Field{{Name: fmt.Sprintf("id%d1", idx), Type: query.Type_INT32, Charset: collations.CollationBinaryID, Flags: uint32(query.MySqlFlag_BINARY_FLAG | query.MySqlFlag_NUM_FLAG)}}
 
 	lastPK := []sqltypes.Value{sqltypes.NewInt32(0)}
 	return &binlogdatapb.TableLastPK{
@@ -430,12 +453,18 @@ func getEventCallback(event *binlogdatapb.VEvent) func() {
 func startVStreamCopy(ctx context.Context, t *testing.T, filter *binlogdatapb.Filter, tablePKs []*binlogdatapb.TableLastPK) {
 	pos := ""
 	go func() {
-		err := engine.Stream(ctx, pos, tablePKs, filter, func(evs []*binlogdatapb.VEvent) error {
-			//t.Logf("Received events: %v", evs)
+		err := engine.Stream(ctx, pos, tablePKs, filter, throttlerapp.VStreamerName, func(evs []*binlogdatapb.VEvent) error {
+			// t.Logf("Received events: %v", evs)
 			muAllEvents.Lock()
 			defer muAllEvents.Unlock()
 			for _, ev := range evs {
 				if ev.Type == binlogdatapb.VEventType_HEARTBEAT {
+					continue
+				}
+				if ev.Type == binlogdatapb.VEventType_ROW {
+					ev.RowEvent.Flags = 0
+				}
+				if ev.Throttled {
 					continue
 				}
 				cb := getEventCallback(ev)
@@ -445,15 +474,15 @@ func startVStreamCopy(ctx context.Context, t *testing.T, filter *binlogdatapb.Fi
 				allEvents = append(allEvents, ev)
 			}
 			return nil
-		})
+		}, nil)
 		require.Nil(t, err)
 	}()
 }
 
 var expectedEvents = []string{
-	"type:OTHER gtid:\"Copy Start t1\"",
+	fmt.Sprintf("type:OTHER gtid:\"%s t1\"", copyPhaseStart),
 	"type:BEGIN",
-	"type:FIELD field_event:{table_name:\"t1\" fields:{name:\"id11\" type:INT32 table:\"t1\" org_table:\"t1\" database:\"vttest\" org_name:\"id11\" column_length:11 charset:63 column_type:\"int(11)\"} fields:{name:\"id12\" type:INT32 table:\"t1\" org_table:\"t1\" database:\"vttest\" org_name:\"id12\" column_length:11 charset:63 column_type:\"int(11)\"}}",
+	"type:FIELD field_event:{table_name:\"t1\" fields:{name:\"id11\" type:INT32 table:\"t1\" org_table:\"t1\" database:\"vttest\" org_name:\"id11\" column_length:11 charset:63 column_type:\"int(11)\"} fields:{name:\"id12\" type:INT32 table:\"t1\" org_table:\"t1\" database:\"vttest\" org_name:\"id12\" column_length:11 charset:63 column_type:\"int(11)\"} enum_set_string_values:true}",
 	"type:GTID",
 	"type:ROW row_event:{table_name:\"t1\" row_changes:{after:{lengths:1 lengths:2 values:\"110\"}}}",
 	"type:ROW row_event:{table_name:\"t1\" row_changes:{after:{lengths:1 lengths:2 values:\"220\"}}}",
@@ -465,24 +494,24 @@ var expectedEvents = []string{
 	"type:ROW row_event:{table_name:\"t1\" row_changes:{after:{lengths:1 lengths:2 values:\"880\"}}}",
 	"type:ROW row_event:{table_name:\"t1\" row_changes:{after:{lengths:1 lengths:2 values:\"990\"}}}",
 	"type:ROW row_event:{table_name:\"t1\" row_changes:{after:{lengths:2 lengths:3 values:\"10100\"}}}",
-	"type:LASTPK last_p_k_event:{table_last_p_k:{table_name:\"t1\" lastpk:{rows:{lengths:2 values:\"10\"}}}}",
+	"type:LASTPK last_p_k_event:{table_last_p_k:{table_name:\"t1\" lastpk:{fields:{name:\"id11\" type:INT32 charset:63 flags:53251} rows:{lengths:2 values:\"10\"}}}}",
 	"type:COMMIT",
 	"type:BEGIN",
 	"type:LASTPK last_p_k_event:{table_last_p_k:{table_name:\"t1\"} completed:true}",
 	"type:COMMIT",
 	"type:BEGIN",
-	"type:FIELD field_event:{table_name:\"t1\" fields:{name:\"id11\" type:INT32 table:\"t1\" org_table:\"t1\" database:\"vttest\" org_name:\"id11\" column_length:11 charset:63 column_type:\"int(11)\"} fields:{name:\"id12\" type:INT32 table:\"t1\" org_table:\"t1\" database:\"vttest\" org_name:\"id12\" column_length:11 charset:63 column_type:\"int(11)\"}}",
+	"type:FIELD field_event:{table_name:\"t1\" fields:{name:\"id11\" type:INT32 table:\"t1\" org_table:\"t1\" database:\"vttest\" org_name:\"id11\" column_length:11 charset:63 column_type:\"int(11)\"} fields:{name:\"id12\" type:INT32 table:\"t1\" org_table:\"t1\" database:\"vttest\" org_name:\"id12\" column_length:11 charset:63 column_type:\"int(11)\"} enum_set_string_values:true}",
 	"type:ROW row_event:{table_name:\"t1\" row_changes:{after:{lengths:2 lengths:3 values:\"11110\"}}}",
 	"type:GTID",
-	"type:COMMIT", //insert for t2 done along with t1 does not generate an event since t2 is not yet copied
-	"type:OTHER gtid:\"Copy Start t2\"",
+	"type:COMMIT", // insert for t2 done along with t1 does not generate an event since t2 is not yet copied
+	fmt.Sprintf("type:OTHER gtid:\"%s t2\"", copyPhaseStart),
 	"type:BEGIN",
-	"type:FIELD field_event:{table_name:\"t1\" fields:{name:\"id11\" type:INT32 table:\"t1\" org_table:\"t1\" database:\"vttest\" org_name:\"id11\" column_length:11 charset:63 column_type:\"int(11)\"} fields:{name:\"id12\" type:INT32 table:\"t1\" org_table:\"t1\" database:\"vttest\" org_name:\"id12\" column_length:11 charset:63 column_type:\"int(11)\"}}",
+	"type:FIELD field_event:{table_name:\"t1\" fields:{name:\"id11\" type:INT32 table:\"t1\" org_table:\"t1\" database:\"vttest\" org_name:\"id11\" column_length:11 charset:63 column_type:\"int(11)\"} fields:{name:\"id12\" type:INT32 table:\"t1\" org_table:\"t1\" database:\"vttest\" org_name:\"id12\" column_length:11 charset:63 column_type:\"int(11)\"} enum_set_string_values:true}",
 	"type:ROW row_event:{table_name:\"t1\" row_changes:{after:{lengths:2 lengths:3 values:\"12120\"}}}",
 	"type:GTID",
 	"type:COMMIT",
 	"type:BEGIN",
-	"type:FIELD field_event:{table_name:\"t2\" fields:{name:\"id21\" type:INT32 table:\"t2\" org_table:\"t2\" database:\"vttest\" org_name:\"id21\" column_length:11 charset:63 column_type:\"int(11)\"} fields:{name:\"id22\" type:INT32 table:\"t2\" org_table:\"t2\" database:\"vttest\" org_name:\"id22\" column_length:11 charset:63 column_type:\"int(11)\"}}",
+	"type:FIELD field_event:{table_name:\"t2\" fields:{name:\"id21\" type:INT32 table:\"t2\" org_table:\"t2\" database:\"vttest\" org_name:\"id21\" column_length:11 charset:63 column_type:\"int(11)\"} fields:{name:\"id22\" type:INT32 table:\"t2\" org_table:\"t2\" database:\"vttest\" org_name:\"id22\" column_length:11 charset:63 column_type:\"int(11)\"} enum_set_string_values:true}",
 	"type:ROW row_event:{table_name:\"t2\" row_changes:{after:{lengths:1 lengths:2 values:\"120\"}}}",
 	"type:ROW row_event:{table_name:\"t2\" row_changes:{after:{lengths:1 lengths:2 values:\"240\"}}}",
 	"type:ROW row_event:{table_name:\"t2\" row_changes:{after:{lengths:1 lengths:2 values:\"360\"}}}",
@@ -494,24 +523,24 @@ var expectedEvents = []string{
 	"type:ROW row_event:{table_name:\"t2\" row_changes:{after:{lengths:1 lengths:3 values:\"9180\"}}}",
 	"type:ROW row_event:{table_name:\"t2\" row_changes:{after:{lengths:2 lengths:3 values:\"10200\"}}}",
 	"type:ROW row_event:{table_name:\"t2\" row_changes:{after:{lengths:2 lengths:3 values:\"11220\"}}}",
-	"type:LASTPK last_p_k_event:{table_last_p_k:{table_name:\"t2\" lastpk:{rows:{lengths:2 values:\"11\"}}}}",
+	"type:LASTPK last_p_k_event:{table_last_p_k:{table_name:\"t2\" lastpk:{fields:{name:\"id21\" type:INT32 charset:63 flags:53251} rows:{lengths:2 values:\"11\"}}}}",
 	"type:COMMIT",
 	"type:BEGIN",
 	"type:LASTPK last_p_k_event:{table_last_p_k:{table_name:\"t2\"} completed:true}",
 	"type:COMMIT",
-	"type:OTHER gtid:\"Copy Start t3\"",
+	fmt.Sprintf("type:OTHER gtid:\"%s t3\"", copyPhaseStart),
 	"type:BEGIN",
-	"type:FIELD field_event:{table_name:\"t1\" fields:{name:\"id11\" type:INT32 table:\"t1\" org_table:\"t1\" database:\"vttest\" org_name:\"id11\" column_length:11 charset:63 column_type:\"int(11)\"} fields:{name:\"id12\" type:INT32 table:\"t1\" org_table:\"t1\" database:\"vttest\" org_name:\"id12\" column_length:11 charset:63 column_type:\"int(11)\"}}",
+	"type:FIELD field_event:{table_name:\"t1\" fields:{name:\"id11\" type:INT32 table:\"t1\" org_table:\"t1\" database:\"vttest\" org_name:\"id11\" column_length:11 charset:63 column_type:\"int(11)\"} fields:{name:\"id12\" type:INT32 table:\"t1\" org_table:\"t1\" database:\"vttest\" org_name:\"id12\" column_length:11 charset:63 column_type:\"int(11)\"} enum_set_string_values:true}",
 	"type:ROW row_event:{table_name:\"t1\" row_changes:{after:{lengths:2 lengths:3 values:\"13130\"}}}",
 	"type:GTID",
 	"type:COMMIT",
 	"type:BEGIN",
-	"type:FIELD field_event:{table_name:\"t2\" fields:{name:\"id21\" type:INT32 table:\"t2\" org_table:\"t2\" database:\"vttest\" org_name:\"id21\" column_length:11 charset:63 column_type:\"int(11)\"} fields:{name:\"id22\" type:INT32 table:\"t2\" org_table:\"t2\" database:\"vttest\" org_name:\"id22\" column_length:11 charset:63 column_type:\"int(11)\"}}",
+	"type:FIELD field_event:{table_name:\"t2\" fields:{name:\"id21\" type:INT32 table:\"t2\" org_table:\"t2\" database:\"vttest\" org_name:\"id21\" column_length:11 charset:63 column_type:\"int(11)\"} fields:{name:\"id22\" type:INT32 table:\"t2\" org_table:\"t2\" database:\"vttest\" org_name:\"id22\" column_length:11 charset:63 column_type:\"int(11)\"} enum_set_string_values:true}",
 	"type:ROW row_event:{table_name:\"t2\" row_changes:{after:{lengths:2 lengths:3 values:\"12240\"}}}",
 	"type:GTID",
 	"type:COMMIT",
 	"type:BEGIN",
-	"type:FIELD field_event:{table_name:\"t3\" fields:{name:\"id31\" type:INT32 table:\"t3\" org_table:\"t3\" database:\"vttest\" org_name:\"id31\" column_length:11 charset:63 column_type:\"int(11)\"} fields:{name:\"id32\" type:INT32 table:\"t3\" org_table:\"t3\" database:\"vttest\" org_name:\"id32\" column_length:11 charset:63 column_type:\"int(11)\"}}",
+	"type:FIELD field_event:{table_name:\"t3\" fields:{name:\"id31\" type:INT32 table:\"t3\" org_table:\"t3\" database:\"vttest\" org_name:\"id31\" column_length:11 charset:63 column_type:\"int(11)\"} fields:{name:\"id32\" type:INT32 table:\"t3\" org_table:\"t3\" database:\"vttest\" org_name:\"id32\" column_length:11 charset:63 column_type:\"int(11)\"} enum_set_string_values:true}",
 	"type:ROW row_event:{table_name:\"t3\" row_changes:{after:{lengths:1 lengths:2 values:\"130\"}}}",
 	"type:ROW row_event:{table_name:\"t3\" row_changes:{after:{lengths:1 lengths:2 values:\"260\"}}}",
 	"type:ROW row_event:{table_name:\"t3\" row_changes:{after:{lengths:1 lengths:2 values:\"390\"}}}",
@@ -522,12 +551,12 @@ var expectedEvents = []string{
 	"type:ROW row_event:{table_name:\"t3\" row_changes:{after:{lengths:1 lengths:3 values:\"8240\"}}}",
 	"type:ROW row_event:{table_name:\"t3\" row_changes:{after:{lengths:1 lengths:3 values:\"9270\"}}}",
 	"type:ROW row_event:{table_name:\"t3\" row_changes:{after:{lengths:2 lengths:3 values:\"10300\"}}}",
-	"type:LASTPK last_p_k_event:{table_last_p_k:{table_name:\"t3\" lastpk:{rows:{lengths:2 values:\"10\"}}}}",
+	"type:LASTPK last_p_k_event:{table_last_p_k:{table_name:\"t3\" lastpk:{fields:{name:\"id31\" type:INT32 charset:63 flags:53251} rows:{lengths:2 values:\"10\"}}}}",
 	"type:COMMIT",
 	"type:BEGIN",
 	"type:LASTPK last_p_k_event:{table_last_p_k:{table_name:\"t3\"} completed:true}",
 	"type:COMMIT",
-	"type:OTHER gtid:\"Copy Done\"",
+	"type:COPY_COMPLETED",
 	"type:BEGIN",
 	"type:FIELD field_event:{table_name:\"t1\" fields:{name:\"id11\" type:INT32 table:\"t1\" org_table:\"t1\" database:\"vttest\" org_name:\"id11\" column_length:11 charset:63 column_type:\"int(11)\"} fields:{name:\"id12\" type:INT32 table:\"t1\" org_table:\"t1\" database:\"vttest\" org_name:\"id12\" column_length:11 charset:63 column_type:\"int(11)\"}}",
 	"type:ROW row_event:{table_name:\"t1\" row_changes:{after:{lengths:2 lengths:3 values:\"14140\"}}}",
@@ -541,8 +570,6 @@ var expectedEvents = []string{
 	"type:BEGIN",
 	"type:FIELD field_event:{table_name:\"t3\" fields:{name:\"id31\" type:INT32 table:\"t3\" org_table:\"t3\" database:\"vttest\" org_name:\"id31\" column_length:11 charset:63 column_type:\"int(11)\"} fields:{name:\"id32\" type:INT32 table:\"t3\" org_table:\"t3\" database:\"vttest\" org_name:\"id32\" column_length:11 charset:63 column_type:\"int(11)\"}}",
 	"type:ROW row_event:{table_name:\"t3\" row_changes:{after:{lengths:2 lengths:3 values:\"12360\"}}}",
-	"type:SAVEPOINT statement:\"SAVEPOINT `a`\"",
-	"type:SAVEPOINT statement:\"SAVEPOINT `b`\"",
 	"type:ROW row_event:{table_name:\"t3\" row_changes:{after:{lengths:2 lengths:3 values:\"13390\"}}}",
 	"type:GTID",
 	"type:COMMIT",

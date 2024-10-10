@@ -17,27 +17,26 @@ limitations under the License.
 package wrangler
 
 import (
+	"context"
 	"fmt"
 	"regexp"
-	"runtime/debug"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
-	"vitess.io/vitess/go/vt/key"
-
-	"context"
-
 	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/key"
 	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/topo/memorytopo"
+	"vitess.io/vitess/go/vt/vtenv"
+	"vitess.io/vitess/go/vt/vttablet/tmclient"
+
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
-	"vitess.io/vitess/go/vt/topo"
-	"vitess.io/vitess/go/vt/topo/memorytopo"
-	"vitess.io/vitess/go/vt/vttablet/tmclient"
 )
 
 type testResharderEnv struct {
@@ -51,10 +50,6 @@ type testResharderEnv struct {
 	cell     string
 	tmc      *testResharderTMClient
 }
-
-var (
-	testMode = "" //"debug"
-)
 
 //----------------------------------------------
 // testResharderEnv
@@ -88,18 +83,18 @@ func initTopo(t *testing.T, topo *topo.Server, keyspace string, sources, targets
 	topo.ValidateSrvKeyspace(ctx, keyspace, strings.Join(cells, ","))
 }
 
-func newTestResharderEnv(t *testing.T, sources, targets []string) *testResharderEnv {
+func newTestResharderEnv(t *testing.T, ctx context.Context, sources, targets []string) *testResharderEnv {
 	env := &testResharderEnv{
 		keyspace: "ks",
 		workflow: "resharderTest",
 		sources:  sources,
 		targets:  targets,
 		tablets:  make(map[int]*topodatapb.Tablet),
-		topoServ: memorytopo.NewServer("cell"),
+		topoServ: memorytopo.NewServer(ctx, "cell"),
 		cell:     "cell",
 		tmc:      newTestResharderTMClient(),
 	}
-	env.wr = New(logutil.NewConsoleLogger(), env.topoServ, env.tmc)
+	env.wr = New(vtenv.NewTestEnv(), logutil.NewConsoleLogger(), env.topoServ, env.tmc)
 	initTopo(t, env.topoServ, "ks", sources, targets, []string{"cell"})
 	tabletID := 100
 	for _, shard := range sources {
@@ -201,7 +196,7 @@ func newTestResharderTMClient() *testResharderTMClient {
 	}
 }
 
-func (tmc *testResharderTMClient) GetSchema(ctx context.Context, tablet *topodatapb.Tablet, tables, excludeTables []string, includeViews bool) (*tabletmanagerdatapb.SchemaDefinition, error) {
+func (tmc *testResharderTMClient) GetSchema(ctx context.Context, tablet *topodatapb.Tablet, request *tabletmanagerdatapb.GetSchemaRequest) (*tabletmanagerdatapb.SchemaDefinition, error) {
 	return tmc.schema, nil
 }
 
@@ -218,14 +213,8 @@ func (tmc *testResharderTMClient) expectVRQuery(tabletID int, query string, resu
 func (tmc *testResharderTMClient) VReplicationExec(ctx context.Context, tablet *topodatapb.Tablet, query string) (*querypb.QueryResult, error) {
 	tmc.mu.Lock()
 	defer tmc.mu.Unlock()
-	if testMode == "debug" {
-		fmt.Printf("Got: %d:%s\n", tablet.Alias.Uid, query)
-	}
 	qrs := tmc.vrQueries[int(tablet.Alias.Uid)]
 	if len(qrs) == 0 {
-		if testMode == "debug" {
-			fmt.Printf("Want: %d:%s, Stack:\n%v\n", tablet.Alias.Uid, query, debug.Stack())
-		}
 		return nil, fmt.Errorf("tablet %v does not expect any more queries: %s", tablet, query)
 	}
 	matched := false
@@ -241,9 +230,9 @@ func (tmc *testResharderTMClient) VReplicationExec(ctx context.Context, tablet *
 	return qrs[0].result, nil
 }
 
-func (tmc *testResharderTMClient) ExecuteFetchAsDba(ctx context.Context, tablet *topodatapb.Tablet, usePool bool, query []byte, maxRows int, disableBinlogs, reloadSchema bool) (*querypb.QueryResult, error) {
+func (tmc *testResharderTMClient) ExecuteFetchAsDba(ctx context.Context, tablet *topodatapb.Tablet, usePool bool, req *tabletmanagerdatapb.ExecuteFetchAsDbaRequest) (*querypb.QueryResult, error) {
 	// Reuse VReplicationExec
-	return tmc.VReplicationExec(ctx, tablet, string(query))
+	return tmc.VReplicationExec(ctx, tablet, string(req.Query))
 }
 
 func (tmc *testResharderTMClient) verifyQueries(t *testing.T) {

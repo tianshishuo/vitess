@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"vitess.io/vitess/go/test/utils"
+	"vitess.io/vitess/go/vt/vtenv"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -17,6 +18,7 @@ import (
 	"vitess.io/vitess/go/vt/vtctl"
 	"vitess.io/vitess/go/vt/vtctl/grpcvtctldserver/testutil"
 	"vitess.io/vitess/go/vt/vttablet/tmclient"
+	"vitess.io/vitess/go/vt/vttablet/tmclienttest"
 	"vitess.io/vitess/go/vt/wrangler"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
@@ -25,9 +27,10 @@ import (
 )
 
 func TestGetSchema(t *testing.T) {
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	topo := memorytopo.NewServer("zone1", "zone2", "zone3")
+	topo := memorytopo.NewServer(ctx, "zone1", "zone2", "zone3")
 
 	tablet := &topodatapb.Tablet{
 		Alias: &topodatapb.TabletAlias{
@@ -155,11 +158,11 @@ func TestGetSchema(t *testing.T) {
 	tmclient.RegisterTabletManagerClientFactory(t.Name(), func() tmclient.TabletManagerClient {
 		return &tmc
 	})
-	*tmclient.TabletManagerProtocol = t.Name()
+	tmclienttest.SetProtocol("go.vt.vtctl.endtoend", t.Name())
 
 	logger := logutil.NewMemoryLogger()
 
-	err := vtctl.RunCommand(ctx, wrangler.New(logger, topo, &tmc), []string{
+	err := vtctl.RunCommand(ctx, wrangler.New(vtenv.NewTestEnv(), logger, topo, &tmc), []string{
 		"GetSchema",
 		topoproto.TabletAliasString(tablet.Alias),
 	})
@@ -170,13 +173,13 @@ func TestGetSchema(t *testing.T) {
 	val := events[0].Value
 
 	actual := &tabletmanagerdatapb.SchemaDefinition{}
-	err = json2.Unmarshal([]byte(val), actual)
+	err = json2.UnmarshalPB([]byte(val), actual)
 	require.NoError(t, err)
 
 	utils.MustMatch(t, sd, actual)
 
 	// reset for the next invocation, where we verify that passing
-	// -table_sizes_only does not include the create table statement or columns.
+	// --table_sizes_only does not include the create table statement or columns.
 	logger.Events = nil
 	sd = &tabletmanagerdatapb.SchemaDefinition{
 		TableDefinitions: []*tabletmanagerdatapb.TableDefinition{
@@ -199,9 +202,9 @@ func TestGetSchema(t *testing.T) {
 		},
 	}
 
-	err = vtctl.RunCommand(ctx, wrangler.New(logger, topo, &tmc), []string{
+	err = vtctl.RunCommand(ctx, wrangler.New(vtenv.NewTestEnv(), logger, topo, &tmc), []string{
 		"GetSchema",
-		"-table_sizes_only",
+		"--table_sizes_only",
 		topoproto.TabletAliasString(tablet.Alias),
 	})
 	require.NoError(t, err)
@@ -211,7 +214,7 @@ func TestGetSchema(t *testing.T) {
 	val = events[0].Value
 
 	actual = &tabletmanagerdatapb.SchemaDefinition{}
-	err = json2.Unmarshal([]byte(val), actual)
+	err = json2.UnmarshalPB([]byte(val), actual)
 	require.NoError(t, err)
 
 	utils.MustMatch(t, sd, actual)

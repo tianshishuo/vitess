@@ -77,10 +77,10 @@ func execUpdate(f *fuzz.ConsumeFuzzer) {
 		return
 	}
 	vc := &loggingVCursor{}
-	_, _ = upd.TryExecute(vc, map[string]*querypb.BindVariable{}, false)
+	_, _ = upd.TryExecute(ctx, vc, map[string]*querypb.BindVariable{}, false)
 }
 
-// execUpdate implements a wrapper to fuzz Insert.Tryexecute()
+// execInsert implements a wrapper to fuzz Insert.Tryexecute()
 func execInsert(f *fuzz.ConsumeFuzzer) {
 	ins := &Insert{}
 	err := f.GenerateStruct(ins)
@@ -88,10 +88,10 @@ func execInsert(f *fuzz.ConsumeFuzzer) {
 		return
 	}
 	vc := &loggingVCursor{}
-	_, _ = ins.TryExecute(vc, map[string]*querypb.BindVariable{}, false)
+	_, _ = ins.TryExecute(ctx, vc, map[string]*querypb.BindVariable{}, false)
 }
 
-// execUpdate implements a wrapper to fuzz Route.Tryexecute()
+// execRoute implements a wrapper to fuzz Route.Tryexecute()
 func execRoute(f *fuzz.ConsumeFuzzer) {
 	sel := &Route{}
 	err := f.GenerateStruct(sel)
@@ -99,7 +99,7 @@ func execRoute(f *fuzz.ConsumeFuzzer) {
 		return
 	}
 	vc := newFuzzDMLTestVCursor("0")
-	_, _ = sel.TryExecute(vc, map[string]*querypb.BindVariable{}, false)
+	_, _ = sel.TryExecute(ctx, vc, map[string]*querypb.BindVariable{}, false)
 }
 
 func newFuzzDMLTestVCursor(shards ...string) *loggingVCursor {

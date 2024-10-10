@@ -17,13 +17,11 @@ limitations under the License.
 package servenv
 
 import (
-	"bytes"
 	"fmt"
-	"html"
-	"html/template"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -31,6 +29,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/safehtml"
+	"github.com/google/safehtml/template"
+	"github.com/google/safehtml/template/uncheckedconversions"
 
 	"vitess.io/vitess/go/acl"
 	"vitess.io/vitess/go/vt/log"
@@ -42,7 +44,7 @@ import (
 // /debug/status request. fragment is parsed and executed with the
 // html/template package. Functions registered with AddStatusFuncs
 // may be used in the template.
-func AddStatusPart(banner, fragment string, f func() interface{}) {
+func AddStatusPart(banner, fragment string, f func() any) {
 	globalStatus.addStatusPart(banner, fragment, f)
 }
 
@@ -104,6 +106,32 @@ text-align: right;
 
 <h1>Status for {{.BinaryName}}</h1>
 
+<script>
+function refreshTablesHaveClassRefreshRequired() {
+  var xhr = new XMLHttpRequest();
+  xhr.open("GET", "/debug/status", true);
+  xhr.onreadystatechange = function() {
+    if (this.readyState === XMLHttpRequest.DONE && this.status === 200) {
+  	  var data = this.responseText;
+  	  var parser = new DOMParser();
+  	  var htmlDoc = parser.parseFromString(data, "text/html");
+  	  var tables = document.getElementsByClassName("refreshRequired");
+  	  var counter = 0;
+  	  for (var i = 0; i < tables.length; i++) {
+  	    var newTable = htmlDoc.querySelectorAll("table.refreshRequired")[counter];
+  	    if (newTable) {
+  	  	tables[i].innerHTML = newTable.innerHTML;
+  	    }
+  	    counter++;
+  	  }
+    }
+  };
+  xhr.send();
+}
+if (` + strconv.Itoa(tableRefreshInterval) + ` !== 0) {
+	setInterval(refreshTablesHaveClassRefreshRequired, ` + strconv.Itoa(tableRefreshInterval) + `);
+}
+</script>
 <div>
 <div class=lefthand>
 Started: {{.StartTime}}<br>
@@ -130,7 +158,7 @@ type statusPage struct {
 type section struct {
 	Banner   string
 	Fragment string
-	F        func() interface{}
+	F        func() any
 }
 
 func newStatusPage(name string) *statusPage {
@@ -139,12 +167,13 @@ func newStatusPage(name string) *statusPage {
 	}
 	sp.tmpl = template.Must(sp.reparse(nil))
 	if name == "" {
-		http.HandleFunc(StatusURLPath(), sp.statusHandler)
+		HTTPHandleFunc(StatusURLPath(), sp.statusHandler)
 		// Debug profiles are only supported for the top level status page.
 		registerDebugBlockProfileRate()
 		registerDebugMutexProfileFraction()
 	} else {
-		http.HandleFunc("/"+name+StatusURLPath(), sp.statusHandler)
+		pat, _ := url.JoinPath("/", name, StatusURLPath())
+		HTTPHandleFunc(pat, sp.statusHandler)
 	}
 	return sp
 }
@@ -173,7 +202,7 @@ func (sp *statusPage) addStatusFuncs(fmap template.FuncMap) {
 	}
 }
 
-func (sp *statusPage) addStatusPart(banner, fragment string, f func() interface{}) {
+func (sp *statusPage) addStatusPart(banner, fragment string, f func() any) {
 	sp.mu.Lock()
 	defer sp.mu.Unlock()
 
@@ -189,7 +218,7 @@ func (sp *statusPage) addStatusPart(banner, fragment string, f func() interface{
 		secs[len(secs)-1] = section{
 			Banner:   banner,
 			Fragment: "<code>bad status template: {{.}}</code>",
-			F:        func() interface{} { return err },
+			F:        func() any { return err },
 		}
 	}
 	sp.tmpl, _ = sp.reparse(secs)
@@ -197,7 +226,7 @@ func (sp *statusPage) addStatusPart(banner, fragment string, f func() interface{
 }
 
 func (sp *statusPage) addStatusSection(banner string, f func() string) {
-	sp.addStatusPart(banner, `{{.}}`, func() interface{} { return f() })
+	sp.addStatusPart(banner, `{{.}}`, func() any { return f() })
 }
 
 func (sp *statusPage) statusHandler(w http.ResponseWriter, r *http.Request) {
@@ -228,13 +257,13 @@ func (sp *statusPage) statusHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (sp *statusPage) reparse(sections []section) (*template.Template, error) {
-	var buf bytes.Buffer
+	var buf strings.Builder
 
 	io.WriteString(&buf, `{{define "status"}}`)
 	io.WriteString(&buf, statusHTML)
 
 	for i, sec := range sections {
-		fmt.Fprintf(&buf, "<h1>%s</h1>\n", html.EscapeString(sec.Banner))
+		fmt.Fprintf(&buf, "<h1>%s</h1>\n", safehtml.HTMLEscaped(sec.Banner))
 		fmt.Fprintf(&buf, "{{$sec := index .Sections %d}}\n", i)
 		fmt.Fprintf(&buf, `{{template "sec-%d" call $sec.F}}`+"\n", i)
 	}
@@ -244,18 +273,18 @@ func (sp *statusPage) reparse(sections []section) (*template.Template, error) {
 	for i, sec := range sections {
 		fmt.Fprintf(&buf, `{{define "sec-%d"}}%s{{end}}\n`, i, sec.Fragment)
 	}
-	return template.New("").Funcs(sp.funcMap).Parse(buf.String())
+	return template.New("").Funcs(sp.funcMap).ParseFromTrustedTemplate(uncheckedconversions.TrustedTemplateFromStringKnownToSatisfyTypeContract(buf.String()))
 }
 
 // Toggle the block profile rate to/from 100%, unless specific rate is passed in
 func registerDebugBlockProfileRate() {
-	http.HandleFunc("/debug/blockprofilerate", func(w http.ResponseWriter, r *http.Request) {
+	HTTPHandleFunc("/debug/blockprofilerate", func(w http.ResponseWriter, r *http.Request) {
 		if err := acl.CheckAccessHTTP(r, acl.DEBUGGING); err != nil {
 			acl.SendError(w, err)
 			return
 		}
 
-		rate, err := strconv.ParseInt(r.FormValue("rate"), 10, 32)
+		rate, err := strconv.Atoi(r.FormValue("rate"))
 		message := "block profiling enabled"
 		if rate < 0 || err != nil {
 			// We can't get the current profiling rate
@@ -269,24 +298,24 @@ func registerDebugBlockProfileRate() {
 		} else {
 			message = fmt.Sprintf("Block profiling rate set to %d", rate)
 		}
-		blockProfileRate = int(rate)
-		runtime.SetBlockProfileRate(int(rate))
+		blockProfileRate = rate
+		runtime.SetBlockProfileRate(rate)
 		log.Infof("Set block profile rate to: %d", rate)
 		w.Header().Set("Content-Type", "text/plain")
-		w.Write([]byte(message))
+		io.WriteString(w, message)
 	})
 }
 
 // Toggle the mutex profiling fraction to/from 100%, unless specific fraction is passed in
 func registerDebugMutexProfileFraction() {
-	http.HandleFunc("/debug/mutexprofilefraction", func(w http.ResponseWriter, r *http.Request) {
+	HTTPHandleFunc("/debug/mutexprofilefraction", func(w http.ResponseWriter, r *http.Request) {
 		if err := acl.CheckAccessHTTP(r, acl.DEBUGGING); err != nil {
 			acl.SendError(w, err)
 			return
 		}
 
 		currentFraction := runtime.SetMutexProfileFraction(-1)
-		fraction, err := strconv.ParseInt(r.FormValue("fraction"), 10, 32)
+		fraction, err := strconv.Atoi(r.FormValue("fraction"))
 		message := "mutex profiling enabled"
 		if fraction < 0 || err != nil {
 			if currentFraction == 0 {
@@ -298,10 +327,10 @@ func registerDebugMutexProfileFraction() {
 		} else {
 			message = fmt.Sprintf("Mutex profiling set to fraction %d", fraction)
 		}
-		runtime.SetMutexProfileFraction(int(fraction))
+		runtime.SetMutexProfileFraction(fraction)
 		log.Infof("Set mutex profiling fraction to: %d", fraction)
 		w.Header().Set("Content-Type", "text/plain")
-		w.Write([]byte(message))
+		io.WriteString(w, message)
 	})
 }
 

@@ -19,6 +19,8 @@ package mysql
 import (
 	"encoding/binary"
 	"fmt"
+
+	"vitess.io/vitess/go/mysql/replication"
 )
 
 // filePosBinlogEvent wraps a raw packet buffer and provides methods to examine
@@ -38,7 +40,7 @@ func newFilePosBinlogEvent(buf []byte) *filePosBinlogEvent {
 	return &filePosBinlogEvent{binlogEvent: binlogEvent(buf)}
 }
 
-func (*filePosBinlogEvent) GTID(BinlogFormat) (GTID, bool, error) {
+func (*filePosBinlogEvent) GTID(BinlogFormat) (replication.GTID, bool, error) {
 	return nil, false, nil
 }
 
@@ -51,8 +53,8 @@ func (*filePosBinlogEvent) IsGTID() bool {
 	return false
 }
 
-func (*filePosBinlogEvent) PreviousGTIDs(BinlogFormat) (Position, error) {
-	return Position{}, fmt.Errorf("filePos should not provide PREVIOUS_GTIDS_EVENT events")
+func (*filePosBinlogEvent) PreviousGTIDs(BinlogFormat) (replication.Position, error) {
+	return replication.Position{}, fmt.Errorf("filePos should not provide PREVIOUS_GTIDS_EVENT events")
 }
 
 // StripChecksum implements BinlogEvent.StripChecksum().
@@ -73,20 +75,21 @@ func (ev *filePosBinlogEvent) StripChecksum(f BinlogFormat) (BinlogEvent, []byte
 
 // nextPosition returns the next file position of the binlog.
 // If no information is available, it returns 0.
-func (ev *filePosBinlogEvent) nextPosition(f BinlogFormat) int {
+func (ev *filePosBinlogEvent) nextPosition(f BinlogFormat) uint32 {
 	if f.HeaderLength <= 13 {
 		// Dead code. This is just a failsafe.
 		return 0
 	}
-	return int(binary.LittleEndian.Uint32(ev.Bytes()[13:17]))
+	return binary.LittleEndian.Uint32(ev.Bytes()[13:17])
 }
 
 // rotate implements BinlogEvent.Rotate().
 //
 // Expected format (L = total length of event data):
-//   # bytes  field
-//   8        position
-//   8:L      file
+//
+//	# bytes  field
+//	8        position
+//	8:L      file
 func (ev *filePosBinlogEvent) rotate(f BinlogFormat) (int, string) {
 	data := ev.Bytes()[f.HeaderLength:]
 	pos := binary.LittleEndian.Uint64(data[0:8])
@@ -184,6 +187,10 @@ func (ev filePosFakeEvent) IsPreviousGTIDs() bool {
 	return false
 }
 
+func (ev filePosFakeEvent) IsHeartbeat() bool {
+	return false
+}
+
 func (ev filePosFakeEvent) IsTableMap() bool {
 	return false
 }
@@ -204,11 +211,15 @@ func (ev filePosFakeEvent) Timestamp() uint32 {
 	return ev.timestamp
 }
 
+func (ev filePosFakeEvent) ServerID() uint32 {
+	return 1
+}
+
 func (ev filePosFakeEvent) Format() (BinlogFormat, error) {
 	return BinlogFormat{}, nil
 }
 
-func (ev filePosFakeEvent) GTID(BinlogFormat) (GTID, bool, error) {
+func (ev filePosFakeEvent) GTID(BinlogFormat) (replication.GTID, bool, error) {
 	return nil, false, nil
 }
 
@@ -224,8 +235,8 @@ func (ev filePosFakeEvent) Rand(BinlogFormat) (uint64, uint64, error) {
 	return 0, 0, nil
 }
 
-func (ev filePosFakeEvent) PreviousGTIDs(BinlogFormat) (Position, error) {
-	return Position{}, nil
+func (ev filePosFakeEvent) PreviousGTIDs(BinlogFormat) (replication.Position, error) {
+	return replication.Position{}, nil
 }
 
 func (ev filePosFakeEvent) TableID(BinlogFormat) uint64 {
@@ -240,6 +251,10 @@ func (ev filePosFakeEvent) Rows(BinlogFormat, *TableMap) (Rows, error) {
 	return Rows{}, nil
 }
 
+func (ev filePosFakeEvent) TransactionPayload(BinlogFormat) (*TransactionPayload, error) {
+	return &TransactionPayload{}, nil
+}
+
 func (ev filePosFakeEvent) NextLogFile(BinlogFormat) (string, uint64, error) {
 	return "", 0, nil
 }
@@ -248,7 +263,7 @@ func (ev filePosFakeEvent) IsPseudo() bool {
 	return false
 }
 
-func (ev filePosFakeEvent) IsCompressed() bool {
+func (ev filePosFakeEvent) IsTransactionPayload() bool {
 	return false
 }
 
@@ -261,17 +276,17 @@ func (ev filePosFakeEvent) Bytes() []byte {
 // filePosGTIDEvent is a fake GTID event for filePos.
 type filePosGTIDEvent struct {
 	filePosFakeEvent
-	gtid filePosGTID
+	gtid replication.FilePosGTID
 }
 
-func newFilePosGTIDEvent(file string, pos int, timestamp uint32) filePosGTIDEvent {
+func newFilePosGTIDEvent(file string, pos uint32, timestamp uint32) filePosGTIDEvent {
 	return filePosGTIDEvent{
 		filePosFakeEvent: filePosFakeEvent{
 			timestamp: timestamp,
 		},
-		gtid: filePosGTID{
-			file: file,
-			pos:  pos,
+		gtid: replication.FilePosGTID{
+			File: file,
+			Pos:  pos,
 		},
 	}
 }
@@ -284,6 +299,6 @@ func (ev filePosGTIDEvent) StripChecksum(f BinlogFormat) (BinlogEvent, []byte, e
 	return ev, nil, nil
 }
 
-func (ev filePosGTIDEvent) GTID(BinlogFormat) (GTID, bool, error) {
+func (ev filePosGTIDEvent) GTID(BinlogFormat) (replication.GTID, bool, error) {
 	return ev.gtid, false, nil
 }

@@ -69,6 +69,9 @@ service Query {
   // ReadTransaction returns the 2pc transaction info.
   rpc ReadTransaction(query.ReadTransactionRequest) returns (query.ReadTransactionResponse) {};
 
+  // UnresolvedTransactions returns the 2pc transaction info.
+  rpc UnresolvedTransactions(query.UnresolvedTransactionsRequest) returns (query.UnresolvedTransactionsResponse) {};
+
   // BeginExecute executes a begin and the specified SQL query.
   rpc BeginExecute(query.BeginExecuteRequest) returns (query.BeginExecuteResponse) {};
 
@@ -106,6 +109,12 @@ service Query {
   // VStreamRows streams rows from the specified starting point.
   rpc VStreamRows(binlogdata.VStreamRowsRequest) returns (stream binlogdata.VStreamRowsResponse) {};
 
+  // VStreamTables streams rows from the specified starting point.
+  rpc VStreamTables(binlogdata.VStreamTablesRequest) returns (stream binlogdata.VStreamTablesResponse) {};
+
   // VStreamResults streams results along with the gtid of the snapshot.
   rpc VStreamResults(binlogdata.VStreamResultsRequest) returns (stream binlogdata.VStreamResultsResponse) {};
+
+  // GetSchema returns the schema information.
+  rpc GetSchema(query.GetSchemaRequest) returns (stream query.GetSchemaResponse) {};
 }

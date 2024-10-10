@@ -18,15 +18,17 @@ package binlog
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"strings"
 
 	"google.golang.org/protobuf/proto"
 
-	"context"
+	"vitess.io/vitess/go/mysql/replication"
 
 	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/mysql/binlog"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/stats"
 	"vitess.io/vitess/go/vt/dbconfigs"
@@ -141,7 +143,7 @@ type Streamer struct {
 	extractPK       bool
 
 	clientCharset    *binlogdatapb.Charset
-	startPos         mysql.Position
+	startPos         replication.Position
 	timestamp        int64
 	sendTransaction  sendTransactionFunc
 	usePreviousGTIDs bool
@@ -157,7 +159,7 @@ type Streamer struct {
 // startPos is the position to start streaming at. Incompatible with timestamp.
 // timestamp is the timestamp to start streaming at. Incompatible with startPos.
 // sendTransaction is called each time a transaction is committed or rolled back.
-func NewStreamer(cp dbconfigs.Connector, se *schema.Engine, clientCharset *binlogdatapb.Charset, startPos mysql.Position, timestamp int64, sendTransaction sendTransactionFunc) *Streamer {
+func NewStreamer(cp dbconfigs.Connector, se *schema.Engine, clientCharset *binlogdatapb.Charset, startPos replication.Position, timestamp int64, sendTransaction sendTransactionFunc) *Streamer {
 	return &Streamer{
 		cp:              cp,
 		se:              se,
@@ -207,6 +209,7 @@ func (bls *Streamer) Stream(ctx context.Context) (err error) {
 	}
 
 	var events <-chan mysql.BinlogEvent
+	var errs <-chan error
 	if bls.timestamp != 0 {
 		// MySQL 5.6 only: We are going to start reading the
 		// logs from the beginning of a binlog file. That is
@@ -214,7 +217,7 @@ func (bls *Streamer) Stream(ctx context.Context) (err error) {
 		// contains the starting GTIDSet, and we will save
 		// that as the current position.
 		bls.usePreviousGTIDs = true
-		events, err = bls.conn.StartBinlogDumpFromBinlogBeforeTimestamp(ctx, bls.timestamp)
+		events, errs, err = bls.conn.StartBinlogDumpFromBinlogBeforeTimestamp(ctx, bls.timestamp)
 	} else if !bls.startPos.IsZero() {
 		// MySQL 5.6 only: we are starting from a random
 		// binlog position. It turns out we will receive a
@@ -223,16 +226,17 @@ func (bls *Streamer) Stream(ctx context.Context) (err error) {
 		// the starting position we pass in, it seems it is
 		// just the PREVIOUS_GTIDS_EVENT from the file we're reading.
 		// So we have to skip it.
-		events, err = bls.conn.StartBinlogDumpFromPosition(ctx, bls.startPos)
+		events, errs, err = bls.conn.StartBinlogDumpFromPosition(ctx, "", bls.startPos)
 	} else {
-		bls.startPos, events, err = bls.conn.StartBinlogDumpFromCurrent(ctx)
+		bls.startPos, events, errs, err = bls.conn.StartBinlogDumpFromCurrent(ctx)
 	}
 	if err != nil {
 		return err
 	}
+
 	// parseEvents will loop until the events channel is closed, the
 	// service enters the SHUTTING_DOWN state, or an error occurs.
-	stopPos, err = bls.parseEvents(ctx, events)
+	stopPos, err = bls.parseEvents(ctx, events, errs)
 	return err
 }
 
@@ -243,12 +247,12 @@ func (bls *Streamer) Stream(ctx context.Context) (err error) {
 // If the sendTransaction func returns io.EOF, parseEvents returns ErrClientEOF.
 // If the events channel is closed, parseEvents returns ErrServerEOF.
 // If the context is done, returns ctx.Err().
-func (bls *Streamer) parseEvents(ctx context.Context, events <-chan mysql.BinlogEvent) (mysql.Position, error) {
+func (bls *Streamer) parseEvents(ctx context.Context, events <-chan mysql.BinlogEvent, errs <-chan error) (replication.Position, error) {
 	var statements []FullBinlogStatement
 	var format mysql.BinlogFormat
-	var gtid mysql.GTID
-	var pos = bls.startPos
-	var autocommit = true
+	var gtid replication.GTID
+	pos := bls.startPos
+	autocommit := true
 	var err error
 
 	// Remember the RBR state.
@@ -271,7 +275,7 @@ func (bls *Streamer) parseEvents(ctx context.Context, events <-chan mysql.Binlog
 		if int64(timestamp) >= bls.timestamp {
 			eventToken := &querypb.EventToken{
 				Timestamp: int64(timestamp),
-				Position:  mysql.EncodePosition(pos),
+				Position:  replication.EncodePosition(pos),
 			}
 			if err = bls.sendTransaction(eventToken, statements); err != nil {
 				if err == io.EOF {
@@ -297,6 +301,8 @@ func (bls *Streamer) parseEvents(ctx context.Context, events <-chan mysql.Binlog
 				log.Infof("reached end of binlog event stream")
 				return pos, ErrServerEOF
 			}
+		case err = <-errs:
+			return pos, err
 		case <-ctx.Done():
 			log.Infof("stopping early due to binlog Streamer service shutdown or client disconnect")
 			return pos, ctx.Err()
@@ -343,7 +349,7 @@ func (bls *Streamer) parseEvents(ctx context.Context, events <-chan mysql.Binlog
 				return pos, fmt.Errorf("can't get GTID from binlog event: %v, event data: %#v", err, ev)
 			}
 			oldpos := pos
-			pos = mysql.AppendGTID(pos, gtid)
+			pos = replication.AppendGTID(pos, gtid)
 			// If the event is received outside of a transaction, it must
 			// be sent. Otherwise, it will get lost and the targets will go out
 			// of sync.
@@ -358,7 +364,7 @@ func (bls *Streamer) parseEvents(ctx context.Context, events <-chan mysql.Binlog
 			if err != nil {
 				return pos, fmt.Errorf("can't get GTID from binlog event: %v, event data: %#v", err, ev)
 			}
-			pos = mysql.AppendGTID(pos, gtid)
+			pos = replication.AppendGTID(pos, gtid)
 			if hasBegin {
 				begin()
 			}
@@ -479,7 +485,7 @@ func (bls *Streamer) parseEvents(ctx context.Context, events <-chan mysql.Binlog
 			}
 
 			// Find and fill in the table schema.
-			tce.ti = bls.se.GetTable(sqlparser.NewTableIdent(tm.Name))
+			tce.ti = bls.se.GetTable(sqlparser.NewIdentifierCS(tm.Name))
 			if tce.ti == nil {
 				return pos, fmt.Errorf("unknown table %v in schema", tm.Name)
 			}
@@ -604,7 +610,7 @@ func (bls *Streamer) parseEvents(ctx context.Context, events <-chan mysql.Binlog
 func (bls *Streamer) appendInserts(statements []FullBinlogStatement, tce *tableCacheEntry, rows *mysql.Rows) []FullBinlogStatement {
 	for i := range rows.Rows {
 		sql := sqlparser.NewTrackedBuffer(nil)
-		sql.Myprintf("INSERT INTO %v SET ", sqlparser.NewTableIdent(tce.tm.Name))
+		sql.Myprintf("INSERT INTO %v SET ", sqlparser.NewIdentifierCS(tce.tm.Name))
 
 		keyspaceIDCell, pkValues, err := writeValuesAsSQL(sql, tce, rows, i, tce.pkNames != nil)
 		if err != nil {
@@ -640,7 +646,7 @@ func (bls *Streamer) appendInserts(statements []FullBinlogStatement, tce *tableC
 func (bls *Streamer) appendUpdates(statements []FullBinlogStatement, tce *tableCacheEntry, rows *mysql.Rows) []FullBinlogStatement {
 	for i := range rows.Rows {
 		sql := sqlparser.NewTrackedBuffer(nil)
-		sql.Myprintf("UPDATE %v SET ", sqlparser.NewTableIdent(tce.tm.Name))
+		sql.Myprintf("UPDATE %v SET ", sqlparser.NewIdentifierCS(tce.tm.Name))
 
 		keyspaceIDCell, pkValues, err := writeValuesAsSQL(sql, tce, rows, i, tce.pkNames != nil)
 		if err != nil {
@@ -683,7 +689,7 @@ func (bls *Streamer) appendUpdates(statements []FullBinlogStatement, tce *tableC
 func (bls *Streamer) appendDeletes(statements []FullBinlogStatement, tce *tableCacheEntry, rows *mysql.Rows) []FullBinlogStatement {
 	for i := range rows.Rows {
 		sql := sqlparser.NewTrackedBuffer(nil)
-		sql.Myprintf("DELETE FROM %v WHERE ", sqlparser.NewTableIdent(tce.tm.Name))
+		sql.Myprintf("DELETE FROM %v WHERE ", sqlparser.NewIdentifierCS(tce.tm.Name))
 
 		keyspaceIDCell, pkValues, err := writeIdentifiersAsSQL(sql, tce, rows, i, tce.pkNames != nil)
 		if err != nil {
@@ -717,7 +723,7 @@ func (bls *Streamer) appendDeletes(statements []FullBinlogStatement, tce *tableC
 }
 
 // writeValuesAsSQL is a helper method to print the values as SQL in the
-// provided bytes.Buffer. It also returns the value for the keyspaceIDColumn,
+// provided strings.Builder. It also returns the value for the keyspaceIDColumn,
 // and the array of values for the PK, if necessary.
 func writeValuesAsSQL(sql *sqlparser.TrackedBuffer, tce *tableCacheEntry, rs *mysql.Rows, rowIndex int, getPK bool) (sqltypes.Value, []sqltypes.Value, error) {
 	valueIndex := 0
@@ -743,7 +749,7 @@ func writeValuesAsSQL(sql *sqlparser.TrackedBuffer, tce *tableCacheEntry, rs *my
 		if valueIndex > 0 {
 			sql.WriteString(", ")
 		}
-		sql.Myprintf("%v", sqlparser.NewColIdent(tce.ti.Fields[c].Name))
+		sql.Myprintf("%v", sqlparser.NewIdentifierCI(tce.ti.Fields[c].Name))
 		sql.WriteByte('=')
 
 		if rs.Rows[rowIndex].NullColumns.Bit(valueIndex) {
@@ -754,7 +760,7 @@ func writeValuesAsSQL(sql *sqlparser.TrackedBuffer, tce *tableCacheEntry, rs *my
 		}
 
 		// We have real data.
-		value, l, err := mysql.CellValue(data, pos, tce.tm.Types[c], tce.tm.Metadata[c], &querypb.Field{Type: tce.ti.Fields[c].Type})
+		value, l, err := binlog.CellValue(data, pos, tce.tm.Types[c], tce.tm.Metadata[c], &querypb.Field{Type: tce.ti.Fields[c].Type})
 		if err != nil {
 			return keyspaceIDCell, nil, err
 		}
@@ -762,7 +768,7 @@ func writeValuesAsSQL(sql *sqlparser.TrackedBuffer, tce *tableCacheEntry, rs *my
 		if err != nil {
 			return sqltypes.Value{}, nil, err
 		}
-		if value.Type() == querypb.Type_TIMESTAMP && !bytes.HasPrefix(vBytes, mysql.ZeroTimestamp) {
+		if value.Type() == querypb.Type_TIMESTAMP && !bytes.HasPrefix(vBytes, binlog.ZeroTimestamp) {
 			// Values in the binary log are UTC. Let's convert them
 			// to whatever timezone the connection is using,
 			// so MySQL properly converts them back to UTC.
@@ -788,7 +794,7 @@ func writeValuesAsSQL(sql *sqlparser.TrackedBuffer, tce *tableCacheEntry, rs *my
 }
 
 // writeIdentifiersAsSQL is a helper method to print the identifies as SQL in the
-// provided bytes.Buffer. It also returns the value for the keyspaceIDColumn,
+// provided strings.Builder. It also returns the value for the keyspaceIDColumn,
 // and the array of values for the PK, if necessary.
 func writeIdentifiersAsSQL(sql *sqlparser.TrackedBuffer, tce *tableCacheEntry, rs *mysql.Rows, rowIndex int, getPK bool) (sqltypes.Value, []sqltypes.Value, error) {
 	valueIndex := 0
@@ -808,7 +814,7 @@ func writeIdentifiersAsSQL(sql *sqlparser.TrackedBuffer, tce *tableCacheEntry, r
 		if valueIndex > 0 {
 			sql.WriteString(" AND ")
 		}
-		sql.Myprintf("%v", sqlparser.NewColIdent(tce.ti.Fields[c].Name))
+		sql.Myprintf("%v", sqlparser.NewIdentifierCI(tce.ti.Fields[c].Name))
 
 		if rs.Rows[rowIndex].NullIdentifyColumns.Bit(valueIndex) {
 			// This column is represented, but its value is NULL.
@@ -819,7 +825,7 @@ func writeIdentifiersAsSQL(sql *sqlparser.TrackedBuffer, tce *tableCacheEntry, r
 		sql.WriteByte('=')
 
 		// We have real data.
-		value, l, err := mysql.CellValue(data, pos, tce.tm.Types[c], tce.tm.Metadata[c], &querypb.Field{Type: tce.ti.Fields[c].Type})
+		value, l, err := binlog.CellValue(data, pos, tce.tm.Types[c], tce.tm.Metadata[c], &querypb.Field{Type: tce.ti.Fields[c].Type})
 		if err != nil {
 			return keyspaceIDCell, nil, err
 		}
@@ -827,7 +833,7 @@ func writeIdentifiersAsSQL(sql *sqlparser.TrackedBuffer, tce *tableCacheEntry, r
 		if err != nil {
 			return keyspaceIDCell, nil, err
 		}
-		if value.Type() == querypb.Type_TIMESTAMP && !bytes.HasPrefix(vBytes, mysql.ZeroTimestamp) {
+		if value.Type() == querypb.Type_TIMESTAMP && !bytes.HasPrefix(vBytes, binlog.ZeroTimestamp) {
 			// Values in the binary log are UTC. Let's convert them
 			// to whatever timezone the connection is using,
 			// so MySQL properly converts them back to UTC.

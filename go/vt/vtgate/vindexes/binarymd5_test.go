@@ -17,12 +17,12 @@ limitations under the License.
 package vindexes
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
 	"reflect"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/sqltypes"
@@ -32,15 +32,58 @@ import (
 var binVindex SingleColumn
 
 func init() {
-	vindex, _ := CreateVindex("binary_md5", "binary_md5_varchar", nil)
+	vindex, err := CreateVindex("binary_md5", "binary_md5_varchar", nil)
+	if err != nil {
+		panic(err)
+	}
 	binVindex = vindex.(SingleColumn)
 }
 
-func TestBinaryMD5Info(t *testing.T) {
-	assert.Equal(t, 1, binVindex.Cost())
-	assert.Equal(t, "binary_md5_varchar", binVindex.String())
-	assert.True(t, binVindex.IsUnique())
-	assert.False(t, binVindex.NeedsVCursor())
+func binaryMD5CreateVindexTestCase(
+	testName string,
+	vindexParams map[string]string,
+	expectErr error,
+	expectUnknownParams []string,
+) createVindexTestCase {
+	return createVindexTestCase{
+		testName: testName,
+
+		vindexType:   "binary_md5",
+		vindexName:   "binary_md5",
+		vindexParams: vindexParams,
+
+		expectCost:          1,
+		expectErr:           expectErr,
+		expectIsUnique:      true,
+		expectNeedsVCursor:  false,
+		expectString:        "binary_md5",
+		expectUnknownParams: expectUnknownParams,
+	}
+}
+
+func TestBinaryMD5CreateVindex(t *testing.T) {
+	cases := []createVindexTestCase{
+		binaryMD5CreateVindexTestCase(
+			"no params",
+			nil,
+			nil,
+			nil,
+		),
+		binaryMD5CreateVindexTestCase(
+			"empty params",
+			map[string]string{},
+			nil,
+			nil,
+		),
+		binaryMD5CreateVindexTestCase(
+			"unknown params",
+			map[string]string{"hello": "world"},
+			nil,
+			[]string{"hello"},
+		),
+	}
+
+	testCreateVindexes(t, cases)
 }
 
 func TestBinaryMD5Map(t *testing.T) {
@@ -61,7 +104,7 @@ func TestBinaryMD5Map(t *testing.T) {
 		out: "\f\xbcf\x11\xf5T\vЀ\x9a8\x8d\xc9Za[",
 	}}
 	for _, tcase := range tcases {
-		got, err := binVindex.Map(nil, []sqltypes.Value{tcase.in})
+		got, err := binVindex.Map(context.Background(), nil, []sqltypes.Value{tcase.in})
 		if err != nil {
 			t.Error(err)
 		}
@@ -79,7 +122,7 @@ func TestBinaryMD5Verify(t *testing.T) {
 	hexBytes, _ := hex.DecodeString(hexValStr)
 	ids := []sqltypes.Value{sqltypes.NewVarBinary("Test"), sqltypes.NewVarBinary("TEst"), sqltypes.NewHexVal([]byte(hexValStrSQL)), sqltypes.NewHexNum([]byte(hexNumStrSQL))}
 	ksids := [][]byte{[]byte("\f\xbcf\x11\xf5T\vЀ\x9a8\x8d\xc9Za["), []byte("\f\xbcf\x11\xf5T\vЀ\x9a8\x8d\xc9Za["), vMD5Hash(hexBytes), vMD5Hash(hexBytes)}
-	got, err := binVindex.Verify(nil, ids, ksids)
+	got, err := binVindex.Verify(context.Background(), nil, ids, ksids)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +134,7 @@ func TestBinaryMD5Verify(t *testing.T) {
 
 func TestSQLValue(t *testing.T) {
 	val := sqltypes.NewVarBinary("Test")
-	got, err := binVindex.Map(nil, []sqltypes.Value{val})
+	got, err := binVindex.Map(context.Background(), nil, []sqltypes.Value{val})
 	require.NoError(t, err)
 	out := string(got[0].(key.DestinationKeyspaceID))
 	want := "\f\xbcf\x11\xf5T\vЀ\x9a8\x8d\xc9Za["
@@ -132,4 +175,18 @@ func benchmarkMD5HashBytes(b *testing.B, input []byte) {
 	for i := 0; i < b.N; i++ {
 		sinkMD5 = vMD5Hash(input)
 	}
+}
+
+func TestCreateVindexBinaryMD5Params(t *testing.T) {
+	vindex, err := CreateVindex("binary_md5", "binary_md5", nil)
+	require.NotNil(t, vindex)
+	unknownParams := vindex.(ParamValidating).UnknownParams()
+	require.Empty(t, unknownParams)
+	require.NoError(t, err)
+
+	vindex, err = CreateVindex("binary_md5", "binary_md5", map[string]string{"hello": "world"})
+	require.NotNil(t, vindex)
+	unknownParams = vindex.(ParamValidating).UnknownParams()
+	require.Len(t, unknownParams, 1)
+	require.NoError(t, err)
 }

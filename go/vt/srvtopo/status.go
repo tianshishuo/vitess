@@ -18,9 +18,11 @@ package srvtopo
 
 import (
 	"context"
-	"html/template"
 	"sort"
 	"time"
+
+	"github.com/google/safehtml"
+	"github.com/google/safehtml/template"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
@@ -37,7 +39,7 @@ const TopoTemplate = `
     padding: 0.2rem;
   }
 </style>
-<table>
+<table class="refreshRequired">
   <tr>
     <th colspan="4">SrvKeyspace Names Cache</th>
   </tr>
@@ -49,15 +51,15 @@ const TopoTemplate = `
   </tr>
   {{range $i, $skn := .SrvKeyspaceNames}}
   <tr>
-    <td>{{github_com_vitessio_vitess_vtctld_srv_cell $skn.Cell}}</td>
-    <td>{{range $j, $value := $skn.Value}}{{github_com_vitessio_vitess_vtctld_srv_keyspace $skn.Cell $value}}&nbsp;{{end}}</td>
+    <td>{{$skn.Cell}}</td>
+    <td>{{range $j, $value := $skn.Value}}{{$value}}&nbsp;{{end}}</td>
     <td>{{github_com_vitessio_vitess_srvtopo_ttl_time $skn.ExpirationTime}}</td>
     <td>{{if $skn.LastError}}({{github_com_vitessio_vitess_srvtopo_time_since $skn.LastQueryTime}}Ago) {{$skn.LastError}}{{end}}</td>
   </tr>
   {{end}}
 </table>
 <br>
-<table>
+<table class="refreshRequired">
   <tr>
     <th colspan="5">SrvKeyspace Cache</th>
   </tr>
@@ -70,8 +72,8 @@ const TopoTemplate = `
   </tr>
   {{range $i, $sk := .SrvKeyspaces}}
   <tr>
-    <td>{{github_com_vitessio_vitess_vtctld_srv_cell $sk.Cell}}</td>
-    <td>{{github_com_vitessio_vitess_vtctld_srv_keyspace $sk.Cell $sk.Keyspace}}</td>
+    <td>{{$sk.Cell}}</td>
+    <td>{{$sk.Keyspace}}</td>
     <td>{{$sk.StatusAsHTML}}</td>
     <td>{{github_com_vitessio_vitess_srvtopo_ttl_time $sk.ExpirationTime}}</td>
     <td>{{if $sk.LastError}}({{github_com_vitessio_vitess_srvtopo_time_since $sk.LastErrorTime}} Ago) {{$sk.LastError}}{{end}}</td>
@@ -119,38 +121,31 @@ type SrvKeyspaceCacheStatus struct {
 	ExpirationTime time.Time
 	LastErrorTime  time.Time
 	LastError      error
-	LastErrorCtx   context.Context
 }
+
+var noData = safehtml.HTMLEscaped("No Data")
+var partitions = template.Must(template.New("partitions").Parse(`
+<b>Partitions:</b><br>
+{{ range .Partitions }}
+&nbsp;<b>{{ .ServedType }}:</b>
+{{ range .ShardReferences }}
+&nbsp;{{ .Name }}
+{{ end }}
+<br>
+{{ end }}
+`))
 
 // StatusAsHTML returns an HTML version of our status.
 // It works best if there is data in the cache.
-func (st *SrvKeyspaceCacheStatus) StatusAsHTML() template.HTML {
+func (st *SrvKeyspaceCacheStatus) StatusAsHTML() safehtml.HTML {
 	if st.Value == nil {
-		return template.HTML("No Data")
+		return noData
 	}
-
-	result := "<b>Partitions:</b><br>"
-	for _, keyspacePartition := range st.Value.Partitions {
-		result += "&nbsp;<b>" + keyspacePartition.ServedType.String() + ":</b>"
-		for _, shard := range keyspacePartition.ShardReferences {
-			result += "&nbsp;" + shard.Name
-		}
-		result += "<br>"
+	html, err := partitions.ExecuteToHTML(st.Value)
+	if err != nil {
+		panic(err)
 	}
-
-	if st.Value.ShardingColumnName != "" {
-		result += "<b>ShardingColumnName:</b>&nbsp;" + st.Value.ShardingColumnName + "<br>"
-		result += "<b>ShardingColumnType:</b>&nbsp;" + st.Value.ShardingColumnType.String() + "<br>"
-	}
-
-	if len(st.Value.ServedFrom) > 0 {
-		result += "<b>ServedFrom:</b><br>"
-		for _, sf := range st.Value.ServedFrom {
-			result += "&nbsp;<b>" + sf.TabletType.String() + ":</b>&nbsp;" + sf.Keyspace + "<br>"
-		}
-	}
-
-	return template.HTML(result)
+	return html
 }
 
 // SrvKeyspaceCacheStatusList is used for sorting
@@ -189,17 +184,19 @@ func (server *ResilientServer) CacheStatus() *ResilientServerCacheStatus {
 	return result
 }
 
+var expired = template.MustParseAndExecuteToHTML("<b>Expired</b>")
+
 // Returns the ttl for the cached entry or "Expired" if it is in the past
-func ttlTime(expirationTime time.Time) template.HTML {
+func ttlTime(expirationTime time.Time) safehtml.HTML {
 	ttl := time.Until(expirationTime).Round(time.Second)
 	if ttl < 0 {
-		return template.HTML("<b>Expired</b>")
+		return expired
 	}
-	return template.HTML(ttl.String())
+	return safehtml.HTMLEscaped(ttl.String())
 }
 
-func timeSince(t time.Time) template.HTML {
-	return template.HTML(time.Since(t).Round(time.Second).String())
+func timeSince(t time.Time) safehtml.HTML {
+	return safehtml.HTMLEscaped(time.Since(t).Round(time.Second).String())
 }
 
 // StatusFuncs is required for CacheStatus) to work properly.

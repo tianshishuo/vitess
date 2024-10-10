@@ -26,10 +26,11 @@ import (
 // vTableInfo is used to represent projected results, not real tables. It is used for
 // ORDER BY, GROUP BY and HAVING that need to access result columns
 type vTableInfo struct {
-	tableName   string
-	columnNames []string
-	cols        []sqlparser.Expr
-	tables      TableSet
+	tableName       string
+	columnNames     []string
+	cols            []sqlparser.Expr
+	tables          TableSet
+	isAuthoritative bool
 }
 
 var _ TableInfo = (*vTableInfo)(nil)
@@ -37,23 +38,40 @@ var _ TableInfo = (*vTableInfo)(nil)
 // dependencies implements the TableInfo interface
 func (v *vTableInfo) dependencies(colName string, org originable) (dependencies, error) {
 	var deps dependencies = &nothing{}
-	var err error
 	for i, name := range v.columnNames {
 		if name != colName {
 			continue
 		}
-		directDeps, recursiveDeps, qt := org.depsForExpr(v.cols[i])
-
-		newDeps := createCertain(directDeps, recursiveDeps, qt)
-		deps, err = deps.merge(newDeps)
-		if err != nil {
-			return nil, err
-		}
+		deps = deps.merge(v.createCertainForCol(org, i), false)
 	}
 	if deps.empty() && v.hasStar() {
 		return createUncertain(v.tables, v.tables), nil
 	}
 	return deps, nil
+}
+
+func (v *vTableInfo) dependenciesInGroupBy(colName string, org originable) (dependencies, error) {
+	// this method is consciously very similar to vTableInfo.dependencies and should remain so
+	var deps dependencies = &nothing{}
+	for i, name := range v.columnNames {
+		if name != colName {
+			continue
+		}
+		if sqlparser.ContainsAggregation(v.cols[i]) {
+			return nil, &CantGroupOn{name}
+		}
+		deps = deps.merge(v.createCertainForCol(org, i), false)
+	}
+	if deps.empty() && v.hasStar() {
+		return createUncertain(v.tables, v.tables), nil
+	}
+	return deps, nil
+}
+
+func (v *vTableInfo) createCertainForCol(org originable, i int) *certain {
+	directDeps, recursiveDeps, qt := org.depsForExpr(v.cols[i])
+	newDeps := createCertain(directDeps, recursiveDeps, qt)
+	return newDeps
 }
 
 // IsInfSchema implements the TableInfo interface
@@ -66,15 +84,19 @@ func (v *vTableInfo) matches(name sqlparser.TableName) bool {
 }
 
 func (v *vTableInfo) authoritative() bool {
-	return true
+	return v.isAuthoritative
 }
 
 func (v *vTableInfo) Name() (sqlparser.TableName, error) {
 	return sqlparser.TableName{}, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "oh noes")
 }
 
-func (v *vTableInfo) getExpr() *sqlparser.AliasedTableExpr {
+func (v *vTableInfo) GetAliasedTableExpr() *sqlparser.AliasedTableExpr {
 	return nil
+}
+
+func (v *vTableInfo) canShortCut() shortCut {
+	return canShortCut
 }
 
 // GetVindexTable implements the TableInfo interface
@@ -82,7 +104,7 @@ func (v *vTableInfo) GetVindexTable() *vindexes.Table {
 	return nil
 }
 
-func (v *vTableInfo) getColumns() []ColumnInfo {
+func (v *vTableInfo) getColumns(bool) []ColumnInfo {
 	cols := make([]ColumnInfo, 0, len(v.columnNames))
 	for _, col := range v.columnNames {
 		cols = append(cols, ColumnInfo{
@@ -93,11 +115,11 @@ func (v *vTableInfo) getColumns() []ColumnInfo {
 }
 
 func (v *vTableInfo) hasStar() bool {
-	return v.tables.NumberOfTables() > 0
+	return v.tables.NotEmpty()
 }
 
 // GetTables implements the TableInfo interface
-func (v *vTableInfo) getTableSet(org originable) TableSet {
+func (v *vTableInfo) getTableSet(_ originable) TableSet {
 	return v.tables
 }
 
@@ -108,15 +130,16 @@ func (v *vTableInfo) getExprFor(s string) (sqlparser.Expr, error) {
 			return v.cols[i], nil
 		}
 	}
-	return nil, vterrors.NewErrorf(vtrpcpb.Code_NOT_FOUND, vterrors.BadFieldError, "Unknown column '%s' in 'field list'", s)
+	return nil, vterrors.VT03022(s, "field list")
 }
 
 func createVTableInfoForExpressions(expressions sqlparser.SelectExprs, tables []TableInfo, org originable) *vTableInfo {
-	cols, colNames, ts := selectExprsToInfos(expressions, tables, org)
+	cols, colNames, ts, isAuthoritative := selectExprsToInfos(expressions, tables, org)
 	return &vTableInfo{
-		columnNames: colNames,
-		cols:        cols,
-		tables:      ts,
+		columnNames:     colNames,
+		cols:            cols,
+		tables:          ts,
+		isAuthoritative: isAuthoritative,
 	}
 }
 
@@ -124,7 +147,8 @@ func selectExprsToInfos(
 	expressions sqlparser.SelectExprs,
 	tables []TableInfo,
 	org originable,
-) (cols []sqlparser.Expr, colNames []string, ts TableSet) {
+) (cols []sqlparser.Expr, colNames []string, ts TableSet, isAuthoritative bool) {
+	isAuthoritative = true
 	for _, selectExpr := range expressions {
 		switch expr := selectExpr.(type) {
 		case *sqlparser.AliasedExpr:
@@ -142,9 +166,17 @@ func selectExprsToInfos(
 			}
 		case *sqlparser.StarExpr:
 			for _, table := range tables {
-				ts.MergeInPlace(table.getTableSet(org))
+				ts = ts.Merge(table.getTableSet(org))
+				if !table.authoritative() {
+					isAuthoritative = false
+				}
 			}
 		}
 	}
 	return
+}
+
+// GetMirrorRule implements TableInfo.
+func (v *vTableInfo) GetMirrorRule() *vindexes.MirrorRule {
+	return nil
 }

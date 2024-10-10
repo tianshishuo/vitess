@@ -17,11 +17,9 @@ limitations under the License.
 package servenv
 
 import (
-	"flag"
 	"fmt"
 	"io"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"runtime"
 	"runtime/pprof"
@@ -29,14 +27,15 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
-	"syscall"
+
+	"github.com/spf13/pflag"
 
 	"vitess.io/vitess/go/vt/log"
 )
 
 var (
-	_         = flag.String("cpu_profile", "", "deprecated: use '-pprof=cpu' instead")
-	pprofFlag = flag.String("pprof", "", "enable profiling")
+	pprofFlag []string
+	httpPprof bool
 )
 
 type profmode string
@@ -64,15 +63,14 @@ type profile struct {
 	waitSig bool
 }
 
-func parseProfileFlag(pf string) (*profile, error) {
-	if pf == "" {
+func parseProfileFlag(pf []string) (*profile, error) {
+	if len(pf) == 0 {
 		return nil, nil
 	}
 
 	var p profile
 
-	items := strings.Split(pf, ",")
-	switch items[0] {
+	switch pf[0] {
 	case "cpu":
 		p.mode = profileCPU
 	case "mem", "mem=heap":
@@ -94,10 +92,10 @@ func parseProfileFlag(pf string) (*profile, error) {
 	case "goroutine":
 		p.mode = profileGoroutine
 	default:
-		return nil, fmt.Errorf("unknown profile mode: %q", items[0])
+		return nil, fmt.Errorf("unknown profile mode: %q", pf[0])
 	}
 
-	for _, kv := range items[1:] {
+	for _, kv := range pf[1:] {
 		var err error
 		fields := strings.SplitN(kv, "=", 2)
 
@@ -168,7 +166,7 @@ func (prof *profile) mkprofile() io.WriteCloser {
 	var (
 		path string
 		err  error
-		logf = func(format string, args ...interface{}) {}
+		logf = func(format string, args ...any) {}
 	)
 
 	if prof.path != "" {
@@ -300,31 +298,10 @@ func (prof *profile) init() (start func(), stop func()) {
 }
 
 func init() {
-	OnInit(func() {
-		prof, err := parseProfileFlag(*pprofFlag)
-		if err != nil {
-			log.Fatal(err)
-		}
-		if prof != nil {
-			ch := make(chan os.Signal, 1)
-			signal.Notify(ch, syscall.SIGUSR1)
-			start, stop := prof.init()
-
-			if prof.waitSig {
-				go func() {
-					<-ch
-					start()
-				}()
-			} else {
-				start()
-			}
-
-			go func() {
-				<-ch
-				stop()
-			}()
-
-			OnTerm(stop)
-		}
+	OnParse(func(fs *pflag.FlagSet) {
+		fs.BoolVar(&httpPprof, "pprof-http", httpPprof, "enable pprof http endpoints")
+		fs.StringSliceVar(&pprofFlag, "pprof", pprofFlag, "enable profiling")
 	})
+	OnInit(pprofInit)
+	OnInit(HTTPRegisterProfile)
 }

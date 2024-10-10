@@ -17,9 +17,11 @@ limitations under the License.
 package engine
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 
+	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/evalengine"
 
@@ -36,6 +38,12 @@ var _ Primitive = (*VindexFunc)(nil)
 
 // VindexFunc is a primitive that performs vindex functions.
 type VindexFunc struct {
+	// VindexFunc does not take inputs
+	noInputs
+
+	// VindexFunc does not need to work inside a tx
+	noTxNeeded
+
 	Opcode VindexOpcode
 	// Fields is the field info for the result.
 	Fields []*querypb.Field
@@ -44,12 +52,6 @@ type VindexFunc struct {
 	// TODO(sougou): add support for MultiColumn.
 	Vindex vindexes.SingleColumn
 	Value  evalengine.Expr
-
-	// VindexFunc does not take inputs
-	noInputs
-
-	// VindexFunc does not need to work inside a tx
-	noTxNeeded
 }
 
 // VindexOpcode is the opcode for a VindexFunc.
@@ -88,52 +90,58 @@ func (vf *VindexFunc) GetTableName() string {
 }
 
 // TryExecute performs a non-streaming exec.
-func (vf *VindexFunc) TryExecute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
-	return vf.mapVindex(vcursor, bindVars)
+func (vf *VindexFunc) TryExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
+	return vf.mapVindex(ctx, vcursor, bindVars)
 }
 
 // TryStreamExecute performs a streaming exec.
-func (vf *VindexFunc) TryStreamExecute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
-	r, err := vf.mapVindex(vcursor, bindVars)
+func (vf *VindexFunc) TryStreamExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
+	r, err := vf.mapVindex(ctx, vcursor, bindVars)
 	if err != nil {
 		return err
 	}
-	if err := callback(&sqltypes.Result{Fields: r.Fields}); err != nil {
+	if err := callback(r.Metadata()); err != nil {
 		return err
 	}
 	return callback(&sqltypes.Result{Rows: r.Rows})
 }
 
 // GetFields fetches the field info.
-func (vf *VindexFunc) GetFields(vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
+func (vf *VindexFunc) GetFields(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
 	return &sqltypes.Result{Fields: vf.Fields}, nil
 }
 
-func (vf *VindexFunc) mapVindex(vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
-	env := evalengine.EnvWithBindVars(bindVars, vcursor.ConnCollation())
+func (vf *VindexFunc) mapVindex(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
+	env := evalengine.NewExpressionEnv(ctx, bindVars, vcursor)
 	k, err := env.Evaluate(vf.Value)
 	if err != nil {
 		return nil, err
 	}
 	var values []sqltypes.Value
-	if k.Value().Type() == querypb.Type_TUPLE {
+	value := k.Value(vcursor.ConnCollation())
+	if value.Type() == querypb.Type_TUPLE {
 		values = k.TupleValues()
 	} else {
-		values = append(values, k.Value())
+		values = append(values, value)
 	}
 	result := &sqltypes.Result{
 		Fields: vf.Fields,
 	}
-	for _, value := range values {
-		vkey, err := evalengine.Cast(value, sqltypes.VarBinary)
+	destinations, err := vf.Vindex.Map(ctx, vcursor, values)
+	if err != nil {
+		return nil, err
+	}
+	if len(destinations) != len(values) {
+		// should never happen
+		return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "Vindex.Map() length mismatch: input values count is %d, output destinations count is %d",
+			len(values), len(destinations))
+	}
+	for i, value := range values {
+		vkey, err := sqltypes.Cast(value, sqltypes.VarBinary)
 		if err != nil {
 			return nil, err
 		}
-		destinations, err := vf.Vindex.Map(vcursor, []sqltypes.Value{value})
-		if err != nil {
-			return nil, err
-		}
-		switch d := destinations[0].(type) {
+		switch d := destinations[i].(type) {
 		case key.DestinationKeyRange:
 			if d.KeyRange != nil {
 				row, err := vf.buildRow(vkey, nil, d.KeyRange)
@@ -145,7 +153,10 @@ func (vf *VindexFunc) mapVindex(vcursor VCursor, bindVars map[string]*querypb.Bi
 		case key.DestinationKeyspaceID:
 			if len(d) > 0 {
 				if vcursor != nil {
-					resolvedShards, _, err := vcursor.ResolveDestinations(vcursor.GetKeyspace(), nil, []key.Destination{d})
+					if vcursor.GetKeyspace() == "" {
+						return nil, vterrors.VT09005()
+					}
+					resolvedShards, _, err := vcursor.ResolveDestinations(ctx, vcursor.GetKeyspace(), nil, []key.Destination{d})
 					if err != nil {
 						return nil, err
 					}
@@ -235,10 +246,10 @@ func (vf *VindexFunc) description() PrimitiveDescription {
 		fields[field.Name] = field.Type.String()
 	}
 
-	other := map[string]interface{}{
+	other := map[string]any{
 		"Fields":  fields,
 		"Columns": vf.Cols,
-		"Value":   evalengine.FormatExpr(vf.Value),
+		"Value":   sqlparser.String(vf.Value),
 	}
 	if vf.Vindex != nil {
 		other["Vindex"] = vf.Vindex.String()

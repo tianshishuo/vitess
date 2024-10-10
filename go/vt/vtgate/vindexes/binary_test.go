@@ -18,12 +18,12 @@ package vindexes
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"fmt"
 	"reflect"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/sqltypes"
@@ -33,15 +33,58 @@ import (
 var binOnlyVindex SingleColumn
 
 func init() {
-	vindex, _ := CreateVindex("binary", "binary_varchar", nil)
+	vindex, err := CreateVindex("binary", "binary_varchar", nil)
+	if err != nil {
+		panic(err)
+	}
 	binOnlyVindex = vindex.(SingleColumn)
 }
 
-func TestBinaryInfo(t *testing.T) {
-	assert.Equal(t, 0, binOnlyVindex.Cost())
-	assert.Equal(t, "binary_varchar", binOnlyVindex.String())
-	assert.True(t, binOnlyVindex.IsUnique())
-	assert.False(t, binOnlyVindex.NeedsVCursor())
+func binaryCreateVindexTestCase(
+	testName string,
+	vindexParams map[string]string,
+	expectErr error,
+	expectUnknownParams []string,
+) createVindexTestCase {
+	return createVindexTestCase{
+		testName: testName,
+
+		vindexType:   "binary",
+		vindexName:   "binary",
+		vindexParams: vindexParams,
+
+		expectCost:          0,
+		expectErr:           expectErr,
+		expectIsUnique:      true,
+		expectNeedsVCursor:  false,
+		expectString:        "binary",
+		expectUnknownParams: expectUnknownParams,
+	}
+}
+
+func TestBinaryCreateVindex(t *testing.T) {
+	cases := []createVindexTestCase{
+		binaryCreateVindexTestCase(
+			"no params",
+			nil,
+			nil,
+			nil,
+		),
+		binaryCreateVindexTestCase(
+			"empty params",
+			map[string]string{},
+			nil,
+			nil,
+		),
+		binaryCreateVindexTestCase(
+			"unknown params",
+			map[string]string{"hello": "world"},
+			nil,
+			[]string{"hello"},
+		),
+	}
+
+	testCreateVindexes(t, cases)
 }
 
 func TestBinaryMap(t *testing.T) {
@@ -59,7 +102,7 @@ func TestBinaryMap(t *testing.T) {
 		out: []byte("test2"),
 	}}
 	for _, tcase := range tcases {
-		got, err := binOnlyVindex.Map(nil, []sqltypes.Value{tcase.in})
+		got, err := binOnlyVindex.Map(context.Background(), nil, []sqltypes.Value{tcase.in})
 		if err != nil {
 			t.Error(err)
 		}
@@ -77,7 +120,7 @@ func TestBinaryVerify(t *testing.T) {
 	hexBytes, _ := hex.DecodeString(hexValStr)
 	ids := []sqltypes.Value{sqltypes.NewVarBinary("1"), sqltypes.NewVarBinary("2"), sqltypes.NewHexVal([]byte(hexValStrSQL)), sqltypes.NewHexNum([]byte(hexNumStrSQL))}
 	ksids := [][]byte{[]byte("1"), []byte("1"), hexBytes, hexBytes}
-	got, err := binOnlyVindex.Verify(nil, ids, ksids)
+	got, err := binOnlyVindex.Verify(context.Background(), nil, ids, ksids)
 	if err != nil {
 		t.Fatal(err)
 	}

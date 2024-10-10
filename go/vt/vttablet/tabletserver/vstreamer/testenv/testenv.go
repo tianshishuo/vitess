@@ -22,15 +22,18 @@ import (
 	"fmt"
 	"os"
 	"regexp"
-	"strconv"
 	"strings"
 
 	"vitess.io/vitess/go/json2"
+	"vitess.io/vitess/go/mysql/collations"
+	"vitess.io/vitess/go/stats"
 	"vitess.io/vitess/go/vt/dbconfigs"
+	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/mysqlctl"
 	"vitess.io/vitess/go/vt/srvtopo"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
+	"vitess.io/vitess/go/vt/vtenv"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/schema"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
 	"vitess.io/vitess/go/vt/vttest"
@@ -39,6 +42,38 @@ import (
 	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
 	vttestpb "vitess.io/vitess/go/vt/proto/vttest"
 )
+
+const (
+	DBName               = "vttest"
+	DefaultCollationName = "utf8mb4_0900_ai_ci"
+	DefaultShard         = "0"
+)
+
+var (
+	// These are exported to coordinate on version specific
+	// behavior between the testenv and its users.
+	CollationEnv       *collations.Environment
+	DefaultCollationID collations.ID
+	MySQLVersion       string
+)
+
+func init() {
+	vs, err := mysqlctl.GetVersionString()
+	if err != nil {
+		panic("could not get MySQL version: " + err.Error())
+	}
+	_, mv, err := mysqlctl.ParseVersionString(vs)
+	if err != nil {
+		panic("could not parse MySQL version: " + err.Error())
+	}
+	MySQLVersion = fmt.Sprintf("%d.%d.%d", mv.Major, mv.Minor, mv.Patch)
+	log.Infof("MySQL version: %s", MySQLVersion)
+	CollationEnv = collations.NewEnvironment(MySQLVersion)
+	// utf8mb4_general_ci is the default for MySQL 5.7 and
+	// utf8mb4_0900_ai_ci is the default for MySQL 8.0.
+	DefaultCollationID = CollationEnv.DefaultConnectionCharset()
+	log.Infof("Default collation ID: %d", DefaultCollationID)
+}
 
 // Env contains all the env vars for a test against a mysql instance.
 type Env struct {
@@ -54,7 +89,6 @@ type Env struct {
 	Dbcfgs       *dbconfigs.DBConfigs
 	Mysqld       *mysqlctl.Mysqld
 	SchemaEngine *schema.Engine
-	Flavor       string
 	// MySQL and Percona are considered equivalent here and both called mysql
 	DBType         string
 	DBMajorVersion int
@@ -63,22 +97,22 @@ type Env struct {
 }
 
 // Init initializes an Env.
-func Init() (*Env, error) {
+func Init(ctx context.Context) (*Env, error) {
 	te := &Env{
-		KeyspaceName: "vttest",
+		KeyspaceName: DBName,
 		ShardName:    "0",
 		Cells:        []string{"cell1"},
 	}
 
-	ctx := context.Background()
-	te.TopoServ = memorytopo.NewServer(te.Cells...)
+	te.TopoServ = memorytopo.NewServer(ctx, te.Cells...)
 	if err := te.TopoServ.CreateKeyspace(ctx, te.KeyspaceName, &topodatapb.Keyspace{}); err != nil {
 		return nil, err
 	}
 	if err := te.TopoServ.CreateShard(ctx, te.KeyspaceName, te.ShardName); err != nil {
 		panic(err)
 	}
-	te.SrvTopo = srvtopo.NewResilientServer(te.TopoServ, "TestTopo")
+	counts := stats.NewCountersWithSingleLabel("", "Resilient srvtopo server operations", "type")
+	te.SrvTopo = srvtopo.NewResilientServer(ctx, te.TopoServ, counts)
 
 	cfg := vttest.Config{
 		Topology: &vttestpb.VTTestTopology{
@@ -88,14 +122,15 @@ func Init() (*Env, error) {
 					Shards: []*vttestpb.Shard{
 						{
 							Name:           "0",
-							DbNameOverride: "vttest",
+							DbNameOverride: DBName,
 						},
 					},
 				},
 			},
 		},
-		OnlyMySQL: true,
-		Charset:   "utf8mb4_general_ci",
+		OnlyMySQL:  true,
+		Charset:    CollationEnv.LookupName(DefaultCollationID),
+		ExtraMyCnf: strings.Split(os.Getenv("EXTRA_MY_CNF"), ":"),
 	}
 	te.cluster = &vttest.LocalCluster{
 		Config: cfg,
@@ -105,33 +140,39 @@ func Init() (*Env, error) {
 		return nil, fmt.Errorf("could not launch mysql: %v", err)
 	}
 	te.Dbcfgs = dbconfigs.NewTestDBConfigs(te.cluster.MySQLConnParams(), te.cluster.MySQLAppDebugConnParams(), te.cluster.DbName())
-	config := tabletenv.NewDefaultConfig()
-	config.DB = te.Dbcfgs
-	te.TabletEnv = tabletenv.NewEnv(config, "VStreamerTest")
+	conf := tabletenv.NewDefaultConfig()
+	conf.DB = te.Dbcfgs
+	vtenvCfg := vtenv.Options{
+		MySQLServerVersion: MySQLVersion,
+	}
+	vtenv, err := vtenv.New(vtenvCfg)
+	if err != nil {
+		return nil, fmt.Errorf("could not initialize new vtenv: %v", err)
+	}
+	te.TabletEnv = tabletenv.NewEnv(vtenv, conf, "VStreamerTest")
 	te.Mysqld = mysqlctl.NewMysqld(te.Dbcfgs)
-	pos, _ := te.Mysqld.PrimaryPosition()
-	te.Flavor = pos.GTIDSet.Flavor()
-	if strings.HasPrefix(strings.ToLower(te.Flavor), string(mysqlctl.FlavorMariaDB)) {
+	pos, _ := te.Mysqld.PrimaryPosition(ctx)
+	if strings.HasPrefix(strings.ToLower(pos.GTIDSet.Flavor()), string(mysqlctl.FlavorMariaDB)) {
 		te.DBType = string(mysqlctl.FlavorMariaDB)
 	} else {
 		// MySQL and Percona are equivalent for the tests
 		te.DBType = string(mysqlctl.FlavorMySQL)
 	}
-	dbVersionStr := te.Mysqld.GetVersionString()
-	dbVersionStrParts := strings.Split(dbVersionStr, ".")
-	var err error
-	te.DBMajorVersion, err = strconv.Atoi(dbVersionStrParts[0])
+	dbVersionStr, err := te.Mysqld.GetVersionString(context.Background())
 	if err != nil {
-		return nil, fmt.Errorf("could not parse database major version from '%s': %v", dbVersionStr, err)
+		return nil, fmt.Errorf("could not get server version: %w", err)
 	}
-	te.DBMinorVersion, err = strconv.Atoi(dbVersionStrParts[1])
+	if !strings.Contains(dbVersionStr, MySQLVersion) {
+		return nil, fmt.Errorf("MySQL version mismatch between mysqlctl %s and mysqld %s", MySQLVersion, dbVersionStr)
+	}
+	_, version, err := mysqlctl.ParseVersionString(dbVersionStr)
 	if err != nil {
-		return nil, fmt.Errorf("could not parse database minor version from '%s': %v", dbVersionStr, err)
+		return nil, fmt.Errorf("could not parse server version %q: %w", dbVersionStr, err)
 	}
-	te.DBPatchVersion, err = strconv.Atoi(dbVersionStrParts[2])
-	if err != nil {
-		return nil, fmt.Errorf("could not parse database patch version from '%s': %v", dbVersionStr, err)
-	}
+
+	te.DBMajorVersion = version.Major
+	te.DBMinorVersion = version.Minor
+	te.DBPatchVersion = version.Patch
 
 	te.SchemaEngine = schema.NewEngine(te.TabletEnv)
 	te.SchemaEngine.InitDBConfig(te.Dbcfgs.DbaWithDB())
@@ -161,7 +202,7 @@ func (te *Env) Close() {
 func (te *Env) SetVSchema(vs string) error {
 	ctx := context.Background()
 	var kspb vschemapb.Keyspace
-	if err := json2.Unmarshal([]byte(vs), &kspb); err != nil {
+	if err := json2.UnmarshalPB([]byte(vs), &kspb); err != nil {
 		return err
 	}
 	if err := te.TopoServ.SaveVSchema(ctx, te.KeyspaceName, &kspb); err != nil {
@@ -182,12 +223,36 @@ func (te *Env) RemoveAnyDeprecatedDisplayWidths(orig string) string {
 	}
 	var adjusted string
 	baseIntType := "int"
-	intRE := regexp.MustCompile(`(i)?int\(([0-9]*)?\)`)
+	intRE := regexp.MustCompile(`(?i)int\(([0-9]*)?\)`)
 	adjusted = intRE.ReplaceAllString(orig, baseIntType)
 	if (te.DBMajorVersion > 8 || te.DBMinorVersion > 0) || te.DBPatchVersion >= 19 {
 		baseYearType := "year"
-		yearRE := regexp.MustCompile(`(i)?year\(([0-9]*)?\)`)
+		yearRE := regexp.MustCompile(`(?i)year\(([0-9]*)?\)`)
 		adjusted = yearRE.ReplaceAllString(adjusted, baseYearType)
 	}
 	return adjusted
+}
+
+// ServerCapability is used to define capabilities for which we want to optionally run tests
+// if the underlying mysql server supports them.
+type ServerCapability int32
+
+const (
+	ServerCapabilityInvisibleColumn              ServerCapability = 1
+	ServerCapabilityGeneratedInvisiblePrimaryKey ServerCapability = 2
+)
+
+// HasCapability returns true if the server has the given capability.
+// Used to skip tests that require a certain version of MySQL.
+func (te *Env) HasCapability(cap ServerCapability) bool {
+	if te.DBType != string(mysqlctl.FlavorMySQL) || te.DBMajorVersion < 8 {
+		return false
+	}
+	switch cap {
+	case ServerCapabilityInvisibleColumn:
+		return te.DBMinorVersion > 0 || te.DBPatchVersion >= 23
+	case ServerCapabilityGeneratedInvisiblePrimaryKey:
+		return te.DBMinorVersion > 0 || te.DBPatchVersion >= 30
+	}
+	return false
 }

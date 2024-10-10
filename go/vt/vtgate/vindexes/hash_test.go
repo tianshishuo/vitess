@@ -17,35 +17,79 @@ limitations under the License.
 package vindexes
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
 )
 
-var hash SingleColumn
+var hashTest SingleColumn
 
 func init() {
-	hv, err := CreateVindex("hash", "nn", map[string]string{"Table": "t", "Column": "c"})
+	hv, err := CreateVindex("hash", "nn", map[string]string{})
+	unknownParams := hv.(ParamValidating).UnknownParams()
+	if len(unknownParams) > 0 {
+		panic("hash test init: expected 0 unknown params")
+	}
 	if err != nil {
 		panic(err)
 	}
-	hash = hv.(SingleColumn)
+	hashTest = hv.(SingleColumn)
 }
 
-func TestHashInfo(t *testing.T) {
-	assert.Equal(t, 1, hash.Cost())
-	assert.Equal(t, "nn", hash.String())
-	assert.True(t, hash.IsUnique())
-	assert.False(t, hash.NeedsVCursor())
+func hashCreateVindexTestCase(
+	testName string,
+	vindexParams map[string]string,
+	expectErr error,
+	expectUnknownParams []string,
+) createVindexTestCase {
+	return createVindexTestCase{
+		testName: testName,
+
+		vindexType:   "hash",
+		vindexName:   "hash",
+		vindexParams: vindexParams,
+
+		expectCost:          1,
+		expectErr:           expectErr,
+		expectIsUnique:      true,
+		expectNeedsVCursor:  false,
+		expectString:        "hash",
+		expectUnknownParams: expectUnknownParams,
+	}
+}
+
+func TestHashCreateVindex(t *testing.T) {
+	cases := []createVindexTestCase{
+		hashCreateVindexTestCase(
+			"no params",
+			nil,
+			nil,
+			nil,
+		),
+		hashCreateVindexTestCase(
+			"empty params",
+			map[string]string{},
+			nil,
+			nil,
+		),
+		hashCreateVindexTestCase(
+			"unknown params",
+			map[string]string{"hello": "world"},
+			nil,
+			[]string{"hello"},
+		),
+	}
+
+	testCreateVindexes(t, cases)
 }
 
 func TestHashMap(t *testing.T) {
-	got, err := hash.Map(nil, []sqltypes.Value{
+	got, err := hashTest.Map(context.Background(), nil, []sqltypes.Value{
 		sqltypes.NewInt64(1),
 		sqltypes.NewInt64(2),
 		sqltypes.NewInt64(3),
@@ -88,7 +132,7 @@ func TestHashMap(t *testing.T) {
 func TestHashVerify(t *testing.T) {
 	ids := []sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewInt64(2)}
 	ksids := [][]byte{[]byte("\x16k@\xb4J\xbaK\xd6"), []byte("\x16k@\xb4J\xbaK\xd6")}
-	got, err := hash.Verify(nil, ids, ksids)
+	got, err := hashTest.Verify(context.Background(), nil, ids, ksids)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,12 +142,12 @@ func TestHashVerify(t *testing.T) {
 	}
 
 	// Failure test
-	_, err = hash.Verify(nil, []sqltypes.Value{sqltypes.NewVarBinary("aa")}, [][]byte{nil})
-	require.EqualError(t, err, "could not parse value: 'aa'")
+	_, err = hashTest.Verify(context.Background(), nil, []sqltypes.Value{sqltypes.NewVarBinary("aa")}, [][]byte{nil})
+	require.EqualError(t, err, "cannot parse uint64 from \"aa\"")
 }
 
 func TestHashReverseMap(t *testing.T) {
-	got, err := hash.(Reversible).ReverseMap(nil, [][]byte{
+	got, err := hashTest.(Reversible).ReverseMap(nil, [][]byte{
 		[]byte("\x16k@\xb4J\xbaK\xd6"),
 		[]byte("\x06\xe7\xea\"Βp\x8f"),
 		[]byte("N\xb1\x90ɢ\xfa\x16\x9c"),
@@ -140,7 +184,7 @@ func TestHashReverseMap(t *testing.T) {
 }
 
 func TestHashReverseMapNeg(t *testing.T) {
-	_, err := hash.(Reversible).ReverseMap(nil, [][]byte{[]byte("\x16k@\xb4J\xbaK\xd6\x16k@\xb4J\xbaK\xd6")})
+	_, err := hashTest.(Reversible).ReverseMap(nil, [][]byte{[]byte("\x16k@\xb4J\xbaK\xd6\x16k@\xb4J\xbaK\xd6")})
 	want := "invalid keyspace id: 166b40b44aba4bd6166b40b44aba4bd6"
 	if err.Error() != want {
 		t.Error(err)

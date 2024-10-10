@@ -20,33 +20,45 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
+
+	"vitess.io/vitess/go/mysql/replication"
 )
 
-func TestMysql56SetReplicationSourceCommand(t *testing.T) {
+func TestMysql8SetReplicationSourceCommand(t *testing.T) {
 	params := &ConnParams{
 		Uname: "username",
 		Pass:  "password",
 	}
 	host := "localhost"
-	port := 123
+	port := int32(123)
 	connectRetry := 1234
-	want := `CHANGE MASTER TO
-  MASTER_HOST = 'localhost',
-  MASTER_PORT = 123,
-  MASTER_USER = 'username',
-  MASTER_PASSWORD = 'password',
-  MASTER_CONNECT_RETRY = 1234,
-  MASTER_AUTO_POSITION = 1`
+	want := `CHANGE REPLICATION SOURCE TO
+  SOURCE_HOST = 'localhost',
+  SOURCE_PORT = 123,
+  SOURCE_USER = 'username',
+  SOURCE_PASSWORD = 'password',
+  SOURCE_CONNECT_RETRY = 1234,
+  SOURCE_AUTO_POSITION = 1`
 
-	conn := &Conn{flavor: mysqlFlavor57{}}
-	got := conn.SetReplicationSourceCommand(params, host, port, connectRetry)
-	if got != want {
-		t.Errorf("mysqlFlavor.SetReplicationSourceCommand(%#v, %#v, %#v, %#v) = %#v, want %#v", params, host, port, connectRetry, got, want)
-	}
+	conn := &Conn{flavor: mysqlFlavor8{}}
+	got := conn.SetReplicationSourceCommand(params, host, port, 0, connectRetry)
+	assert.Equal(t, want, got, "mysqlFlavor.SetReplicationSourceCommand(%#v, %#v, %#v, %#v) = %#v, want %#v", params, host, port, connectRetry, got, want)
+
+	var heartbeatInterval float64 = 5.4
+	want = `CHANGE REPLICATION SOURCE TO
+  SOURCE_HOST = 'localhost',
+  SOURCE_PORT = 123,
+  SOURCE_USER = 'username',
+  SOURCE_PASSWORD = 'password',
+  SOURCE_CONNECT_RETRY = 1234,
+  SOURCE_HEARTBEAT_PERIOD = 5.4,
+  SOURCE_AUTO_POSITION = 1`
+
+	got = conn.SetReplicationSourceCommand(params, host, port, heartbeatInterval, connectRetry)
+	assert.Equal(t, want, got, "mysqlFlavor.SetReplicationSourceCommand(%#v, %#v, %#v, %#v, %#v) = %#v, want %#v", params, host, port, heartbeatInterval, connectRetry, got, want)
 }
 
-func TestMysql56SetReplicationSourceCommandSSL(t *testing.T) {
+func TestMysql8SetReplicationSourceCommandSSL(t *testing.T) {
 	params := &ConnParams{
 		Uname:     "username",
 		Pass:      "password",
@@ -57,91 +69,48 @@ func TestMysql56SetReplicationSourceCommandSSL(t *testing.T) {
 	}
 	params.EnableSSL()
 	host := "localhost"
-	port := 123
+	port := int32(123)
 	connectRetry := 1234
-	want := `CHANGE MASTER TO
-  MASTER_HOST = 'localhost',
-  MASTER_PORT = 123,
-  MASTER_USER = 'username',
-  MASTER_PASSWORD = 'password',
-  MASTER_CONNECT_RETRY = 1234,
-  MASTER_SSL = 1,
-  MASTER_SSL_CA = 'ssl-ca',
-  MASTER_SSL_CAPATH = 'ssl-ca-path',
-  MASTER_SSL_CERT = 'ssl-cert',
-  MASTER_SSL_KEY = 'ssl-key',
-  MASTER_AUTO_POSITION = 1`
+	want := `CHANGE REPLICATION SOURCE TO
+  SOURCE_HOST = 'localhost',
+  SOURCE_PORT = 123,
+  SOURCE_USER = 'username',
+  SOURCE_PASSWORD = 'password',
+  SOURCE_CONNECT_RETRY = 1234,
+  SOURCE_SSL = 1,
+  SOURCE_SSL_CA = 'ssl-ca',
+  SOURCE_SSL_CAPATH = 'ssl-ca-path',
+  SOURCE_SSL_CERT = 'ssl-cert',
+  SOURCE_SSL_KEY = 'ssl-key',
+  SOURCE_AUTO_POSITION = 1`
 
-	conn := &Conn{flavor: mysqlFlavor57{}}
-	got := conn.SetReplicationSourceCommand(params, host, port, connectRetry)
-	if got != want {
-		t.Errorf("mysqlFlavor.SetReplicationSourceCommand(%#v, %#v, %#v, %#v) = %#v, want %#v", params, host, port, connectRetry, got, want)
-	}
+	conn := &Conn{flavor: mysqlFlavor8{}}
+	got := conn.SetReplicationSourceCommand(params, host, port, 0, connectRetry)
+	assert.Equal(t, want, got, "mysqlFlavor.SetReplicationSourceCommand(%#v, %#v, %#v, %#v) = %#v, want %#v", params, host, port, connectRetry, got, want)
 }
 
-func TestMysqlRetrieveSourceServerId(t *testing.T) {
-	resultMap := map[string]string{
-		"Master_Server_Id": "1",
-	}
-
-	want := ReplicationStatus{SourceServerID: 1}
-	got, err := parseMysqlReplicationStatus(resultMap)
-	require.NoError(t, err)
-	assert.Equalf(t, got.SourceServerID, want.SourceServerID, "got SourceServerID: %v; want SourceServerID: %v", got.SourceServerID, want.SourceServerID)
+func TestMysql8SetReplicationPositionCommands(t *testing.T) {
+	pos := replication.Position{GTIDSet: replication.Mysql56GTIDSet{}}
+	conn := &Conn{flavor: mysqlFlavor8{}}
+	queries := conn.SetReplicationPositionCommands(pos)
+	assert.Equal(t, []string{"RESET MASTER", "SET GLOBAL gtid_purged = ''"}, queries)
 }
 
-func TestMysqlRetrieveFileBasedPositions(t *testing.T) {
-	resultMap := map[string]string{
-		"Exec_Master_Log_Pos":   "1307",
-		"Relay_Master_Log_File": "master-bin.000002",
-		"Read_Master_Log_Pos":   "1308",
-		"Master_Log_File":       "master-bin.000003",
-	}
-
-	want := ReplicationStatus{
-		FilePosition:         Position{GTIDSet: filePosGTID{file: "master-bin.000002", pos: 1307}},
-		FileRelayLogPosition: Position{GTIDSet: filePosGTID{file: "master-bin.000003", pos: 1308}},
-	}
-	got, err := parseMysqlReplicationStatus(resultMap)
-	require.NoError(t, err)
-	assert.Equalf(t, got.FilePosition.GTIDSet, want.FilePosition.GTIDSet, "got FilePosition: %v; want FilePosition: %v", got.FilePosition.GTIDSet, want.FilePosition.GTIDSet)
-	assert.Equalf(t, got.FileRelayLogPosition.GTIDSet, want.FileRelayLogPosition.GTIDSet, "got FileRelayLogPosition: %v; want FileRelayLogPosition: %v", got.FileRelayLogPosition.GTIDSet, want.FileRelayLogPosition.GTIDSet)
+func TestMysql82SetReplicationPositionCommands(t *testing.T) {
+	pos := replication.Position{GTIDSet: replication.Mysql56GTIDSet{}}
+	conn := &Conn{flavor: mysqlFlavor82{}}
+	queries := conn.SetReplicationPositionCommands(pos)
+	assert.Equal(t, []string{"RESET BINARY LOGS AND GTIDS", "SET GLOBAL gtid_purged = ''"}, queries)
 }
 
-func TestMysqlShouldGetRelayLogPosition(t *testing.T) {
-	resultMap := map[string]string{
-		"Executed_Gtid_Set":     "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5",
-		"Retrieved_Gtid_Set":    "3e11fa47-71ca-11e1-9e33-c80aa9429562:6-9",
-		"Exec_Master_Log_Pos":   "1307",
-		"Relay_Master_Log_File": "master-bin.000002",
-		"Read_Master_Log_Pos":   "1308",
-		"Master_Log_File":       "master-bin.000003",
-	}
-
-	sid, _ := ParseSID("3e11fa47-71ca-11e1-9e33-c80aa9429562")
-	want := ReplicationStatus{
-		Position:         Position{GTIDSet: Mysql56GTIDSet{sid: []interval{{start: 1, end: 5}}}},
-		RelayLogPosition: Position{GTIDSet: Mysql56GTIDSet{sid: []interval{{start: 1, end: 9}}}},
-	}
-	got, err := parseMysqlReplicationStatus(resultMap)
-	require.NoError(t, err)
-	assert.Equalf(t, got.RelayLogPosition.GTIDSet.String(), want.RelayLogPosition.GTIDSet.String(), "got RelayLogPosition: %v; want RelayLogPosition: %v", got.RelayLogPosition.GTIDSet, want.RelayLogPosition.GTIDSet)
+func TestMysql8ResetReplicationParametersCommands(t *testing.T) {
+	conn := &Conn{flavor: mysqlFlavor8{}}
+	queries := conn.ResetReplicationParametersCommands()
+	assert.Equal(t, []string{"RESET REPLICA ALL"}, queries)
 }
 
-func TestMysqlShouldGetPosition(t *testing.T) {
-	resultMap := map[string]string{
-		"Executed_Gtid_Set": "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5",
-		"Position":          "1307",
-		"File":              "source-bin.000003",
-	}
-
-	sid, _ := ParseSID("3e11fa47-71ca-11e1-9e33-c80aa9429562")
-	want := PrimaryStatus{
-		Position:     Position{GTIDSet: Mysql56GTIDSet{sid: []interval{{start: 1, end: 5}}}},
-		FilePosition: Position{GTIDSet: filePosGTID{file: "source-bin.000003", pos: 1307}},
-	}
-	got, err := parseMysqlPrimaryStatus(resultMap)
-	require.NoError(t, err)
-	assert.Equalf(t, got.Position.GTIDSet.String(), want.Position.GTIDSet.String(), "got Position: %v; want Position: %v", got.Position.GTIDSet, want.Position.GTIDSet)
-	assert.Equalf(t, got.FilePosition.GTIDSet.String(), want.FilePosition.GTIDSet.String(), "got FilePosition: %v; want FilePosition: %v", got.FilePosition.GTIDSet, want.FilePosition.GTIDSet)
+func TestMysql82ResetReplicationParametersCommands(t *testing.T) {
+	conn := &Conn{flavor: mysqlFlavor82{}}
+	queries := conn.ResetReplicationParametersCommands()
+	assert.Equal(t, []string{"RESET REPLICA ALL"}, queries)
 }

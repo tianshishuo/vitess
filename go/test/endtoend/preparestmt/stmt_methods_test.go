@@ -73,7 +73,7 @@ func TestInsertUpdateDelete(t *testing.T) {
 	// inserting multiple rows into test table
 	for i := 1; i <= 100; i++ {
 		// preparing value for the insert testing
-		insertValue := []interface{}{
+		insertValue := []any{
 			i, strconv.FormatInt(int64(i), 10) + "21", i * 100,
 			127, 1, 32767, 8388607, 2147483647, 2.55, 64.9, 55.5,
 			time.Date(2009, 5, 5, 0, 0, 0, 50000, time.UTC),
@@ -165,7 +165,7 @@ func TestAutoIncColumns(t *testing.T) {
 ) VALUES (?,  ?,  ?,  ?,  ?, ?,
 		  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?, ?, ?, ?,
 		  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?,  ?, ?, ?, ?);`
-	insertValue := []interface{}{
+	insertValue := []any{
 		"21", 0,
 		127, 1, 32767, 8388607, 2147483647, 2.55, 64.9, 55.5,
 		time.Date(2009, 5, 5, 0, 0, 0, 50000, time.UTC),
@@ -235,7 +235,7 @@ func TestColumnParameter(t *testing.T) {
 	parameter1 := "param1"
 	message := "TestColumnParameter"
 	insertStmt := "INSERT INTO " + tableName + " (id, msg, keyspace_id) VALUES (?, ?, ?);"
-	values := []interface{}{
+	values := []any{
 		id,
 		message,
 		2000,
@@ -435,4 +435,25 @@ func TestShowColumns(t *testing.T) {
 	}
 	require.Len(t, cols, 6)
 	require.False(t, rows.Next())
+}
+
+func TestBinaryColumn(t *testing.T) {
+	defer cluster.PanicHandler(t)
+	dbo := Connect(t, "interpolateParams=false")
+	defer dbo.Close()
+
+	_, err := dbo.Query(`SELECT DISTINCT
+                BINARY table_info.table_name AS table_name,
+                table_info.create_options AS create_options,
+                table_info.table_comment AS table_comment
+              FROM information_schema.tables AS table_info
+              JOIN information_schema.columns AS column_info
+                  ON BINARY column_info.table_name = BINARY table_info.table_name
+              WHERE
+                  table_info.table_schema = ?
+                  AND column_info.table_schema = ?
+                  -- Exclude views.
+                  AND table_info.table_type = 'BASE TABLE'
+              ORDER BY BINARY table_info.table_name`, keyspaceName, keyspaceName)
+	require.NoError(t, err)
 }

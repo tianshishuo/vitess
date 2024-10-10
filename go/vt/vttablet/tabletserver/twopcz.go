@@ -19,8 +19,9 @@ package tabletserver
 import (
 	"encoding/json"
 	"fmt"
-	"html/template"
 	"net/http"
+
+	"github.com/google/safehtml/template"
 
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tx"
 
@@ -129,7 +130,7 @@ var (
 	`))
 )
 
-func twopczHandler(txe *TxExecutor, w http.ResponseWriter, r *http.Request) {
+func twopczHandler(txe *DTExecutor, w http.ResponseWriter, r *http.Request) {
 	if err := acl.CheckAccessHTTP(r, acl.DEBUGGING); err != nil {
 		acl.SendError(w, err)
 		return

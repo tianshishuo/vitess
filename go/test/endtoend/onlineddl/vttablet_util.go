@@ -26,13 +26,14 @@ import (
 
 	"vitess.io/vitess/go/test/endtoend/cluster"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 // WaitForVReplicationStatus waits for a vreplication stream to be in one of given states, or timeout
-func WaitForVReplicationStatus(t *testing.T, vtParams *mysql.ConnParams, shards []cluster.Shard, uuid string, timeout time.Duration, expectStatuses ...string) (status string) {
+func WaitForVReplicationStatus(t *testing.T, vtParams *mysql.ConnParams, tablet *cluster.Vttablet, uuid string, timeout time.Duration, expectStatuses ...string) (status string) {
 
-	query, err := sqlparser.ParseAndBind("select workflow, state from _vt.vreplication where workflow=%a",
+	query, err := sqlparser.ParseAndBind("select state from _vt.vreplication where workflow=%a",
 		sqltypes.StringBindVariable(uuid),
 	)
 	require.NoError(t, err)
@@ -44,23 +45,28 @@ func WaitForVReplicationStatus(t *testing.T, vtParams *mysql.ConnParams, shards 
 	startTime := time.Now()
 	lastKnownStatus := ""
 	for time.Since(startTime) < timeout {
-		countMatchedShards := 0
+		r, err := tablet.VttabletProcess.QueryTablet(query, "", true)
+		require.NoError(t, err)
 
-		for _, shard := range shards {
-			r, err := shard.Vttablets[0].VttabletProcess.QueryTablet(query, "", false)
-			require.NoError(t, err)
-
-			for _, row := range r.Named().Rows {
-				lastKnownStatus = row["state"].ToString()
-				if row["workflow"].ToString() == uuid && statusesMap[lastKnownStatus] {
-					countMatchedShards++
-				}
+		if row := r.Named().Row(); row != nil {
+			lastKnownStatus, err = row.ToString("state")
+			assert.NoError(t, err)
+			if statusesMap[lastKnownStatus] {
+				return lastKnownStatus
 			}
-		}
-		if countMatchedShards == len(shards) {
-			return lastKnownStatus
 		}
 		time.Sleep(1 * time.Second)
 	}
 	return lastKnownStatus
+}
+
+func GetMySQLVersion(t *testing.T, tablet *cluster.Vttablet) string {
+	query := `select @@version as version`
+	rs, err := tablet.VttabletProcess.QueryTablet(query, "", true)
+	assert.NoError(t, err)
+	row := rs.Named().Row()
+	assert.NotNil(t, row)
+	version := row["version"].ToString()
+	assert.NotEmpty(t, row)
+	return version
 }

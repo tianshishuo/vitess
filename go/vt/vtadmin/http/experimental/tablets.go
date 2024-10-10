@@ -35,9 +35,14 @@ import (
 func TabletDebugVarsPassthrough(ctx context.Context, r vtadminhttp.Request, api *vtadminhttp.API) *vtadminhttp.JSONResponse {
 	vars := r.Vars()
 
+	alias, err := vars.GetTabletAlias("tablet")
+	if err != nil {
+		return vtadminhttp.NewJSONResponse(nil, err)
+	}
+
 	tablet, err := api.Server().GetTablet(ctx, &vtadminpb.GetTabletRequest{
-		Alias:      vars["tablet"],
-		ClusterIds: r.URL.Query()["cluster"],
+		Alias:      alias,
+		ClusterIds: r.URL.Query()["cluster_id"],
 	})
 
 	if err != nil {
@@ -48,7 +53,7 @@ func TabletDebugVarsPassthrough(ctx context.Context, r vtadminhttp.Request, api 
 	return vtadminhttp.NewJSONResponse(debugVars, err)
 }
 
-func getDebugVars(ctx context.Context, api *vtadminhttp.API, tablet *vtadminpb.Tablet) (map[string]interface{}, error) {
+func getDebugVars(ctx context.Context, api *vtadminhttp.API, tablet *vtadminpb.Tablet) (map[string]any, error) {
 	tmpl, err := template.New("tablet-fqdn").Parse(api.Options().ExperimentalOptions.TabletURLTmpl)
 	if err != nil {
 		return nil, err
@@ -78,7 +83,7 @@ func getDebugVars(ctx context.Context, api *vtadminhttp.API, tablet *vtadminpb.T
 		return nil, err
 	}
 
-	var debugVars map[string]interface{}
+	var debugVars map[string]any
 	if err := json.Unmarshal(data, &debugVars); err != nil {
 		return nil, err
 	}

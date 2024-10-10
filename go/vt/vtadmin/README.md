@@ -1,7 +1,6 @@
 # VTAdmin
 
-VTAdmin is an experimental replacement for the vtctld2 web UI, that also allows
-users to manage multiple Vitess clusters from a single API and web UI.
+VTAdmin is web UI and API that allows users to manage multiple Vitess clusters at once.
 
 For a more detailed writeup, refer to the [original RFC](https://github.com/vitessio/vitess/issues/7117).
 
@@ -49,7 +48,7 @@ Then, you can run `make build`, and run `./bin/vtadmin` with any flags you need
 
 ### Building and running `vtadmin-web`
 
-Make sure you are using node version 12.x.
+Make sure you are using node version 16.x.
 
 Then, you may run:
 
@@ -59,7 +58,7 @@ npm install
 
 # This should be the address you passed to `./vtadmin --addr`. For example,
 # "http://127.0.0.1:14200".
-export REACT_APP_VTADMIN_API_ADDRESS="${vtadmin_api_addr}"
-export REACT_APP_ENABLE_EXPERIMENTAL_TABLET_DEBUG_VARS="true"
+export VITE_VTADMIN_API_ADDRESS="${vtadmin_api_addr}"
+export VITE_ENABLE_EXPERIMENTAL_TABLET_DEBUG_VARS="true"
 npm run start
 ```

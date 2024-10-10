@@ -25,6 +25,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"vitess.io/vitess/go/constants/sidecar"
 	"vitess.io/vitess/go/test/endtoend/cluster"
 	"vitess.io/vitess/go/test/endtoend/encryption"
 	"vitess.io/vitess/go/vt/log"
@@ -60,10 +61,10 @@ func testReplicationBase(t *testing.T, isClientCertPassed bool) {
 	replicaTablet := *clusterInstance.Keyspaces[0].Shards[0].Vttablets[1]
 
 	if isClientCertPassed {
-		replicaTablet.VttabletProcess.ExtraArgs = append(replicaTablet.VttabletProcess.ExtraArgs, "-db_flags", "2048",
-			"-db_ssl_ca", path.Join(certDirectory, "ca-cert.pem"),
-			"-db_ssl_cert", path.Join(certDirectory, "client-cert.pem"),
-			"-db_ssl_key", path.Join(certDirectory, "client-key.pem"),
+		replicaTablet.VttabletProcess.ExtraArgs = append(replicaTablet.VttabletProcess.ExtraArgs, "--db_flags", "2048",
+			"--db_ssl_ca", path.Join(certDirectory, "ca-cert.pem"),
+			"--db_ssl_cert", path.Join(certDirectory, "client-cert.pem"),
+			"--db_ssl_key", path.Join(certDirectory, "client-key.pem"),
 		)
 	}
 
@@ -73,12 +74,15 @@ func testReplicationBase(t *testing.T, isClientCertPassed bool) {
 	}
 
 	// Reparent using SSL (this will also check replication works)
-	err = clusterInstance.VtctlclientProcess.InitializeShard(keyspace, shardName, clusterInstance.Cell, primaryTablet.TabletUID)
+	err = clusterInstance.VtctldClientProcess.InitializeShard(keyspace, shardName, clusterInstance.Cell, primaryTablet.TabletUID)
 	if isClientCertPassed {
 		require.NoError(t, err)
 	} else {
 		require.Error(t, err)
 	}
+
+	err = clusterInstance.StartVTOrc(keyspace)
+	require.NoError(t, err)
 }
 
 func initializeCluster(t *testing.T) (int, error) {
@@ -95,13 +99,13 @@ func initializeCluster(t *testing.T) (int, error) {
 	certDirectory = path.Join(clusterInstance.TmpDirectory, "certs")
 	_ = encryption.CreateDirectory(certDirectory, 0700)
 
-	err := encryption.ExecuteVttlstestCommand("-root", certDirectory, "CreateCA")
+	err := encryption.ExecuteVttlstestCommand("CreateCA", "--root", certDirectory)
 	require.NoError(t, err)
 
-	err = encryption.ExecuteVttlstestCommand("-root", certDirectory, "CreateSignedCert", "-common_name", "Mysql Server", "-serial", "01", "server")
+	err = encryption.ExecuteVttlstestCommand("CreateSignedCert", "--root", certDirectory, "--common-name", "Mysql Server", "--serial", "01", "server")
 	require.NoError(t, err)
 
-	err = encryption.ExecuteVttlstestCommand("-root", certDirectory, "CreateSignedCert", "-common_name", "Mysql Client", "-serial", "02", "client")
+	err = encryption.ExecuteVttlstestCommand("CreateSignedCert", "--root", certDirectory, "--common-name", "Mysql Client", "--serial", "02", "client")
 	require.NoError(t, err)
 
 	extraMyCnf := path.Join(certDirectory, "secure.cnf")
@@ -127,7 +131,7 @@ func initializeCluster(t *testing.T) (int, error) {
 	for _, keyspaceStr := range []string{keyspace} {
 		KeyspacePtr := &cluster.Keyspace{Name: keyspaceStr}
 		keyspace := *KeyspacePtr
-		if err := clusterInstance.VtctlProcess.CreateKeyspace(keyspace.Name); err != nil {
+		if err := clusterInstance.VtctlProcess.CreateKeyspace(keyspace.Name, sidecar.DefaultName, ""); err != nil {
 			return 1, err
 		}
 		shard := &cluster.Shard{
@@ -139,7 +143,11 @@ func initializeCluster(t *testing.T) (int, error) {
 			tablet := clusterInstance.NewVttabletInstance("replica", tabletUID, cell)
 
 			// Start Mysqlctl process
-			tablet.MysqlctlProcess = *cluster.MysqlCtlProcessInstance(tablet.TabletUID, tablet.MySQLPort, clusterInstance.TmpDirectory)
+			mysqlctlProcess, err := cluster.MysqlCtlProcessInstance(tablet.TabletUID, tablet.MySQLPort, clusterInstance.TmpDirectory)
+			if err != nil {
+				return 1, err
+			}
+			tablet.MysqlctlProcess = *mysqlctlProcess
 			proc, err := tablet.MysqlctlProcess.StartProcess()
 			if err != nil {
 				return 1, err
@@ -159,7 +167,6 @@ func initializeCluster(t *testing.T) (int, error) {
 				clusterInstance.Hostname,
 				clusterInstance.TmpDirectory,
 				clusterInstance.VtTabletExtraArgs,
-				clusterInstance.EnableSemiSync,
 				clusterInstance.DefaultCharset)
 			tablet.Alias = tablet.VttabletProcess.TabletPath
 			shard.Vttablets = append(shard.Vttablets, tablet)

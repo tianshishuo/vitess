@@ -18,9 +18,58 @@ package vtctlbackup
 
 import (
 	"testing"
+
+	"vitess.io/vitess/go/vt/mysqlctl"
 )
 
-// TestBackupMain - main tests backup using vtctl commands
-func TestBackupMain(t *testing.T) {
-	TestBackup(t, Backup, "", 0)
+// TestBuiltinBackup - main tests backup using vtctl commands
+func TestBuiltinBackup(t *testing.T) {
+	TestBackup(t, BuiltinBackup, "xbstream", 0, nil, nil)
+}
+
+func TestBuiltinBackupWithZstdCompression(t *testing.T) {
+	defer setDefaultCompressionFlag()
+	defer setDefaultCommonArgs()
+	cDetails := &CompressionDetails{
+		CompressorEngineName:    "zstd",
+		ExternalCompressorCmd:   "zstd",
+		ExternalCompressorExt:   ".zst",
+		ExternalDecompressorCmd: "zstd -d",
+	}
+
+	TestBackup(t, BuiltinBackup, "xbstream", 0, cDetails, []string{"TestReplicaBackup", "TestPrimaryBackup"})
+}
+
+func TestBuiltinBackupWithExternalZstdCompression(t *testing.T) {
+	defer setDefaultCompressionFlag()
+	defer setDefaultCommonArgs()
+	cDetails := &CompressionDetails{
+		CompressorEngineName:    "external",
+		ExternalCompressorCmd:   "zstd",
+		ExternalCompressorExt:   ".zst",
+		ExternalDecompressorCmd: "zstd -d",
+	}
+
+	TestBackup(t, BuiltinBackup, "xbstream", 0, cDetails, []string{"TestReplicaBackup", "TestPrimaryBackup"})
+}
+
+func TestBuiltinBackupWithExternalZstdCompressionAndManifestedDecompressor(t *testing.T) {
+	defer setDefaultCompressionFlag()
+	defer setDefaultCommonArgs()
+	cDetails := &CompressionDetails{
+		CompressorEngineName:            "external",
+		ExternalCompressorCmd:           "zstd",
+		ExternalCompressorExt:           ".zst",
+		ManifestExternalDecompressorCmd: "zstd -d",
+	}
+
+	TestBackup(t, BuiltinBackup, "xbstream", 0, cDetails, []string{"TestReplicaBackup", "TestPrimaryBackup"})
+}
+
+func setDefaultCompressionFlag() {
+	mysqlctl.CompressionEngineName = "pgzip"
+	mysqlctl.ExternalCompressorCmd = ""
+	mysqlctl.ExternalCompressorExt = ""
+	mysqlctl.ExternalDecompressorCmd = ""
+	mysqlctl.ManifestExternalDecompressorCmd = ""
 }

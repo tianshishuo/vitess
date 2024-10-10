@@ -18,6 +18,7 @@ package wrangler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -28,34 +29,34 @@ import (
 	"vitess.io/vitess/go/vt/schema"
 	"vitess.io/vitess/go/vt/vtctl/workflow"
 
-	"github.com/pkg/errors"
-
 	"vitess.io/vitess/go/sqltypes"
-	"vitess.io/vitess/go/vt/binlog/binlogplayer"
 	"vitess.io/vitess/go/vt/concurrency"
 	"vitess.io/vitess/go/vt/key"
-	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
-	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topotools"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/vindexes"
 	"vitess.io/vitess/go/vt/vttablet/tabletmanager/vreplication"
+
+	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
+	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
 )
 
 type resharder struct {
-	wr              *Wrangler
-	keyspace        string
-	workflow        string
-	sourceShards    []*topo.ShardInfo
-	sourcePrimaries map[string]*topo.TabletInfo
-	targetShards    []*topo.ShardInfo
-	targetPrimaries map[string]*topo.TabletInfo
-	vschema         *vschemapb.Keyspace
-	refStreams      map[string]*refStream
-	cell            string //single cell or cellsAlias or comma-separated list of cells/cellsAliases
-	tabletTypes     string
-	stopAfterCopy   bool
+	wr                 *Wrangler
+	keyspace           string
+	workflow           string
+	sourceShards       []*topo.ShardInfo
+	sourcePrimaries    map[string]*topo.TabletInfo
+	targetShards       []*topo.ShardInfo
+	targetPrimaries    map[string]*topo.TabletInfo
+	vschema            *vschemapb.Keyspace
+	refStreams         map[string]*refStream
+	cell               string //single cell or cellsAlias or comma-separated list of cells/cellsAliases
+	tabletTypes        string
+	stopAfterCopy      bool
+	onDDL              string
+	deferSecondaryKeys bool
 }
 
 type refStream struct {
@@ -67,7 +68,7 @@ type refStream struct {
 
 // Reshard initiates a resharding workflow.
 func (wr *Wrangler) Reshard(ctx context.Context, keyspace, workflow string, sources, targets []string,
-	skipSchemaCopy bool, cell, tabletTypes string, autoStart, stopAfterCopy bool) error {
+	skipSchemaCopy bool, cell, tabletTypes, onDDL string, autoStart, stopAfterCopy, deferSecondaryKeys bool) error {
 	if err := wr.validateNewWorkflow(ctx, keyspace, workflow); err != nil {
 		return err
 	}
@@ -82,7 +83,9 @@ func (wr *Wrangler) Reshard(ctx context.Context, keyspace, workflow string, sour
 		return vterrors.Wrap(err, "buildResharder")
 	}
 
+	rs.onDDL = onDDL
 	rs.stopAfterCopy = stopAfterCopy
+	rs.deferSecondaryKeys = deferSecondaryKeys
 	if !skipSchemaCopy {
 		if err := rs.copySchema(ctx); err != nil {
 			return vterrors.Wrap(err, "copySchema")
@@ -161,6 +164,9 @@ func (wr *Wrangler) buildResharder(ctx context.Context, keyspace, workflow strin
 	return rs, nil
 }
 
+// validateTargets ensures that the target shards have no existing
+// VReplication workflow streams as that is an invalid starting
+// state for the non-serving shards involved in a Reshard.
 func (rs *resharder) validateTargets(ctx context.Context) error {
 	err := rs.forAll(rs.targetShards, func(target *topo.ShardInfo) error {
 		targetPrimary := rs.targetPrimaries[target.ShardName()]
@@ -295,6 +301,8 @@ func (rs *resharder) copySchema(ctx context.Context) error {
 	return err
 }
 
+// createStreams creates all of the VReplication streams that
+// need to now exist on the new shards.
 func (rs *resharder) createStreams(ctx context.Context) error {
 	var excludeRules []*binlogdatapb.Rule
 	for tableName, table := range rs.vschema.Tables {
@@ -309,12 +317,12 @@ func (rs *resharder) createStreams(ctx context.Context) error {
 	err := rs.forAll(rs.targetShards, func(target *topo.ShardInfo) error {
 		targetPrimary := rs.targetPrimaries[target.ShardName()]
 
-		ig := vreplication.NewInsertGenerator(binlogplayer.BlpStopped, targetPrimary.DbName())
+		ig := vreplication.NewInsertGenerator(binlogdatapb.VReplicationWorkflowState_Stopped, targetPrimary.DbName())
 
 		// copy excludeRules to prevent data race.
 		copyExcludeRules := append([]*binlogdatapb.Rule(nil), excludeRules...)
 		for _, source := range rs.sourceShards {
-			if !key.KeyRangesIntersect(target.KeyRange, source.KeyRange) {
+			if !key.KeyRangeIntersect(target.KeyRange, source.KeyRange) {
 				continue
 			}
 			filter := &binlogdatapb.Filter{
@@ -328,12 +336,20 @@ func (rs *resharder) createStreams(ctx context.Context) error {
 				Shard:         source.ShardName(),
 				Filter:        filter,
 				StopAfterCopy: rs.stopAfterCopy,
+				OnDdl:         binlogdatapb.OnDDLAction(binlogdatapb.OnDDLAction_value[rs.onDDL]),
 			}
-			ig.AddRow(rs.workflow, bls, "", rs.cell, rs.tabletTypes)
+			ig.AddRow(rs.workflow, bls, "", rs.cell, rs.tabletTypes,
+				binlogdatapb.VReplicationWorkflowType_Reshard,
+				binlogdatapb.VReplicationWorkflowSubType_None,
+				rs.deferSecondaryKeys, "")
 		}
 
 		for _, rstream := range rs.refStreams {
-			ig.AddRow(rstream.workflow, rstream.bls, "", rstream.cell, rstream.tabletTypes)
+			ig.AddRow(rstream.workflow, rstream.bls, "", rstream.cell, rstream.tabletTypes,
+				//todo: fix based on original stream
+				binlogdatapb.VReplicationWorkflowType_Reshard,
+				binlogdatapb.VReplicationWorkflowSubType_None,
+				rs.deferSecondaryKeys, "")
 		}
 		query := ig.String()
 		if _, err := rs.wr.tmc.VReplicationExec(ctx, targetPrimary.Tablet, query); err != nil {
@@ -348,7 +364,14 @@ func (rs *resharder) createStreams(ctx context.Context) error {
 func (rs *resharder) startStreams(ctx context.Context) error {
 	err := rs.forAll(rs.targetShards, func(target *topo.ShardInfo) error {
 		targetPrimary := rs.targetPrimaries[target.ShardName()]
-		query := fmt.Sprintf("update _vt.vreplication set state='Running' where db_name=%s", encodeString(targetPrimary.DbName()))
+		// This is the rare case where we truly want to update every stream/record
+		// because we've already confirmed that there were no existing workflows
+		// on the shards when we started, and we want to start all of the ones
+		// that we've created on the new shards as we're migrating them.
+		// We use the comment directive to indicate that this is intentional
+		// and OK.
+		query := fmt.Sprintf("update /*vt+ %s */ _vt.vreplication set state='Running' where db_name=%s",
+			vreplication.AllowUnsafeWriteCommentDirective, encodeString(targetPrimary.DbName()))
 		if _, err := rs.wr.tmc.VReplicationExec(ctx, targetPrimary.Tablet, query); err != nil {
 			return vterrors.Wrapf(err, "VReplicationExec(%v, %s)", targetPrimary.Tablet, query)
 		}

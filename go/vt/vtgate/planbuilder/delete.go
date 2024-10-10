@@ -17,56 +17,73 @@ limitations under the License.
 package planbuilder
 
 import (
-	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
+	querypb "vitess.io/vitess/go/vt/proto/query"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/engine"
+	"vitess.io/vitess/go/vt/vtgate/planbuilder/operators"
 	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
+	"vitess.io/vitess/go/vt/vtgate/vindexes"
 )
 
-// buildDeletePlan builds the instructions for a DELETE statement.
-func buildDeletePlan(stmt sqlparser.Statement, reservedVars *sqlparser.ReservedVars, vschema plancontext.VSchema) (engine.Primitive, error) {
-	del := stmt.(*sqlparser.Delete)
-	if del.With != nil {
-		return nil, vterrors.New(vtrpcpb.Code_UNIMPLEMENTED, "unsupported: with expression in delete statement")
+func gen4DeleteStmtPlanner(
+	version querypb.ExecuteOptions_PlannerVersion,
+	deleteStmt *sqlparser.Delete,
+	reservedVars *sqlparser.ReservedVars,
+	vschema plancontext.VSchema,
+) (*planResult, error) {
+	if deleteStmt.With != nil {
+		return nil, vterrors.VT12001("WITH expression in DELETE statement")
 	}
+
 	var err error
-	if len(del.TableExprs) == 1 && len(del.Targets) == 1 {
-		del, err = rewriteSingleTbl(del)
+	if len(deleteStmt.TableExprs) == 1 && len(deleteStmt.Targets) == 1 {
+		deleteStmt, err = rewriteSingleTbl(deleteStmt)
 		if err != nil {
 			return nil, err
 		}
 	}
-	dml, ksidVindex, err := buildDMLPlan(vschema, "delete", del, reservedVars, del.TableExprs, del.Where, del.OrderBy, del.Limit, del.Comments, del.Targets)
+
+	ctx, err := plancontext.CreatePlanningContext(deleteStmt, reservedVars, vschema, version)
 	if err != nil {
 		return nil, err
 	}
-	edel := &engine.Delete{DML: dml}
 
-	if dml.Opcode == engine.Unsharded {
-		return edel, nil
+	err = queryRewrite(ctx, deleteStmt)
+	if err != nil {
+		return nil, err
 	}
 
-	if len(del.Targets) > 1 {
-		return nil, vterrors.New(vtrpcpb.Code_UNIMPLEMENTED, "multi-table delete statement in not supported in sharded database")
+	// Remove all the foreign keys that don't require any handling.
+	err = ctx.SemTable.RemoveNonRequiredForeignKeys(ctx.VerifyAllFKs, vindexes.DeleteAction)
+	if err != nil {
+		return nil, err
 	}
 
-	if len(del.Targets) == 1 && del.Targets[0].Name != edel.Table.Name {
-		return nil, vterrors.NewErrorf(vtrpcpb.Code_INVALID_ARGUMENT, vterrors.UnknownTable, "Unknown table '%s' in MULTI DELETE", del.Targets[0].Name.String())
-	}
-
-	if len(edel.Table.Owned) > 0 {
-		aTblExpr, ok := del.TableExprs[0].(*sqlparser.AliasedTableExpr)
-		if !ok {
-			return nil, vterrors.New(vtrpcpb.Code_UNIMPLEMENTED, "unsupported: delete on complex table expression")
+	if ks, tables := ctx.SemTable.SingleUnshardedKeyspace(); ks != nil {
+		if !ctx.SemTable.ForeignKeysPresent() {
+			plan := deleteUnshardedShortcut(deleteStmt, ks, tables)
+			return newPlanResult(plan, operators.QualifiedTables(ks, tables)...), nil
 		}
-		tblExpr := &sqlparser.AliasedTableExpr{Expr: sqlparser.TableName{Name: edel.Table.Name}, As: aTblExpr.As}
-		edel.OwnedVindexQuery = generateDMLSubquery(tblExpr, del.Where, del.OrderBy, del.Limit, edel.Table, ksidVindex.Columns)
-		edel.KsidVindex = ksidVindex.Vindex
-		edel.KsidLength = len(ksidVindex.Columns)
 	}
 
-	return edel, nil
+	// error out here if delete query cannot bypass the planner and
+	// planner cannot plan such query due to different reason like missing full information, etc.
+	if ctx.SemTable.NotUnshardedErr != nil {
+		return nil, ctx.SemTable.NotUnshardedErr
+	}
+
+	op, err := operators.PlanQuery(ctx, deleteStmt)
+	if err != nil {
+		return nil, err
+	}
+
+	plan, err := transformToPrimitive(ctx, op)
+	if err != nil {
+		return nil, err
+	}
+
+	return newPlanResult(plan, operators.TablesUsed(op)...), nil
 }
 
 func rewriteSingleTbl(del *sqlparser.Delete) (*sqlparser.Delete, error) {
@@ -74,33 +91,45 @@ func rewriteSingleTbl(del *sqlparser.Delete) (*sqlparser.Delete, error) {
 	if !ok {
 		return del, nil
 	}
-	if !atExpr.As.IsEmpty() && !sqlparser.EqualsTableIdent(del.Targets[0].Name, atExpr.As) {
-		//Unknown table in MULTI DELETE
-		return nil, vterrors.NewErrorf(vtrpcpb.Code_INVALID_ARGUMENT, vterrors.UnknownTable, "Unknown table '%s' in MULTI DELETE", del.Targets[0].Name.String())
+	if atExpr.As.NotEmpty() && !sqlparser.Equals.IdentifierCS(del.Targets[0].Name, atExpr.As) {
+		// Unknown table in MULTI DELETE
+		return nil, vterrors.VT03003(del.Targets[0].Name.String())
 	}
 
 	tbl, ok := atExpr.Expr.(sqlparser.TableName)
 	if !ok {
 		// derived table
-		return nil, vterrors.NewErrorf(vtrpcpb.Code_INVALID_ARGUMENT, vterrors.NonUpdateableTable, "The target table %s of the DELETE is not updatable", atExpr.As.String())
+		return nil, vterrors.VT03004(atExpr.As.String())
 	}
-	if atExpr.As.IsEmpty() && !sqlparser.EqualsTableIdent(del.Targets[0].Name, tbl.Name) {
-		//Unknown table in MULTI DELETE
-		return nil, vterrors.NewErrorf(vtrpcpb.Code_INVALID_ARGUMENT, vterrors.UnknownTable, "Unknown table '%s' in MULTI DELETE", del.Targets[0].Name.String())
+	if atExpr.As.IsEmpty() && !sqlparser.Equals.IdentifierCS(del.Targets[0].Name, tbl.Name) {
+		// Unknown table in MULTI DELETE
+		return nil, vterrors.VT03003(del.Targets[0].Name.String())
 	}
 
 	del.TableExprs = sqlparser.TableExprs{&sqlparser.AliasedTableExpr{Expr: tbl}}
 	del.Targets = nil
 	if del.Where != nil {
-		_ = sqlparser.Rewrite(del.Where, func(cursor *sqlparser.Cursor) bool {
-			switch node := cursor.Node().(type) {
-			case *sqlparser.ColName:
-				if !node.Qualifier.IsEmpty() {
-					node.Qualifier = tbl
-				}
+		_ = sqlparser.Walk(func(node sqlparser.SQLNode) (kontinue bool, err error) {
+			col, ok := node.(*sqlparser.ColName)
+			if !ok {
+				return true, nil
 			}
-			return true
-		}, nil)
+			if !col.Qualifier.IsEmpty() {
+				col.Qualifier = tbl
+			}
+			return true, nil
+		}, del.Where)
 	}
 	return del, nil
+}
+
+func deleteUnshardedShortcut(stmt *sqlparser.Delete, ks *vindexes.Keyspace, tables []*vindexes.Table) engine.Primitive {
+	edml := engine.NewDML()
+	edml.Keyspace = ks
+	edml.Opcode = engine.Unsharded
+	edml.Query = generateQuery(stmt)
+	for _, tbl := range tables {
+		edml.TableNames = append(edml.TableNames, tbl.Name.String())
+	}
+	return &engine.Delete{DML: edml}
 }

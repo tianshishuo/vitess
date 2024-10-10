@@ -17,32 +17,42 @@ limitations under the License.
 package tabletmanager
 
 import (
-	"flag"
+	"context"
 	"fmt"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	"vitess.io/vitess/go/vt/servenv"
-
-	"context"
-
+	"github.com/spf13/pflag"
 	"google.golang.org/protobuf/proto"
 
+	"vitess.io/vitess/go/protoutil"
 	"vitess.io/vitess/go/trace"
 	"vitess.io/vitess/go/vt/key"
 	"vitess.io/vitess/go/vt/log"
-	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/mysqlctl"
-	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/servenv"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/topoproto"
 	"vitess.io/vitess/go/vt/topotools"
+	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/rules"
+
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
-var publishRetryInterval = flag.Duration("publish_retry_interval", 30*time.Second, "how long vttablet waits to retry publishing the tablet record")
+var publishRetryInterval = 30 * time.Second
+
+func registerStateFlags(fs *pflag.FlagSet) {
+	fs.DurationVar(&publishRetryInterval, "publish_retry_interval", publishRetryInterval, "how long vttablet waits to retry publishing the tablet record")
+}
+
+func init() {
+	servenv.OnParseFor("vtcombo", registerStateFlags)
+	servenv.OnParseFor("vttablet", registerStateFlags)
+}
 
 // tmState manages the state of the TabletManager.
 type tmState struct {
@@ -59,17 +69,16 @@ type tmState struct {
 	// Because mu can be held for long, we publish the current state
 	// of these variables into displayState, which can be accessed
 	// more freely even while tmState is busy transitioning.
-	mu                       sync.Mutex
-	isOpen                   bool
-	isOpening                bool
-	isResharding             bool
-	isInSrvKeyspace          bool
-	isShardServing           map[topodatapb.TabletType]bool
-	tabletControls           map[topodatapb.TabletType]bool
-	deniedTables             map[topodatapb.TabletType][]string
-	tablet                   *topodatapb.Tablet
-	isPublishing             bool
-	hasCreatedMetadataTables bool
+	mu              sync.Mutex
+	isOpen          bool
+	isOpening       bool
+	isResharding    bool
+	isInSrvKeyspace bool
+	isShardServing  map[topodatapb.TabletType]bool
+	tabletControls  map[topodatapb.TabletType]bool
+	deniedTables    map[topodatapb.TabletType][]string
+	tablet          *topodatapb.Tablet
+	isPublishing    bool
 
 	// displayState contains the current snapshot of the internal state
 	// and has its own mutex.
@@ -81,7 +90,7 @@ func newTMState(tm *TabletManager, tablet *topodatapb.Tablet) *tmState {
 	return &tmState{
 		tm: tm,
 		displayState: displayState{
-			tablet: proto.Clone(tablet).(*topodatapb.Tablet),
+			tablet: tablet.CloneVT(),
 		},
 		tablet: tablet,
 		ctx:    ctx,
@@ -90,6 +99,7 @@ func newTMState(tm *TabletManager, tablet *topodatapb.Tablet) *tmState {
 }
 
 func (ts *tmState) Open() {
+	log.Infof("In tmState.Open()")
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 	if ts.isOpen {
@@ -98,12 +108,13 @@ func (ts *tmState) Open() {
 
 	ts.isOpen = true
 	ts.isOpening = true
-	ts.updateLocked(ts.ctx)
+	_ = ts.updateLocked(ts.ctx)
 	ts.isOpening = false
 	ts.publishStateLocked(ts.ctx)
 }
 
 func (ts *tmState) Close() {
+	log.Infof("In tmState.Close()")
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 
@@ -125,11 +136,10 @@ func (ts *tmState) RefreshFromTopo(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	ts.RefreshFromTopoInfo(ctx, shardInfo, srvKeyspace)
-	return nil
+	return ts.RefreshFromTopoInfo(ctx, shardInfo, srvKeyspace)
 }
 
-func (ts *tmState) RefreshFromTopoInfo(ctx context.Context, shardInfo *topo.ShardInfo, srvKeyspace *topodatapb.SrvKeyspace) {
+func (ts *tmState) RefreshFromTopoInfo(ctx context.Context, shardInfo *topo.ShardInfo, srvKeyspace *topodatapb.SrvKeyspace) error {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 
@@ -147,6 +157,7 @@ func (ts *tmState) RefreshFromTopoInfo(ctx context.Context, shardInfo *topo.Shar
 	if srvKeyspace != nil {
 		ts.isShardServing = make(map[topodatapb.TabletType]bool)
 		ts.tabletControls = make(map[topodatapb.TabletType]bool)
+		ts.tm.QueryServiceControl.SetTwoPCAllowed(tabletserver.TwoPCAllowed_TabletControls, true)
 
 		for _, partition := range srvKeyspace.GetPartitions() {
 
@@ -159,7 +170,10 @@ func (ts *tmState) RefreshFromTopoInfo(ctx context.Context, shardInfo *topo.Shar
 			for _, tabletControl := range partition.GetShardTabletControls() {
 				if key.KeyRangeEqual(tabletControl.GetKeyRange(), ts.KeyRange()) {
 					if tabletControl.QueryServiceDisabled {
-						ts.tabletControls[partition.GetServedType()] = true
+						err := ts.prepareForDisableQueryService(ctx, partition.GetServedType())
+						if err != nil {
+							return err
+						}
 					}
 					break
 				}
@@ -167,16 +181,29 @@ func (ts *tmState) RefreshFromTopoInfo(ctx context.Context, shardInfo *topo.Shar
 		}
 	}
 
-	ts.updateLocked(ctx)
+	return ts.updateLocked(ctx)
+}
+
+// prepareForDisableQueryService prepares the tablet for disabling query service.
+func (ts *tmState) prepareForDisableQueryService(ctx context.Context, servType topodatapb.TabletType) error {
+	if servType == topodatapb.TabletType_PRIMARY {
+		ts.tm.QueryServiceControl.SetTwoPCAllowed(tabletserver.TwoPCAllowed_TabletControls, false)
+		err := ts.tm.QueryServiceControl.WaitForPreparedTwoPCTransactions(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	ts.tabletControls[servType] = true
+	return nil
 }
 
 func (ts *tmState) ChangeTabletType(ctx context.Context, tabletType topodatapb.TabletType, action DBAction) error {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
-	log.Infof("Changing Tablet Type: %v", tabletType)
+	log.Infof("Changing Tablet Type: %v for %s", tabletType, ts.tablet.Alias.String())
 
 	if tabletType == topodatapb.TabletType_PRIMARY {
-		PrimaryTermStartTime := logutil.TimeToProto(time.Now())
+		PrimaryTermStartTime := protoutil.TimeToProto(time.Now())
 
 		// Update the tablet record first.
 		_, err := topotools.ChangeType(ctx, ts.tm.TopoServer, ts.tm.tabletAlias, tabletType, PrimaryTermStartTime)
@@ -186,6 +213,9 @@ func (ts *tmState) ChangeTabletType(ctx context.Context, tabletType topodatapb.T
 			// We must read the data again and verify whether the previous write succeeded or not.
 			// The only way to guarantee safety is to keep retrying read until we succeed
 			for {
+				if ctx.Err() != nil {
+					return fmt.Errorf("context canceled updating tablet_type for %s in the topo, please retry", ts.tm.tabletAlias)
+				}
 				ti, errInReading := ts.tm.TopoServer.GetTablet(ctx, ts.tm.tabletAlias)
 				if errInReading != nil {
 					<-time.After(100 * time.Millisecond)
@@ -199,10 +229,12 @@ func (ts *tmState) ChangeTabletType(ctx context.Context, tabletType topodatapb.T
 				return err
 			}
 		}
+
 		if action == DBActionSetReadWrite {
+			// We need to redo the prepared transactions in read only mode using the dba user to ensure we don't lose them.
 			// We call SetReadOnly only after the topo has been updated to avoid
 			// situations where two tablets are primary at the DB level but not at the vitess level
-			if err := ts.tm.MysqlDaemon.SetReadOnly(false); err != nil {
+			if err = ts.tm.redoPreparedTransactionsAndSetReadWrite(ctx); err != nil {
 				return err
 			}
 		}
@@ -218,10 +250,22 @@ func (ts *tmState) ChangeTabletType(ctx context.Context, tabletType topodatapb.T
 	statsTabletType.Set(s)
 	statsTabletTypeCount.Add(s, 1)
 
-	ts.updateLocked(ctx)
+	err := ts.updateLocked(ctx)
+	// No need to short circuit. Apply all steps and return error in the end.
 	ts.publishStateLocked(ctx)
 	ts.tm.notifyShardSync()
-	return nil
+	return err
+}
+
+func (ts *tmState) ChangeTabletTags(ctx context.Context, tabletTags map[string]string) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	log.Infof("Changing Tablet Tags: %v for %s", tabletTags, ts.tablet.Alias.String())
+
+	ts.tablet.Tags = tabletTags
+	ts.publishStateLocked(ctx)
+	ts.publishForDisplay()
+	setTabletTagsStats(ts.tablet)
 }
 
 func (ts *tmState) SetMysqlPort(mport int32) {
@@ -240,32 +284,42 @@ func (ts *tmState) UpdateTablet(update func(tablet *topodatapb.Tablet)) {
 	ts.publishForDisplay()
 }
 
-func (ts *tmState) updateLocked(ctx context.Context) {
+func (ts *tmState) updateLocked(ctx context.Context) error {
 	span, ctx := trace.NewSpan(ctx, "tmState.update")
 	defer span.Finish()
 	ts.publishForDisplay()
-
+	var returnErr error
 	if !ts.isOpen {
-		return
+		return nil
 	}
 
-	terTime := logutil.ProtoToTime(ts.tablet.PrimaryTermStartTime)
+	ptsTime := protoutil.TimeFromProto(ts.tablet.PrimaryTermStartTime).UTC()
 
 	// Disable TabletServer first so the nonserving state gets advertised
 	// before other services are shutdown.
 	reason := ts.canServe(ts.tablet.Type)
 	if reason != "" {
 		log.Infof("Disabling query service: %v", reason)
-		if err := ts.tm.QueryServiceControl.SetServingType(ts.tablet.Type, terTime, false, reason); err != nil {
-			log.Errorf("SetServingType(serving=false) failed: %v", err)
+		// SetServingType can result in error. Although we have forever retries to fix these transient errors
+		// but, under certain conditions these errors are non-transient (see https://github.com/vitessio/vitess/issues/10145).
+		// There is no way to distinguish between retry (transient) and non-retryable errors, therefore we will
+		// always return error from 'SetServingType' and 'applyDenyList' to our client. It is up to them to handle it accordingly.
+		// UpdateLock is called from 'ChangeTabletType', 'Open' and 'RefreshFromTopoInfo'. For 'Open' and 'RefreshFromTopoInfo' we don't need
+		// to propagate error to client hence no changes there but we will propagate error from 'ChangeTabletType' to client.
+		if err := ts.tm.QueryServiceControl.SetServingType(ts.tablet.Type, ptsTime, false, reason); err != nil {
+			errStr := fmt.Sprintf("SetServingType(serving=false) failed: %v", err)
+			log.Errorf(errStr)
+			// No need to short circuit. Apply all steps and return error in the end.
+			returnErr = vterrors.Wrap(err, errStr)
 		}
 	}
 
 	if err := ts.applyDenyList(ctx); err != nil {
-		log.Errorf("Cannot update denied tables rule: %v", err)
+		errStr := fmt.Sprintf("Cannot update denied tables rule: %v", err)
+		log.Errorf(errStr)
+		// No need to short circuit. Apply all steps and return error in the end.
+		returnErr = vterrors.Wrap(err, errStr)
 	}
-
-	ts.tm.replManager.SetTabletType(ts.tablet.Type)
 
 	if ts.tm.UpdateStream != nil {
 		if topo.IsRunningUpdateStream(ts.tablet.Type) {
@@ -283,6 +337,14 @@ func (ts *tmState) updateLocked(ctx context.Context) {
 		}
 	}
 
+	if ts.tm.VDiffEngine != nil {
+		if ts.tablet.Type == topodatapb.TabletType_PRIMARY {
+			ts.tm.VDiffEngine.Open(ts.tm.BatchCtx, ts.tm.VREngine)
+		} else {
+			ts.tm.VDiffEngine.Close()
+		}
+	}
+
 	if ts.isShardServing[ts.tablet.Type] {
 		ts.isInSrvKeyspace = true
 		statsIsInSrvKeyspace.Set(1)
@@ -293,37 +355,14 @@ func (ts *tmState) updateLocked(ctx context.Context) {
 
 	// Open TabletServer last so that it advertises serving after all other services are up.
 	if reason == "" {
-		if err := ts.tm.QueryServiceControl.SetServingType(ts.tablet.Type, terTime, true, ""); err != nil {
-			log.Errorf("Cannot start query service: %v", err)
+		if err := ts.tm.QueryServiceControl.SetServingType(ts.tablet.Type, ptsTime, true, ""); err != nil {
+			errStr := fmt.Sprintf("Cannot start query service: %v", err)
+			log.Errorf(errStr)
+			returnErr = vterrors.Wrap(err, errStr)
 		}
 	}
-}
 
-func (ts *tmState) populateLocalMetadataLocked() {
-	if ts.tm.MetadataManager == nil {
-		return
-	}
-
-	if ts.isOpening && !*initPopulateMetadata {
-		return
-	}
-
-	localMetadata := ts.tm.getLocalMetadataValues(ts.tablet.Type)
-	dbName := topoproto.TabletDbName(ts.tablet)
-
-	if !ts.hasCreatedMetadataTables {
-		if err := ts.tm.MetadataManager.PopulateMetadataTables(ts.tm.MysqlDaemon, localMetadata, dbName); err != nil {
-			log.Errorf("PopulateMetadataTables(%v) failed: %v", localMetadata, err)
-			return
-		}
-
-		ts.hasCreatedMetadataTables = true
-		return
-	}
-
-	if err := ts.tm.MetadataManager.UpsertLocalMetadata(ts.tm.MysqlDaemon, localMetadata, dbName); err != nil {
-		log.Errorf("UpsertMetadataTables(%v) failed: %v", localMetadata, err)
-	}
+	return returnErr
 }
 
 func (ts *tmState) canServe(tabletType topodatapb.TabletType) string {
@@ -374,7 +413,7 @@ func (ts *tmState) publishStateLocked(ctx context.Context) {
 		return
 	}
 	// Fast path: publish immediately.
-	ctx, cancel := context.WithTimeout(ctx, *topo.RemoteOperationTimeout)
+	ctx, cancel := context.WithTimeout(ctx, topo.RemoteOperationTimeout)
 	defer cancel()
 	_, err := ts.tm.TopoServer.UpdateTabletFields(ctx, ts.tm.tabletAlias, func(tablet *topodatapb.Tablet) error {
 		if err := topotools.CheckOwnership(tablet, ts.tablet); err != nil {
@@ -407,7 +446,7 @@ func (ts *tmState) retryPublish() {
 	for {
 		// Retry immediately the first time because the previous failure might have been
 		// due to an expired context.
-		ctx, cancel := context.WithTimeout(ts.ctx, *topo.RemoteOperationTimeout)
+		ctx, cancel := context.WithTimeout(ts.ctx, topo.RemoteOperationTimeout)
 		_, err := ts.tm.TopoServer.UpdateTabletFields(ctx, ts.tm.tabletAlias, func(tablet *topodatapb.Tablet) error {
 			if err := topotools.CheckOwnership(tablet, ts.tablet); err != nil {
 				log.Error(err)
@@ -426,7 +465,7 @@ func (ts *tmState) retryPublish() {
 			}
 			log.Errorf("Unable to publish state to topo, will keep retrying: %v", err)
 			ts.mu.Unlock()
-			time.Sleep(*publishRetryInterval)
+			time.Sleep(publishRetryInterval)
 			ts.mu.Lock()
 			continue
 		}
@@ -449,15 +488,14 @@ type displayState struct {
 func (ts *tmState) publishForDisplay() {
 	ts.displayState.mu.Lock()
 	defer ts.displayState.mu.Unlock()
-
-	ts.displayState.tablet = proto.Clone(ts.tablet).(*topodatapb.Tablet)
+	ts.displayState.tablet = ts.tablet.CloneVT()
 	ts.displayState.deniedTables = ts.deniedTables[ts.tablet.Type]
 }
 
 func (ts *tmState) Tablet() *topodatapb.Tablet {
 	ts.displayState.mu.Lock()
 	defer ts.displayState.mu.Unlock()
-	return proto.Clone(ts.displayState.tablet).(*topodatapb.Tablet)
+	return ts.displayState.tablet.CloneVT()
 }
 
 func (ts *tmState) DeniedTables() []string {

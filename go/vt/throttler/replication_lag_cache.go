@@ -18,6 +18,7 @@ package throttler
 
 import (
 	"sort"
+	"sync"
 	"time"
 
 	"vitess.io/vitess/go/vt/discovery"
@@ -29,6 +30,8 @@ type replicationLagCache struct {
 	// entries maps from the replica to its history.
 	// The map key is replicationLagRecord.LegacyTabletStats.Key.
 	entries map[string]*replicationLagHistory
+
+	mu sync.Mutex
 
 	// slowReplicas is a set of slow replicas.
 	// The map key is replicationLagRecord.LegacyTabletStats.Key.
@@ -60,25 +63,54 @@ func newReplicationLagCache(historyCapacityPerReplica int) *replicationLagCache 
 
 // add inserts or updates "r" in the cache for the replica with the key "r.Key".
 func (c *replicationLagCache) add(r replicationLagRecord) {
-	if !r.Up {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !r.Serving {
 		// Tablet is down. Do no longer track it.
-		delete(c.entries, r.Key)
-		delete(c.ignoredSlowReplicasInARow, r.Key)
+		delete(c.entries, discovery.TabletToMapKey(r.Tablet))
+		delete(c.ignoredSlowReplicasInARow, discovery.TabletToMapKey(r.Tablet))
 		return
 	}
 
-	entry, ok := c.entries[r.Key]
+	entry, ok := c.entries[discovery.TabletToMapKey(r.Tablet)]
 	if !ok {
 		entry = newReplicationLagHistory(c.historyCapacityPerReplica)
-		c.entries[r.Key] = entry
+		c.entries[discovery.TabletToMapKey(r.Tablet)] = entry
 	}
 
 	entry.add(r)
 }
 
+// maxLag returns the maximum replication lag for the entries in cache.
+func (c *replicationLagCache) maxLag() (maxLag uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for key := range c.entries {
+		if c.isIgnored(key) {
+			continue
+		}
+
+		entry := c.entries[key]
+		if entry == nil {
+			continue
+		}
+
+		latest := entry.latest()
+		if lag := latest.Stats.ReplicationLagSeconds; lag > maxLag {
+			maxLag = lag
+		}
+	}
+
+	return maxLag
+}
+
 // latest returns the current lag record for the given LegacyTabletStats.Key string.
 // A zero record is returned if there is no latest entry.
 func (c *replicationLagCache) latest(key string) replicationLagRecord {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	entry, ok := c.entries[key]
 	if !ok {
 		return replicationLagRecord{}
@@ -90,6 +122,8 @@ func (c *replicationLagCache) latest(key string) replicationLagRecord {
 // or just after it.
 // If there is no such record, a zero record is returned.
 func (c *replicationLagCache) atOrAfter(key string, at time.Time) replicationLagRecord {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	entry, ok := c.entries[key]
 	if !ok {
 		return replicationLagRecord{}
@@ -100,6 +134,9 @@ func (c *replicationLagCache) atOrAfter(key string, at time.Time) replicationLag
 // sortByLag sorts all replicas by their latest replication lag value and
 // tablet uid and updates the c.slowReplicas set.
 func (c *replicationLagCache) sortByLag(ignoreNSlowestReplicas int, minimumReplicationLag int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	// Reset the current list of ignored replicas.
 	c.slowReplicas = make(map[string]bool)
 
@@ -114,7 +151,7 @@ func (c *replicationLagCache) sortByLag(ignoreNSlowestReplicas int, minimumRepli
 	for _, v := range c.entries {
 		record := v.latest()
 		if int64(record.Stats.ReplicationLagSeconds) >= minimumReplicationLag {
-			list = append(list, record.LegacyTabletStats)
+			list = append(list, record.TabletHealth)
 			i++
 		}
 	}
@@ -122,13 +159,13 @@ func (c *replicationLagCache) sortByLag(ignoreNSlowestReplicas int, minimumRepli
 
 	// Now remember the N slowest replicas.
 	for i := len(list) - 1; len(list) > 0 && i >= len(list)-ignoreNSlowestReplicas; i-- {
-		c.slowReplicas[list[i].Key] = true
+		c.slowReplicas[discovery.TabletToMapKey(list[i].Tablet)] = true
 	}
 }
 
-// byLagAndTabletUID is a slice of discovery.LegacyTabletStats elements that
+// byLagAndTabletUID is a slice of discovery.TabletHealth elements that
 // implements sort.Interface to sort by replication lag and tablet Uid.
-type byLagAndTabletUID []discovery.LegacyTabletStats
+type byLagAndTabletUID []discovery.TabletHealth
 
 func (a byLagAndTabletUID) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
 func (a byLagAndTabletUID) Len() int      { return len(a) }
@@ -142,6 +179,9 @@ func (a byLagAndTabletUID) Less(i, j int) bool {
 // this slow replica.
 // "key" refers to ReplicationLagRecord.LegacyTabletStats.Key.
 func (c *replicationLagCache) ignoreSlowReplica(key string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	if len(c.slowReplicas) == 0 {
 		// No slow replicas at all.
 		return false

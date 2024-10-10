@@ -18,15 +18,15 @@
 #
 # First build the `common` image, then any flavors you want. For example:
 # $ docker/bootstrap/build.sh common
-# $ docker/bootstrap/build.sh mysql56
+# $ docker/bootstrap/build.sh mysql80
 #
 # Is it also possible to specify the resulting image name:
 # $ docker/bootstrap/build.sh common --image my-common-image
 #
 # If custom image names are specified, you might need to set the base image name when building flavors:
-# $ docker/bootstrap/build.sh mysql56 --base_image my-common-image
+# $ docker/bootstrap/build.sh mysql80 --base_image my-common-image
 # Both arguments can be combined. For example:
-# $ docker/bootstrap/build.sh mysql56 --base_image my-common-image --image my-mysql-image
+# $ docker/bootstrap/build.sh mysql80 --base_image my-common-image --image my-mysql-image
 
 
 flavor=$1
@@ -47,11 +47,9 @@ fi
 chmod -R o=rx *;
 
 arch=$(uname -m)
-[ "$arch" == "aarch64" ] && [ $flavor != "common" ] && arch_ext='-arm64v8'
-
 
 base_image="${base_image:-vitess/bootstrap:$version-common}"
-image="${image:-vitess/bootstrap:$version-$flavor$arch_ext}"
+image="${image:-vitess/bootstrap:$version-$flavor}"
 
 while [ $# -gt 0 ]; do
    if [[ $1 == *"--"* ]]; then
@@ -61,6 +59,11 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-if [ -f "docker/bootstrap/Dockerfile.$flavor$arch_ext" ]; then
-    docker build --no-cache -f docker/bootstrap/Dockerfile.$flavor$arch_ext -t $image --build-arg bootstrap_version=$version --build-arg image=$base_image .
+if [ -f "docker/bootstrap/Dockerfile.$flavor" ]; then
+    docker build \
+      -f docker/bootstrap/Dockerfile.$flavor \
+      -t $image \
+      --build-arg bootstrap_version=$version \
+      --build-arg image=$base_image \
+      .
 fi

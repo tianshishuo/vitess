@@ -21,14 +21,15 @@ source $DIR/shell_functions.inc
 # a tar ball might be used, which will prevent the git metadata from being available.
 # Should this be the case then allow environment variables to be used to source
 # this information instead.
-DEFAULT_BUILD_GIT_REV=$(git rev-parse --short HEAD)
+DEFAULT_BUILD_GIT_REV=$(git rev-parse HEAD)
 DEFAULT_BUILD_GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+DEFAULT_BUILD_TIME=$(LC_ALL=C date)
 
 echo "\
   -X 'vitess.io/vitess/go/vt/servenv.buildHost=$(hostname)' \
   -X 'vitess.io/vitess/go/vt/servenv.buildUser=$(whoami)' \
   -X 'vitess.io/vitess/go/vt/servenv.buildGitRev=${BUILD_GIT_REV:-$DEFAULT_BUILD_GIT_REV}' \
   -X 'vitess.io/vitess/go/vt/servenv.buildGitBranch=${BUILD_GIT_BRANCH:-$DEFAULT_BUILD_GIT_BRANCH}' \
-  -X 'vitess.io/vitess/go/vt/servenv.buildTime=$(LC_ALL=C date)' \
+  -X 'vitess.io/vitess/go/vt/servenv.buildTime=${BUILD_TIME:-$DEFAULT_BUILD_TIME}' \
   -X 'vitess.io/vitess/go/vt/servenv.jenkinsBuildNumberStr=${BUILD_NUMBER}' \
 "

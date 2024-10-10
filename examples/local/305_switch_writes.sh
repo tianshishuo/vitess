@@ -16,6 +16,7 @@
 
 # this script migrates traffic for the primary tablet
 
-source ./env.sh
+source ../common/env.sh
 
-vtctlclient Reshard -tablet_types=primary SwitchTraffic customer.cust2cust
+vtctldclient Reshard --workflow cust2cust --target-keyspace customer switchtraffic --tablet-types "primary"
+

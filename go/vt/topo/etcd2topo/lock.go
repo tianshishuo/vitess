@@ -17,25 +17,36 @@ limitations under the License.
 package etcd2topo
 
 import (
-	"flag"
+	"context"
 	"fmt"
 	"path"
+	"time"
 
-	"context"
+	"github.com/spf13/pflag"
 
 	"go.etcd.io/etcd/api/v3/mvccpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
 
-	"vitess.io/vitess/go/vt/proto/vtrpc"
-	"vitess.io/vitess/go/vt/vterrors"
-
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/servenv"
 	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/vterrors"
 )
 
 var (
-	leaseTTL = flag.Int("topo_etcd_lease_ttl", 30, "Lease TTL for locks and leader election. The client will use KeepAlive to keep the lease going.")
+	leaseTTL = 30 // This is the default used for all non-named locks
 )
+
+func init() {
+	for _, cmd := range topo.FlagBinaries {
+		servenv.OnParseFor(cmd, registerEtcd2TopoLockFlags)
+	}
+}
+
+func registerEtcd2TopoLockFlags(fs *pflag.FlagSet) {
+	fs.IntVar(&leaseTTL, "topo_etcd_lease_ttl", leaseTTL, "Lease TTL for locks and leader election. The client will use KeepAlive to keep the lease going.")
+}
 
 // newUniqueEphemeralKV creates a new file in the provided directory.
 // It is linked to the Lease.
@@ -121,6 +132,31 @@ type etcdLockDescriptor struct {
 	leaseID clientv3.LeaseID
 }
 
+// TryLock is part of the topo.Conn interface.
+func (s *Server) TryLock(ctx context.Context, dirPath, contents string) (topo.LockDescriptor, error) {
+	// We list all the entries under dirPath
+	entries, err := s.ListDir(ctx, dirPath, true)
+	if err != nil {
+		// We need to return the right error codes, like
+		// topo.ErrNoNode and topo.ErrInterrupted, and the
+		// easiest way to do this is to return convertError(err).
+		// It may lose some of the context, if this is an issue,
+		// maybe logging the error would work here.
+		return nil, convertError(err, dirPath)
+	}
+
+	// If there is a folder '/locks' with some entries in it then we can assume that someone else already has a lock.
+	// Throw error in this case
+	for _, e := range entries {
+		if e.Name == locksPath && e.Type == topo.TypeDirectory && e.Ephemeral {
+			return nil, topo.NewError(topo.NodeExists, fmt.Sprintf("lock already exists at path %s", dirPath))
+		}
+	}
+
+	// everything is good let's acquire the lock.
+	return s.lock(ctx, dirPath, contents, leaseTTL)
+}
+
 // Lock is part of the topo.Conn interface.
 func (s *Server) Lock(ctx context.Context, dirPath, contents string) (topo.LockDescriptor, error) {
 	// We list the directory first to make sure it exists.
@@ -133,15 +169,35 @@ func (s *Server) Lock(ctx context.Context, dirPath, contents string) (topo.LockD
 		return nil, convertError(err, dirPath)
 	}
 
-	return s.lock(ctx, dirPath, contents)
+	return s.lock(ctx, dirPath, contents, leaseTTL)
+}
+
+// LockWithTTL is part of the topo.Conn interface.
+func (s *Server) LockWithTTL(ctx context.Context, dirPath, contents string, ttl time.Duration) (topo.LockDescriptor, error) {
+	// We list the directory first to make sure it exists.
+	if _, err := s.ListDir(ctx, dirPath, false /*full*/); err != nil {
+		// We need to return the right error codes, like
+		// topo.ErrNoNode and topo.ErrInterrupted, and the
+		// easiest way to do this is to return convertError(err).
+		// It may lose some of the context, if this is an issue,
+		// maybe logging the error would work here.
+		return nil, convertError(err, dirPath)
+	}
+
+	return s.lock(ctx, dirPath, contents, int(ttl.Seconds()))
+}
+
+// LockName is part of the topo.Conn interface.
+func (s *Server) LockName(ctx context.Context, dirPath, contents string) (topo.LockDescriptor, error) {
+	return s.lock(ctx, dirPath, contents, int(topo.NamedLockTTL.Seconds()))
 }
 
 // lock is used by both Lock() and primary election.
-func (s *Server) lock(ctx context.Context, nodePath, contents string) (topo.LockDescriptor, error) {
+func (s *Server) lock(ctx context.Context, nodePath, contents string, ttl int) (topo.LockDescriptor, error) {
 	nodePath = path.Join(s.root, nodePath, locksPath)
 
 	// Get a lease, set its KeepAlive.
-	lease, err := s.cli.Grant(ctx, int64(*leaseTTL))
+	lease, err := s.cli.Grant(ctx, int64(ttl))
 	if err != nil {
 		return nil, convertError(err, nodePath)
 	}

@@ -23,8 +23,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"golang.org/x/sync/semaphore"
 
-	"vitess.io/vitess/go/sync2"
 	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
 	"vitess.io/vitess/go/vt/topo/topoproto"
@@ -86,7 +86,6 @@ func (tmc *reloadSchemaTMC) ReloadSchema(ctx context.Context, tablet *topodatapb
 
 func TestReloadShard(t *testing.T) {
 	t.Parallel()
-	ctx := context.Background()
 
 	tests := []struct {
 		name    string
@@ -326,11 +325,13 @@ func TestReloadShard(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			ts := memorytopo.NewServer(tt.cells...)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ts := memorytopo.NewServer(ctx, tt.cells...)
+			defer ts.Close()
 			testutil.AddTablets(ctx, t, ts, &testutil.AddTabletOptions{
 				AlsoSetShardPrimary: true,
 			}, tt.tablets...)
@@ -338,7 +339,7 @@ func TestReloadShard(t *testing.T) {
 				results: tt.results,
 			}
 
-			isPartial, ok := ReloadShard(ctx, ts, tmc, logutil.NewMemoryLogger(), tt.req.Keyspace, tt.req.Shard, tt.req.Position, sync2.NewSemaphore(1, 0), tt.req.IncludePrimary)
+			isPartial, ok := ReloadShard(ctx, ts, tmc, logutil.NewMemoryLogger(), tt.req.Keyspace, tt.req.Shard, tt.req.Position, semaphore.NewWeighted(1), tt.req.IncludePrimary)
 			assert.Equal(t, tt.expected.IsPartial, isPartial, "incorrect value for isPartial")
 			assert.Equal(t, tt.expected.Ok, ok, "incorrect value for ok")
 

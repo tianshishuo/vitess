@@ -17,25 +17,23 @@ limitations under the License.
 package testlib
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
 
-	"vitess.io/vitess/go/vt/discovery"
-
-	"context"
-
 	"vitess.io/vitess/go/mysql/fakesqldb"
 	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/discovery"
 	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/mysqlctl/tmutils"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
 	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/vtenv"
 	"vitess.io/vitess/go/vt/vttablet/tabletmanager/vreplication"
 	"vitess.io/vitess/go/vt/vttablet/tmclient"
 	"vitess.io/vitess/go/vt/wrangler"
 
-	querypb "vitess.io/vitess/go/vt/proto/query"
 	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
@@ -55,15 +53,14 @@ func copySchema(t *testing.T, useShardAsSource bool) {
 	}()
 	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
 
-	ts := memorytopo.NewServer("cell1", "cell2")
-	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
-	vp := NewVtctlPipe(t, ts)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ts := memorytopo.NewServer(ctx, "cell1", "cell2")
+	wr := wrangler.New(vtenv.NewTestEnv(), logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
+	vp := NewVtctlPipe(ctx, t, ts)
 	defer vp.Close()
 
-	if err := ts.CreateKeyspace(context.Background(), "ks", &topodatapb.Keyspace{
-		ShardingColumnName: "keyspace_id",
-		ShardingColumnType: topodatapb.KeyspaceIdType_UINT64,
-	}); err != nil {
+	if err := ts.CreateKeyspace(context.Background(), "ks", &topodatapb.Keyspace{}); err != nil {
 		t.Fatalf("CreateKeyspace failed: %v", err)
 	}
 
@@ -76,6 +73,13 @@ func copySchema(t *testing.T, useShardAsSource bool) {
 	defer sourceRdonlyDb.Close()
 	sourceRdonly := NewFakeTablet(t, wr, "cell1", 1,
 		topodatapb.TabletType_RDONLY, sourceRdonlyDb, TabletKeyspaceShard(t, "ks", "-80"))
+	sourceRdonly.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
+		// These 3 statements come from tablet startup
+		"STOP REPLICA",
+		"FAKE SET SOURCE",
+		"START REPLICA",
+	}
+	sourceRdonly.FakeMysqlDaemon.SetReplicationSourceInputs = append(sourceRdonly.FakeMysqlDaemon.SetReplicationSourceInputs, fmt.Sprintf("%v:%v", sourcePrimary.Tablet.MysqlHostname, sourcePrimary.Tablet.MysqlPort))
 
 	destinationPrimaryDb := fakesqldb.New(t).SetName("destinationPrimaryDb")
 	defer destinationPrimaryDb.Close()
@@ -126,8 +130,6 @@ func copySchema(t *testing.T, useShardAsSource bool) {
 		"  PRIMARY KEY (`id`),\n" +
 		"  KEY `by_msg` (`msg`)\n" +
 		") ENGINE=InnoDB DEFAULT CHARSET=utf8"
-	selectInformationSchema := "SELECT 1 FROM information_schema.tables WHERE table_schema = '_vt' AND table_name = 'shard_metadata'"
-	selectShardMetadata := "SELECT db_name, name, value FROM _vt.shard_metadata"
 
 	// The source table is asked about its schema.
 	// It may be the primary or the rdonly.
@@ -136,19 +138,6 @@ func copySchema(t *testing.T, useShardAsSource bool) {
 		sourceDb = sourcePrimaryDb
 	}
 	sourceDb.AddQuery(changeToDb, &sqltypes.Result{})
-	sourceDb.AddQuery(selectInformationSchema, &sqltypes.Result{
-		Fields: []*querypb.Field{
-			{
-				Type: querypb.Type_INT64,
-			},
-		},
-		Rows: [][]sqltypes.Value{
-			{
-				sqltypes.Value{},
-			},
-		},
-	})
-	sourceDb.AddQuery(selectShardMetadata, &sqltypes.Result{})
 
 	// The destination table is asked to create the new schema.
 	destinationPrimaryDb.AddQuery(setSQLMode, &sqltypes.Result{})
@@ -168,19 +157,12 @@ func copySchema(t *testing.T, useShardAsSource bool) {
 	if useShardAsSource {
 		source = "ks/-80"
 	}
-	if err := vp.Run([]string{"CopySchemaShard", "-include-views", source, "ks/-40"}); err != nil {
-		t.Fatalf("CopySchemaShard failed: %v", err)
-	}
 
-	// Check call count on the source.
-	if count := sourceDb.GetQueryCalledNum(changeToDb); count != 2 {
-		t.Errorf("CopySchemaShard did not change to the db 2 times. Query count: %v", count)
-	}
-	if count := sourceDb.GetQueryCalledNum(selectInformationSchema); count != 1 {
-		t.Errorf("CopySchemaShard did not select data from information_schema.tables exactly once. Query count: %v", count)
-	}
-	if count := sourceDb.GetQueryCalledNum(selectShardMetadata); count != 1 {
-		t.Errorf("CopySchemaShard did not select data from _vt.shard_metadata exactly once. Query count: %v", count)
+	// PrimaryAlias in the shard record is updated asynchronously, so we should wait for it to succeed.
+	waitForShardPrimary(t, wr, destinationPrimary.Tablet)
+
+	if err := vp.Run([]string{"CopySchemaShard", "--include-views", source, "ks/-40"}); err != nil {
+		t.Fatalf("CopySchemaShard failed: %v", err)
 	}
 
 	// Check call count on destinationPrimaryDb

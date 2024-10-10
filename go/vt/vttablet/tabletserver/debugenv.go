@@ -17,6 +17,7 @@ limitations under the License.
 package tabletserver
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -39,9 +40,9 @@ var (
 	`)
 	debugEnvRow = template.Must(template.New("debugenv").Parse(`
 	<tr><form method="POST">
-		<td>{{.VarName}}</td>
+		<td>{{.Name}}</td>
 		<td>
-			<input type="hidden" name="varname" value="{{.VarName}}"></input>
+			<input type="hidden" name="varname" value="{{.Name}}"></input>
 			<input type="text" name="value" value="{{.Value}}"></input>
 		</td>
 		<td><input type="submit" name="Action" value="Modify"></input></td>
@@ -50,8 +51,17 @@ var (
 )
 
 type envValue struct {
-	VarName string
-	Value   string
+	Name  string
+	Value string
+}
+
+// this cannot be an anonymous function within debugEnvHandler because those kinds
+// of functions cannot (currently) have type params.
+func addVar[T any](vars []envValue, name string, f func() T) []envValue {
+	return append(vars, envValue{
+		Name:  name,
+		Value: fmt.Sprintf("%v", f()),
+	})
 }
 
 func debugEnvHandler(tsv *TabletServer, w http.ResponseWriter, r *http.Request) {
@@ -66,6 +76,26 @@ func debugEnvHandler(tsv *TabletServer, w http.ResponseWriter, r *http.Request) 
 		value := r.FormValue("value")
 		setIntVal := func(f func(int)) {
 			ival, err := strconv.Atoi(value)
+			if err != nil {
+				msg = fmt.Sprintf("Failed setting value for %v: %v", varname, err)
+				return
+			}
+			f(ival)
+			msg = fmt.Sprintf("Setting %v to: %v", varname, value)
+		}
+		setIntValCtx := func(f func(context.Context, int) error) {
+			ival, err := strconv.Atoi(value)
+			if err == nil {
+				err = f(r.Context(), ival)
+				if err == nil {
+					msg = fmt.Sprintf("Setting %v to: %v", varname, value)
+					return
+				}
+			}
+			msg = fmt.Sprintf("Failed setting value for %v: %v", varname, err)
+		}
+		setInt64Val := func(f func(int64)) {
+			ival, err := strconv.ParseInt(value, 10, 64)
 			if err != nil {
 				msg = fmt.Sprintf("Failed setting value for %v: %v", varname, err)
 				return
@@ -93,19 +123,21 @@ func debugEnvHandler(tsv *TabletServer, w http.ResponseWriter, r *http.Request) 
 		}
 		switch varname {
 		case "PoolSize":
-			setIntVal(tsv.SetPoolSize)
+			setIntValCtx(tsv.SetPoolSize)
 		case "StreamPoolSize":
-			setIntVal(tsv.SetStreamPoolSize)
+			setIntValCtx(tsv.SetStreamPoolSize)
 		case "TxPoolSize":
-			setIntVal(tsv.SetTxPoolSize)
-		case "QueryCacheCapacity":
-			setIntVal(tsv.SetQueryPlanCacheCap)
+			setIntValCtx(tsv.SetTxPoolSize)
 		case "MaxResultSize":
 			setIntVal(tsv.SetMaxResultSize)
 		case "WarnResultSize":
 			setIntVal(tsv.SetWarnResultSize)
+		case "RowStreamerMaxInnoDBTrxHistLen":
+			setInt64Val(func(val int64) { tsv.Config().RowStreamer.MaxInnoDBTrxHistLen = val })
+		case "RowStreamerMaxMySQLReplLagSecs":
+			setInt64Val(func(val int64) { tsv.Config().RowStreamer.MaxMySQLReplLagSecs = val })
 		case "UnhealthyThreshold":
-			setDurationVal(tsv.Config().Healthcheck.UnhealthyThresholdSeconds.Set)
+			setDurationVal(func(d time.Duration) { tsv.Config().Healthcheck.UnhealthyThreshold = d })
 			setDurationVal(tsv.hs.SetUnhealthyThreshold)
 			setDurationVal(tsv.sm.SetUnhealthyThreshold)
 		case "ThrottleMetricThreshold":
@@ -117,42 +149,27 @@ func debugEnvHandler(tsv *TabletServer, w http.ResponseWriter, r *http.Request) 
 	}
 
 	var vars []envValue
-	addIntVar := func(varname string, f func() int) {
-		vars = append(vars, envValue{
-			VarName: varname,
-			Value:   fmt.Sprintf("%v", f()),
-		})
-	}
-	addDurationVar := func(varname string, f func() time.Duration) {
-		vars = append(vars, envValue{
-			VarName: varname,
-			Value:   fmt.Sprintf("%v", f()),
-		})
-	}
-	addFloat64Var := func(varname string, f func() float64) {
-		vars = append(vars, envValue{
-			VarName: varname,
-			Value:   fmt.Sprintf("%v", f()),
-		})
-	}
-	addIntVar("PoolSize", tsv.PoolSize)
-	addIntVar("StreamPoolSize", tsv.StreamPoolSize)
-	addIntVar("TxPoolSize", tsv.TxPoolSize)
-	addIntVar("QueryCacheCapacity", tsv.QueryPlanCacheCap)
-	addIntVar("MaxResultSize", tsv.MaxResultSize)
-	addIntVar("WarnResultSize", tsv.WarnResultSize)
-	addDurationVar("UnhealthyThreshold", tsv.Config().Healthcheck.UnhealthyThresholdSeconds.Get)
-	addFloat64Var("ThrottleMetricThreshold", tsv.ThrottleMetricThreshold)
+	vars = addVar(vars, "PoolSize", tsv.PoolSize)
+	vars = addVar(vars, "StreamPoolSize", tsv.StreamPoolSize)
+	vars = addVar(vars, "TxPoolSize", tsv.TxPoolSize)
+	vars = addVar(vars, "QueryCacheCapacity", tsv.QueryPlanCacheCap) // QueryCacheCapacity is deprecated in v21, it is replaced by QueryEnginePlanCacheCapacity
+	vars = addVar(vars, "QueryEnginePlanCacheCapacity", tsv.QueryPlanCacheCap)
+	vars = addVar(vars, "MaxResultSize", tsv.MaxResultSize)
+	vars = addVar(vars, "WarnResultSize", tsv.WarnResultSize)
+	vars = addVar(vars, "RowStreamerMaxInnoDBTrxHistLen", func() int64 { return tsv.Config().RowStreamer.MaxInnoDBTrxHistLen })
+	vars = addVar(vars, "RowStreamerMaxMySQLReplLagSecs", func() int64 { return tsv.Config().RowStreamer.MaxMySQLReplLagSecs })
+	vars = addVar(vars, "UnhealthyThreshold", func() time.Duration { return tsv.Config().Healthcheck.UnhealthyThreshold })
+	vars = addVar(vars, "ThrottleMetricThreshold", tsv.ThrottleMetricThreshold)
 	vars = append(vars, envValue{
-		VarName: "Consolidator",
-		Value:   tsv.ConsolidatorMode(),
+		Name:  "Consolidator",
+		Value: tsv.ConsolidatorMode(),
 	})
 
 	format := r.FormValue("format")
 	if format == "json" {
 		mvars := make(map[string]string)
 		for _, v := range vars {
-			mvars[v.VarName] = v.Value
+			mvars[v.Name] = v.Value
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(mvars)

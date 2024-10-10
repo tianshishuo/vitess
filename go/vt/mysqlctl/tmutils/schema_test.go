@@ -19,9 +19,10 @@ package tmutils
 import (
 	"errors"
 	"fmt"
-	"reflect"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 
 	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
@@ -135,9 +136,7 @@ func TestToSQLStrings(t *testing.T) {
 
 	for _, tc := range testcases {
 		got := SchemaDefinitionToSQLStrings(tc.input)
-		if !reflect.DeepEqual(got, tc.want) {
-			t.Errorf("ToSQLStrings() on SchemaDefinition %v returned %v; want %v", tc.input, got, tc.want)
-		}
+		assert.Equal(t, tc.want, got)
 	}
 }
 
@@ -156,12 +155,7 @@ func testDiff(t *testing.T, left, right *tabletmanagerdatapb.SchemaDefinition, l
 			}
 		}
 	}
-
-	if !equal {
-		t.Logf("Expected: %v", expected)
-		t.Logf("Actual: %v", actual)
-		t.Fail()
-	}
+	assert.Truef(t, equal, "expected: %v, actual: %v", expected, actual)
 }
 
 func TestSchemaDiff(t *testing.T) {
@@ -240,7 +234,7 @@ func TestSchemaDiff(t *testing.T) {
 	})
 
 	testDiff(t, sd4, sd5, "sd4", "sd5", []string{
-		fmt.Sprintf("schemas differ on table type for table table2:\nsd4: VIEW\n differs from:\nsd5: BASE TABLE"), //nolint
+		"schemas differ on table type for table table2:\nsd4: VIEW\n differs from:\nsd5: BASE TABLE",
 	})
 
 	sd1.DatabaseSchema = "CREATE DATABASE {{.DatabaseName}}"
@@ -434,6 +428,26 @@ func TestTableFilter(t *testing.T) {
 			included: false,
 		},
 		{
+			desc:          "exclude table list does not list table",
+			excludeTables: []string{"nomatch1", "nomatch2", "/nomatch3/", "/nomatch4/", "/nomatch5/"},
+			includeViews:  true,
+
+			tableName: excludedTable,
+			tableType: TableBaseTable,
+
+			included: true,
+		},
+		{
+			desc:          "exclude table list with re match",
+			excludeTables: []string{"nomatch1", "nomatch2", "/nomatch3/", "/" + excludedTable + "/", "/nomatch5/"},
+			includeViews:  true,
+
+			tableName: excludedTable,
+			tableType: TableBaseTable,
+
+			included: false,
+		},
+		{
 			desc:   "bad table regexp",
 			tables: []string{"/*/"},
 
@@ -450,18 +464,16 @@ func TestTableFilter(t *testing.T) {
 	for _, tc := range tcs {
 		t.Run(tc.desc, func(t *testing.T) {
 			f, err := NewTableFilter(tc.tables, tc.excludeTables, tc.includeViews)
-			if tc.hasErr != (err != nil) {
-				t.Fatalf("hasErr not right: %v, tc: %+v", err, tc)
-			}
-
 			if tc.hasErr {
+				assert.Error(t, err)
 				return
 			}
+			assert.NoError(t, err)
 
+			assert.Equal(t, len(tc.tables), len(f.tableNames)+len(f.tableREs))
+			assert.Equal(t, len(tc.excludeTables), len(f.excludeTableNames)+len(f.excludeTableREs))
 			included := f.Includes(tc.tableName, tc.tableType)
-			if tc.included != included {
-				t.Fatalf("included is not right: %v\nfilter: %+v\ntc: %+v", included, f, tc)
-			}
+			assert.Equalf(t, tc.included, included, "filter: %v", f)
 		})
 	}
 }
@@ -537,23 +549,6 @@ func TestFilterTables(t *testing.T) {
 					basicTable1,
 					basicTable2,
 				},
-			},
-		},
-		{
-			desc: "update schema version hash when list of tables has changed",
-			input: &tabletmanagerdatapb.SchemaDefinition{
-				TableDefinitions: []*tabletmanagerdatapb.TableDefinition{
-					basicTable1,
-					basicTable2,
-				},
-				Version: "dummy-version",
-			},
-			excludeTables: []string{basicTable1.Name},
-			want: &tabletmanagerdatapb.SchemaDefinition{
-				TableDefinitions: []*tabletmanagerdatapb.TableDefinition{
-					basicTable2,
-				},
-				Version: "6d1d294def9febdb21b35dd19a1dd4c6",
 			},
 		},
 		{
@@ -638,21 +633,15 @@ func TestFilterTables(t *testing.T) {
 	}
 
 	for _, tc := range testcases {
-		got, err := FilterTables(tc.input, tc.tables, tc.excludeTables, tc.includeViews)
-		if tc.wantError != nil {
-			if err == nil {
-				t.Fatalf("FilterTables() test '%v' on SchemaDefinition %v did not return an error (result: %v), but should have, wantError %v", tc.desc, tc.input, got, tc.wantError)
+		t.Run(tc.desc, func(t *testing.T) {
+			got, err := FilterTables(tc.input, tc.tables, tc.excludeTables, tc.includeViews)
+			if tc.wantError != nil {
+				require.Error(t, err)
+				require.Equal(t, tc.wantError, err)
+			} else {
+				assert.NoError(t, err)
+				assert.Truef(t, proto.Equal(tc.want, got), "wanted: %v, got: %v", tc.want, got)
 			}
-			if err.Error() != tc.wantError.Error() {
-				t.Errorf("FilterTables() test '%v' on SchemaDefinition %v returned wrong error '%v'; wanted error '%v'", tc.desc, tc.input, err, tc.wantError)
-			}
-		} else {
-			if err != nil {
-				t.Errorf("FilterTables() test '%v' on SchemaDefinition %v failed with error %v, want %v", tc.desc, tc.input, err, tc.want)
-			}
-			if !proto.Equal(got, tc.want) {
-				t.Errorf("FilterTables() test '%v' on SchemaDefinition %v returned %v; want %v", tc.desc, tc.input, got, tc.want)
-			}
-		}
+		})
 	}
 }

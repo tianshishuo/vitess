@@ -17,22 +17,18 @@ limitations under the License.
 package wrangler
 
 import (
+	"context"
 	"fmt"
 	"time"
 
-	"google.golang.org/protobuf/proto"
-
-	"context"
-
-	"vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/topoproto"
 	"vitess.io/vitess/go/vt/topotools"
 	"vitess.io/vitess/go/vt/vtctl/reparentutil"
-	"vitess.io/vitess/go/vt/vterrors"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	vtctldatapb "vitess.io/vitess/go/vt/proto/vtctldata"
 )
 
 // Tablet related methods for wrangler
@@ -48,7 +44,7 @@ func (wr *Wrangler) DeleteTablet(ctx context.Context, tabletAlias *topodatapb.Ta
 	}
 
 	wasPrimary, err := wr.isPrimaryTablet(ctx, ti)
-	if err != nil {
+	if err != nil && !topo.IsErrType(err, topo.NoNode) {
 		return err
 	}
 
@@ -67,7 +63,7 @@ func (wr *Wrangler) DeleteTablet(ctx context.Context, tabletAlias *topodatapb.Ta
 		defer unlock(&err)
 
 		// update the shard record's primary
-		if _, err := wr.ts.UpdateShardFields(ctx, ti.Keyspace, ti.Shard, func(si *topo.ShardInfo) error {
+		_, err := wr.ts.UpdateShardFields(ctx, ti.Keyspace, ti.Shard, func(si *topo.ShardInfo) error {
 			if !topoproto.TabletAliasEqual(si.PrimaryAlias, tabletAlias) {
 				wr.Logger().Warningf("Deleting primary %v from shard %v/%v but primary in Shard object was %v", topoproto.TabletAliasString(tabletAlias), ti.Keyspace, ti.Shard, topoproto.TabletAliasString(si.PrimaryAlias))
 				return topo.NewError(topo.NoUpdateNeeded, si.Keyspace()+"/"+si.ShardName())
@@ -75,7 +71,8 @@ func (wr *Wrangler) DeleteTablet(ctx context.Context, tabletAlias *topodatapb.Ta
 			si.PrimaryAlias = nil
 			si.SetPrimaryTermStartTime(time.Now())
 			return nil
-		}); err != nil {
+		})
+		if err != nil && !topo.IsErrType(err, topo.NoNode) {
 			return err
 		}
 	}
@@ -106,10 +103,9 @@ func (wr *Wrangler) ChangeTabletType(ctx context.Context, tabletAlias *topodatap
 
 	// We should clone the tablet and change its type to the expected type before checking the durability rules
 	// Since we want to check the durability rules for the desired state and not before we make that change
-	expectedTablet := proto.Clone(ti.Tablet).(*topodatapb.Tablet)
+	expectedTablet := ti.Tablet.CloneVT()
 	expectedTablet.Type = tabletType
 	semiSync, err := wr.shouldSendSemiSyncAck(ctx, expectedTablet)
-
 	if err != nil {
 		return err
 	}
@@ -129,14 +125,10 @@ func (wr *Wrangler) StartReplication(ctx context.Context, tablet *topodatapb.Tab
 
 // SetReplicationSource is used to set the replication source on the specified tablet to the current shard primary (if available).
 // It also figures out if the tablet should be sending semi-sync ACKs or not and passes that to the tabletmanager RPC.
-// It does not start the replication forcefully
+// It does not start the replication forcefully. If we are unable to find the shard primary of the tablet from the topo server
+// we exit out without any error.
 func (wr *Wrangler) SetReplicationSource(ctx context.Context, tablet *topodatapb.Tablet) error {
-	shardPrimary, err := wr.getShardPrimaryForTablet(ctx, tablet)
-	if err != nil {
-		return nil
-	}
-	semiSync := reparentutil.IsReplicaSemiSync(shardPrimary.Tablet, tablet)
-	return wr.TabletManagerClient().SetReplicationSource(ctx, tablet, shardPrimary.Alias, 0, "", false, semiSync)
+	return reparentutil.SetReplicationSource(ctx, wr.ts, wr.TabletManagerClient(), tablet)
 }
 
 func (wr *Wrangler) shouldSendSemiSyncAck(ctx context.Context, tablet *topodatapb.Tablet) (bool, error) {
@@ -144,32 +136,21 @@ func (wr *Wrangler) shouldSendSemiSyncAck(ctx context.Context, tablet *topodatap
 	if err != nil {
 		return false, err
 	}
-	return reparentutil.IsReplicaSemiSync(shardPrimary.Tablet, tablet), nil
+
+	durabilityName, err := wr.ts.GetKeyspaceDurability(ctx, tablet.Keyspace)
+	if err != nil {
+		return false, err
+	}
+	durability, err := reparentutil.GetDurabilityPolicy(durabilityName)
+	if err != nil {
+		return false, err
+	}
+
+	return reparentutil.IsReplicaSemiSync(durability, shardPrimary.Tablet, tablet), nil
 }
 
 func (wr *Wrangler) getShardPrimaryForTablet(ctx context.Context, tablet *topodatapb.Tablet) (*topo.TabletInfo, error) {
-	shard, err := wr.ts.GetShard(ctx, tablet.Keyspace, tablet.Shard)
-	if err != nil {
-		return nil, err
-	}
-
-	if !shard.HasPrimary() {
-		return nil, vterrors.Errorf(vtrpc.Code_FAILED_PRECONDITION, "no primary tablet for shard %v/%v", tablet.Keyspace, tablet.Shard)
-	}
-
-	shardPrimary, err := wr.ts.GetTablet(ctx, shard.PrimaryAlias)
-	if err != nil {
-		return nil, fmt.Errorf("cannot lookup primary tablet %v for shard %v/%v: %w", topoproto.TabletAliasString(shard.PrimaryAlias), tablet.Keyspace, tablet.Shard, err)
-	}
-
-	if shardPrimary.Type != topodatapb.TabletType_PRIMARY {
-		return nil, vterrors.Errorf(vtrpc.Code_FAILED_PRECONDITION, "TopologyServer has inconsistent state for shard primary %v", topoproto.TabletAliasString(shard.PrimaryAlias))
-	}
-
-	if shardPrimary.Keyspace != tablet.Keyspace || shardPrimary.Shard != tablet.Shard {
-		return nil, vterrors.Errorf(vtrpc.Code_FAILED_PRECONDITION, "primary %v and potential replica %v not in same keyspace shard (%v/%v)", topoproto.TabletAliasString(shard.PrimaryAlias), topoproto.TabletAliasString(tablet.Alias), tablet.Keyspace, tablet.Shard)
-	}
-	return shardPrimary, nil
+	return topotools.GetShardPrimaryForTablet(ctx, wr.ts, tablet)
 }
 
 // RefreshTabletState refreshes tablet state
@@ -186,20 +167,48 @@ func (wr *Wrangler) RefreshTabletState(ctx context.Context, tabletAlias *topodat
 
 // ExecuteFetchAsApp executes a query remotely using the App pool
 func (wr *Wrangler) ExecuteFetchAsApp(ctx context.Context, tabletAlias *topodatapb.TabletAlias, usePool bool, query string, maxRows int) (*querypb.QueryResult, error) {
-	ti, err := wr.ts.GetTablet(ctx, tabletAlias)
+	resp, err := wr.VtctldServer().ExecuteFetchAsApp(ctx, &vtctldatapb.ExecuteFetchAsAppRequest{
+		TabletAlias: tabletAlias,
+		Query:       query,
+		MaxRows:     int64(maxRows),
+		UsePool:     usePool,
+	})
 	if err != nil {
 		return nil, err
 	}
-	return wr.tmc.ExecuteFetchAsApp(ctx, ti.Tablet, usePool, []byte(query), maxRows)
+
+	return resp.Result, nil
 }
 
 // ExecuteFetchAsDba executes a query remotely using the DBA pool
 func (wr *Wrangler) ExecuteFetchAsDba(ctx context.Context, tabletAlias *topodatapb.TabletAlias, query string, maxRows int, disableBinlogs bool, reloadSchema bool) (*querypb.QueryResult, error) {
-	ti, err := wr.ts.GetTablet(ctx, tabletAlias)
+	resp, err := wr.VtctldServer().ExecuteFetchAsDBA(ctx, &vtctldatapb.ExecuteFetchAsDBARequest{
+		TabletAlias:    tabletAlias,
+		Query:          query,
+		MaxRows:        int64(maxRows),
+		DisableBinlogs: disableBinlogs,
+		ReloadSchema:   reloadSchema,
+	})
 	if err != nil {
 		return nil, err
 	}
-	return wr.tmc.ExecuteFetchAsDba(ctx, ti.Tablet, false, []byte(query), maxRows, disableBinlogs, reloadSchema)
+
+	return resp.Result, nil
+}
+
+// ExecuteMultiFetchAsDba executes one or more queries remotely using the DBA pool
+func (wr *Wrangler) ExecuteMultiFetchAsDba(ctx context.Context, tabletAlias *topodatapb.TabletAlias, sql string, maxRows int, disableBinlogs bool, reloadSchema bool) ([]*querypb.QueryResult, error) {
+	resp, err := wr.VtctldServer().ExecuteMultiFetchAsDBA(ctx, &vtctldatapb.ExecuteMultiFetchAsDBARequest{
+		TabletAlias:    tabletAlias,
+		Sql:            sql,
+		MaxRows:        int64(maxRows),
+		DisableBinlogs: disableBinlogs,
+		ReloadSchema:   reloadSchema,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Results, nil
 }
 
 // VReplicationExec executes a query remotely using the DBA pool
@@ -209,15 +218,6 @@ func (wr *Wrangler) VReplicationExec(ctx context.Context, tabletAlias *topodatap
 		return nil, err
 	}
 	return wr.tmc.VReplicationExec(ctx, ti.Tablet, query)
-}
-
-// GenericVExec executes a query remotely using the DBA pool
-func (wr *Wrangler) GenericVExec(ctx context.Context, tabletAlias *topodatapb.TabletAlias, query, workflow, keyspace string) (*querypb.QueryResult, error) {
-	ti, err := wr.ts.GetTablet(ctx, tabletAlias)
-	if err != nil {
-		return nil, err
-	}
-	return wr.tmc.VExec(ctx, ti.Tablet, query, workflow, keyspace)
 }
 
 // isPrimaryTablet is a shortcut way to determine whether the current tablet

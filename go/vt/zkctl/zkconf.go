@@ -1,3 +1,6 @@
+//go:build !codeanalysis
+// +build !codeanalysis
+
 /*
 Copyright 2019 The Vitess Authors.
 
@@ -21,7 +24,6 @@ limitations under the License.
 package zkctl
 
 import (
-	"bytes"
 	"fmt"
 	"os"
 	"path"
@@ -35,7 +37,7 @@ import (
 )
 
 type zkServerAddr struct {
-	ServerId     uint32
+	ServerId     uint32 // nolint:revive
 	Hostname     string
 	LeaderPort   int
 	ElectionPort int
@@ -43,9 +45,10 @@ type zkServerAddr struct {
 }
 
 type ZkConfig struct {
-	ServerId   uint32
+	ServerId   uint32 // nolint:revive
 	ClientPort int
 	Servers    []zkServerAddr
+	Extra      []string
 	Global     bool
 }
 
@@ -90,70 +93,75 @@ func (cnf *ZkConfig) MyidFile() string {
 }
 
 func (cnf *ZkConfig) WriteMyid() error {
-	return os.WriteFile(cnf.MyidFile(), []byte(fmt.Sprintf("%v", cnf.ServerId)), 0664)
+	return os.WriteFile(cnf.MyidFile(), []byte(fmt.Sprintf("%v", cnf.ServerId)), 0o664)
 }
 
 /*
-  Search for first existing file in cnfFiles and subsitute in the right values.
+Search for first existing file in cnfFiles and subsitute in the right values.
 */
 func MakeZooCfg(cnfFiles []string, cnf *ZkConfig, header string) (string, error) {
-	myTemplateSource := new(bytes.Buffer)
+	var myTemplateSource strings.Builder
 	for _, line := range strings.Split(header, "\n") {
-		fmt.Fprintf(myTemplateSource, "## %v\n", strings.TrimSpace(line))
+		fmt.Fprintf(&myTemplateSource, "## %v\n", strings.TrimSpace(line))
 	}
-	var dataErr error
+
 	for _, path := range cnfFiles {
-		data, dataErr := os.ReadFile(path)
-		if dataErr != nil {
+		data, err := os.ReadFile(path)
+		if err != nil {
 			continue
 		}
+
 		myTemplateSource.WriteString("## " + path + "\n")
 		myTemplateSource.Write(data)
 	}
-	if dataErr != nil {
-		return "", dataErr
+
+	myTemplateSource.WriteString("\n") // in case `data` did not end with a newline
+	for _, extra := range cnf.Extra {
+		myTemplateSource.WriteString(fmt.Sprintf("%s\n", extra))
 	}
 
 	myTemplate, err := template.New("foo").Parse(myTemplateSource.String())
 	if err != nil {
 		return "", err
 	}
-	cnfData := new(bytes.Buffer)
-	err = myTemplate.Execute(cnfData, cnf)
-	if err != nil {
+
+	var cnfData strings.Builder
+	if err := myTemplate.Execute(&cnfData, cnf); err != nil {
 		return "", err
 	}
 	return cnfData.String(), nil
 }
 
-const GUESS_MYID = 0
+const GuessMyID = 0
 
 /*
-  Create a config for this instance.
+Create a config for this instance.
 
-  <server_id>@<hostname>:<leader_port>:<election_port>:<client_port>
+<server_id>@<hostname>:<leader_port>:<election_port>:<client_port>
 
-  If server_id > 1000, then we assume this is a global quorum.
-  server_id's must be 1-255, global id's are 1001-1255 mod 1000.
+If server_id > 1000, then we assume this is a global quorum.
+server_id's must be 1-255, global id's are 1001-1255 mod 1000.
 */
-func MakeZkConfigFromString(cmdLine string, myId uint32) *ZkConfig {
+func MakeZkConfigFromString(cmdLine string, myID uint32) *ZkConfig {
 	zkConfig := NewZkConfig()
 	for _, zki := range strings.Split(cmdLine, ",") {
 		zkiParts := strings.SplitN(zki, "@", 2)
 		if len(zkiParts) != 2 {
 			panic("bad command line format for zk config")
 		}
-		zkId := zkiParts[0]
+		zkID := zkiParts[0]
 		zkAddrParts := strings.Split(zkiParts[1], ":")
-		serverId, _ := strconv.ParseUint(zkId, 10, 0)
-		if serverId > 1000 {
-			serverId = serverId % 1000
+		serverID, _ := strconv.ParseUint(zkID, 10, 32)
+		if serverID > 1000 {
+			serverID = serverID % 1000
 			zkConfig.Global = true
 		}
-		myId = myId % 1000
+		myID = myID % 1000
 
-		zkServer := zkServerAddr{ServerId: uint32(serverId), ClientPort: 2181,
-			LeaderPort: 2888, ElectionPort: 3888}
+		zkServer := zkServerAddr{
+			ServerId: uint32(serverID), ClientPort: 2181,
+			LeaderPort: 2888, ElectionPort: 3888,
+		}
 		switch len(zkAddrParts) {
 		case 4:
 			zkServer.ClientPort, _ = strconv.Atoi(zkAddrParts[3])
@@ -177,7 +185,7 @@ func MakeZkConfigFromString(cmdLine string, myId uint32) *ZkConfig {
 	hostname := netutil.FullyQualifiedHostnameOrPanic()
 	log.Infof("Fully qualified machine hostname was detected as: %v", hostname)
 	for _, zkServer := range zkConfig.Servers {
-		if (myId > 0 && myId == zkServer.ServerId) || (myId == 0 && zkServer.Hostname == hostname) {
+		if (myID > 0 && myID == zkServer.ServerId) || (myID == 0 && zkServer.Hostname == hostname) {
 			zkConfig.ServerId = zkServer.ServerId
 			zkConfig.ClientPort = zkServer.ClientPort
 			break

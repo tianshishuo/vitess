@@ -21,9 +21,7 @@ import (
 	"path"
 	"strings"
 
-	"google.golang.org/protobuf/proto"
-	"k8s.io/apimachinery/pkg/util/sets"
-
+	"vitess.io/vitess/go/sets"
 	"vitess.io/vitess/go/vt/vterrors"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -62,6 +60,9 @@ func (ts *Server) GetCellInfoNames(ctx context.Context) ([]string, error) {
 // GetCellInfo reads a CellInfo from the global Conn.
 func (ts *Server) GetCellInfo(ctx context.Context, cell string, strongRead bool) (*topodatapb.CellInfo, error) {
 	conn := ts.globalCell
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 	if !strongRead {
 		conn = ts.globalReadOnlyCell
 	}
@@ -74,7 +75,7 @@ func (ts *Server) GetCellInfo(ctx context.Context, cell string, strongRead bool)
 
 	// Unpack the contents.
 	ci := &topodatapb.CellInfo{}
-	if err := proto.Unmarshal(contents, ci); err != nil {
+	if err := ci.UnmarshalVT(contents); err != nil {
 		return nil, err
 	}
 	return ci, nil
@@ -83,7 +84,7 @@ func (ts *Server) GetCellInfo(ctx context.Context, cell string, strongRead bool)
 // CreateCellInfo creates a new CellInfo with the provided content.
 func (ts *Server) CreateCellInfo(ctx context.Context, cell string, ci *topodatapb.CellInfo) error {
 	// Pack the content.
-	contents, err := proto.Marshal(ci)
+	contents, err := ci.MarshalVT()
 	if err != nil {
 		return err
 	}
@@ -108,7 +109,7 @@ func (ts *Server) UpdateCellInfoFields(ctx context.Context, cell string, update 
 		contents, version, err := ts.globalCell.Get(ctx, filePath)
 		switch {
 		case err == nil:
-			if err := proto.Unmarshal(contents, ci); err != nil {
+			if err := ci.UnmarshalVT(contents); err != nil {
 				return err
 			}
 		case IsErrType(err, NoNode):
@@ -126,7 +127,7 @@ func (ts *Server) UpdateCellInfoFields(ctx context.Context, cell string, update 
 		}
 
 		// Pack and save.
-		contents, err = proto.Marshal(ci)
+		contents, err = ci.MarshalVT()
 		if err != nil {
 			return err
 		}
@@ -163,7 +164,7 @@ func (ts *Server) DeleteCellInfo(ctx context.Context, cell string, force bool) e
 			// local-down-topo scenario would mean we never can delete it.
 			// (see https://github.com/vitessio/vitess/issues/8220).
 			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeout(context.Background(), *RemoteOperationTimeout)
+			ctx, cancel = context.WithTimeout(context.Background(), RemoteOperationTimeout)
 			defer cancel()
 		default:
 			// Context still has some time left, no need to make a new one.
@@ -194,7 +195,7 @@ func (ts *Server) ExpandCells(ctx context.Context, cells string) ([]string, erro
 	var (
 		err         error
 		inputCells  []string
-		outputCells = sets.NewString() // Use a set to dedupe if the input cells list includes an alias and a cell in that alias.
+		outputCells = sets.New[string]() // Use a set to dedupe if the input cells list includes an alias and a cell in that alias.
 	)
 
 	if cells == "" {
@@ -207,13 +208,13 @@ func (ts *Server) ExpandCells(ctx context.Context, cells string) ([]string, erro
 	}
 
 	expandCell := func(ctx context.Context, cell string) error {
-		shortCtx, cancel := context.WithTimeout(ctx, *RemoteOperationTimeout)
+		shortCtx, cancel := context.WithTimeout(ctx, RemoteOperationTimeout)
 		defer cancel()
 
 		_, err := ts.GetCellInfo(shortCtx, cell, false /* strongRead */)
 		if err != nil {
 			// Not a valid cell name. Check whether it is an alias.
-			shortCtx, cancel := context.WithTimeout(ctx, *RemoteOperationTimeout)
+			shortCtx, cancel := context.WithTimeout(ctx, RemoteOperationTimeout)
 			defer cancel()
 
 			alias, err2 := ts.GetCellsAlias(shortCtx, cell, false /* strongRead */)
@@ -238,5 +239,5 @@ func (ts *Server) ExpandCells(ctx context.Context, cells string) ([]string, erro
 		}
 	}
 
-	return outputCells.List(), nil
+	return sets.List(outputCells), nil
 }

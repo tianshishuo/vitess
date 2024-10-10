@@ -35,31 +35,40 @@ type VtctlProcess struct {
 	TopoGlobalRoot     string
 	TopoServerAddress  string
 	TopoRootPath       string
+	VtctlMajorVersion  int
 }
 
 // AddCellInfo executes vtctl command to add cell info
 func (vtctl *VtctlProcess) AddCellInfo(Cell string) (err error) {
 	tmpProcess := exec.Command(
 		vtctl.Binary,
-		"-topo_implementation", vtctl.TopoImplementation,
-		"-topo_global_server_address", vtctl.TopoGlobalAddress,
-		"-topo_global_root", vtctl.TopoGlobalRoot,
+		"--topo_implementation", vtctl.TopoImplementation,
+		"--topo_global_server_address", vtctl.TopoGlobalAddress,
+		"--topo_global_root", vtctl.TopoGlobalRoot,
 	)
 	if *isCoverage {
-		tmpProcess.Args = append(tmpProcess.Args, "-test.coverprofile="+getCoveragePath("vtctl-addcell.out"))
+		tmpProcess.Args = append(tmpProcess.Args, "--test.coverprofile="+getCoveragePath("vtctl-addcell.out"))
 	}
 	tmpProcess.Args = append(tmpProcess.Args,
-		"AddCellInfo",
-		"-root", vtctl.TopoRootPath+Cell,
-		"-server_address", vtctl.TopoServerAddress,
+		"AddCellInfo", "--",
+		"--root", vtctl.TopoRootPath+Cell,
+		"--server_address", vtctl.TopoServerAddress,
 		Cell)
+	tmpProcess.Args = filterDoubleDashArgs(tmpProcess.Args, vtctl.VtctlMajorVersion)
 	log.Infof("Adding CellInfo for cell %v with command: %v", Cell, strings.Join(tmpProcess.Args, " "))
 	return tmpProcess.Run()
 }
 
 // CreateKeyspace executes vtctl command to create keyspace
-func (vtctl *VtctlProcess) CreateKeyspace(keyspace string) (err error) {
-	output, err := vtctl.ExecuteCommandWithOutput("CreateKeyspace", keyspace)
+func (vtctl *VtctlProcess) CreateKeyspace(keyspace, sidecarDBName, durabilityPolicy string) error {
+	args := []string{
+		"CreateKeyspace", keyspace,
+		"--sidecar-db-name", sidecarDBName,
+	}
+	if durabilityPolicy != "" {
+		args = append(args, "--durability-policy", durabilityPolicy)
+	}
+	output, err := vtctl.ExecuteCommandWithOutput(args...)
 	if err != nil {
 		log.Errorf("CreateKeyspace returned err: %s, output: %s", err, output)
 	}
@@ -69,17 +78,16 @@ func (vtctl *VtctlProcess) CreateKeyspace(keyspace string) (err error) {
 // ExecuteCommandWithOutput executes any vtctlclient command and returns output
 func (vtctl *VtctlProcess) ExecuteCommandWithOutput(args ...string) (result string, err error) {
 	args = append([]string{
-		"-log_dir", vtctl.LogDir,
-		"-enable_queries",
-		"-topo_implementation", vtctl.TopoImplementation,
-		"-topo_global_server_address", vtctl.TopoGlobalAddress,
-		"-topo_global_root", vtctl.TopoGlobalRoot}, args...)
+		"--log_dir", vtctl.LogDir,
+		"--topo_implementation", vtctl.TopoImplementation,
+		"--topo_global_server_address", vtctl.TopoGlobalAddress,
+		"--topo_global_root", vtctl.TopoGlobalRoot}, args...)
 	if *isCoverage {
-		args = append([]string{"-test.coverprofile=" + getCoveragePath("vtctl-o-"+args[0]+".out"), "-test.v"}, args...)
+		args = append([]string{"--test.coverprofile=" + getCoveragePath("vtctl-o-"+args[0]+".out"), "--test.v"}, args...)
 	}
 	tmpProcess := exec.Command(
 		vtctl.Binary,
-		args...,
+		filterDoubleDashArgs(args, vtctl.VtctlMajorVersion)...,
 	)
 	log.Info(fmt.Sprintf("Executing vtctlclient with arguments %v", strings.Join(tmpProcess.Args, " ")))
 	resultByte, err := tmpProcess.CombinedOutput()
@@ -89,16 +97,15 @@ func (vtctl *VtctlProcess) ExecuteCommandWithOutput(args ...string) (result stri
 // ExecuteCommand executes any vtctlclient command
 func (vtctl *VtctlProcess) ExecuteCommand(args ...string) (err error) {
 	args = append([]string{
-		"-enable_queries",
-		"-topo_implementation", vtctl.TopoImplementation,
-		"-topo_global_server_address", vtctl.TopoGlobalAddress,
-		"-topo_global_root", vtctl.TopoGlobalRoot}, args...)
+		"--topo_implementation", vtctl.TopoImplementation,
+		"--topo_global_server_address", vtctl.TopoGlobalAddress,
+		"--topo_global_root", vtctl.TopoGlobalRoot}, args...)
 	if *isCoverage {
-		args = append([]string{"-test.coverprofile=" + getCoveragePath("vtctl-"+args[0]+".out"), "-test.v"}, args...)
+		args = append([]string{"--test.coverprofile=" + getCoveragePath("vtctl-"+args[0]+".out"), "--test.v"}, args...)
 	}
 	tmpProcess := exec.Command(
 		vtctl.Binary,
-		args...,
+		filterDoubleDashArgs(args, vtctl.VtctlMajorVersion)...,
 	)
 	log.Info(fmt.Sprintf("Executing vtctlclient with arguments %v", strings.Join(tmpProcess.Args, " ")))
 	return tmpProcess.Run()
@@ -111,7 +118,6 @@ func VtctlProcessInstance(topoPort int, hostname string) *VtctlProcess {
 
 	// Default values for etcd2 topo server.
 	topoImplementation := "etcd2"
-	topoGlobalRoot := "/vitess/global"
 	topoRootPath := "/"
 
 	// Checking and resetting the parameters for required topo server.
@@ -120,9 +126,13 @@ func VtctlProcessInstance(topoPort int, hostname string) *VtctlProcess {
 		topoImplementation = "zk2"
 	case "consul":
 		topoImplementation = "consul"
-		topoGlobalRoot = "global"
 		// For consul we do not need "/" in the path
 		topoRootPath = ""
+	}
+
+	version, err := GetMajorVersion("vtctl")
+	if err != nil {
+		log.Warningf("failed to get major vtctl version; interop with CLI changes for VEP-4 may not work: %s", err)
 	}
 
 	vtctl := &VtctlProcess{
@@ -130,9 +140,10 @@ func VtctlProcessInstance(topoPort int, hostname string) *VtctlProcess {
 		Binary:             "vtctl",
 		TopoImplementation: topoImplementation,
 		TopoGlobalAddress:  fmt.Sprintf("%s:%d", hostname, topoPort),
-		TopoGlobalRoot:     topoGlobalRoot,
+		TopoGlobalRoot:     TopoGlobalRoot(*topoFlavor),
 		TopoServerAddress:  fmt.Sprintf("%s:%d", hostname, topoPort),
 		TopoRootPath:       topoRootPath,
+		VtctlMajorVersion:  version,
 	}
 	return vtctl
 }

@@ -17,26 +17,23 @@ limitations under the License.
 package tabletserver
 
 import (
+	"context"
 	"fmt"
 	"time"
 
-	"vitess.io/vitess/go/vt/log"
-
-	"vitess.io/vitess/go/vt/callerid"
-	querypb "vitess.io/vitess/go/vt/proto/query"
-	"vitess.io/vitess/go/vt/servenv"
-
-	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/mysql/sqlerror"
+	"vitess.io/vitess/go/pools/smartconnpool"
 	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/callerid"
+	"vitess.io/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/connpool"
-
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tx"
 
-	"context"
-
+	querypb "vitess.io/vitess/go/vt/proto/query"
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
-	"vitess.io/vitess/go/vt/vterrors"
-	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
 )
 
 // StatefulConnection is used in the situations where we need a dedicated connection for a vtgate session.
@@ -44,13 +41,15 @@ import (
 // NOTE: After use, if must be returned either by doing a Unlock() or a Release().
 type StatefulConnection struct {
 	pool           *StatefulConnectionPool
-	dbConn         *connpool.DBConn
+	dbConn         *connpool.PooledConn
 	ConnID         tx.ConnID
 	env            tabletenv.Env
 	txProps        *tx.Properties
 	reservedProps  *Properties
 	tainted        bool
 	enforceTimeout bool
+	timeout        time.Duration
+	expiryTime     time.Time
 }
 
 // Properties contains meta information about the connection
@@ -70,12 +69,22 @@ func (sc *StatefulConnection) Close() {
 
 // IsClosed returns true when the connection is still operational
 func (sc *StatefulConnection) IsClosed() bool {
-	return sc.dbConn == nil || sc.dbConn.IsClosed()
+	return sc.dbConn == nil || sc.dbConn.Conn.IsClosed()
 }
 
 // IsInTransaction returns true when the connection has tx state
 func (sc *StatefulConnection) IsInTransaction() bool {
 	return sc.txProps != nil
+}
+
+func (sc *StatefulConnection) ElapsedTimeout() bool {
+	if !sc.enforceTimeout {
+		return false
+	}
+	if sc.timeout <= 0 {
+		return false
+	}
+	return sc.expiryTime.Before(time.Now())
 }
 
 // Exec executes the statement in the dedicated connection
@@ -86,9 +95,9 @@ func (sc *StatefulConnection) Exec(ctx context.Context, query string, maxrows in
 		}
 		return nil, vterrors.New(vtrpcpb.Code_ABORTED, "connection was aborted")
 	}
-	r, err := sc.dbConn.ExecOnce(ctx, query, maxrows, wantfields)
+	r, err := sc.dbConn.Conn.ExecOnce(ctx, query, maxrows, wantfields)
 	if err != nil {
-		if mysql.IsConnErr(err) {
+		if sqlerror.IsConnErr(err) {
 			select {
 			case <-ctx.Done():
 				// If the context is done, the query was killed.
@@ -103,14 +112,15 @@ func (sc *StatefulConnection) Exec(ctx context.Context, query string, maxrows in
 	return r, nil
 }
 
-func (sc *StatefulConnection) execWithRetry(ctx context.Context, query string, maxrows int, wantfields bool) error {
+func (sc *StatefulConnection) execWithRetry(ctx context.Context, query string, maxrows int, wantfields bool) (string, error) {
 	if sc.IsClosed() {
-		return vterrors.New(vtrpcpb.Code_CANCELED, "connection is closed")
+		return "", vterrors.New(vtrpcpb.Code_CANCELED, "connection is closed")
 	}
-	if _, err := sc.dbConn.Exec(ctx, query, maxrows, wantfields); err != nil {
-		return err
+	res, err := sc.dbConn.Conn.Exec(ctx, query, maxrows, wantfields)
+	if err != nil {
+		return "", err
 	}
-	return nil
+	return res.SessionStateChanges, nil
 }
 
 // FetchNext returns the next result set.
@@ -118,7 +128,7 @@ func (sc *StatefulConnection) FetchNext(ctx context.Context, maxrows int, wantfi
 	if sc.IsClosed() {
 		return nil, vterrors.New(vtrpcpb.Code_CANCELED, "connection is closed")
 	}
-	return sc.dbConn.FetchNext(ctx, maxrows, wantfields)
+	return sc.dbConn.Conn.FetchNext(ctx, maxrows, wantfields)
 }
 
 // Unlock returns the connection to the pool. The connection remains active.
@@ -139,8 +149,8 @@ func (sc *StatefulConnection) unlock(updateTime bool) {
 	if sc.dbConn == nil {
 		return
 	}
-	if sc.dbConn.IsClosed() {
-		sc.Releasef("unlocked closed connection")
+	if sc.dbConn.Conn.IsClosed() {
+		sc.ReleaseString("unlocked closed connection")
 	} else {
 		sc.pool.markAsNotInUse(sc, updateTime)
 	}
@@ -149,16 +159,24 @@ func (sc *StatefulConnection) unlock(updateTime bool) {
 // Release is used when the connection will not be used ever again.
 // The underlying dbConn is removed so that this connection cannot be used by mistake.
 func (sc *StatefulConnection) Release(reason tx.ReleaseReason) {
-	sc.Releasef(reason.String())
+	sc.ReleaseString(reason.String())
 }
 
 // Releasef is used when the connection will not be used ever again.
 // The underlying dbConn is removed so that this connection cannot be used by mistake.
-func (sc *StatefulConnection) Releasef(reasonFormat string, a ...interface{}) {
+func (sc *StatefulConnection) Releasef(reasonFormat string, a ...any) {
+	sc.ReleaseString(fmt.Sprintf(reasonFormat, a...))
+}
+
+// ReleaseString is used when the connection will not be used ever again.
+// The underlying dbConn is removed so that this connection cannot be used by mistake.
+func (sc *StatefulConnection) ReleaseString(reason string) {
 	if sc.dbConn == nil {
 		return
 	}
-	sc.pool.unregister(sc.ConnID, fmt.Sprintf(reasonFormat, a...))
+	if sc.pool != nil {
+		sc.pool.unregister(sc.ConnID, reason)
+	}
 	sc.dbConn.Recycle()
 	sc.dbConn = nil
 	sc.logReservedConn()
@@ -175,27 +193,27 @@ func (sc *StatefulConnection) Renew() error {
 }
 
 // String returns a printable version of the connection info.
-func (sc *StatefulConnection) String(sanitize bool) string {
+func (sc *StatefulConnection) String(sanitize bool, parser *sqlparser.Parser) string {
 	return fmt.Sprintf(
 		"%v\t%s",
 		sc.ConnID,
-		sc.txProps.String(sanitize),
+		sc.txProps.String(sanitize, parser),
 	)
 }
 
 // Current returns the currently executing query
 func (sc *StatefulConnection) Current() string {
-	return sc.dbConn.Current()
+	return sc.dbConn.Conn.Current()
 }
 
 // ID returns the mysql connection ID
 func (sc *StatefulConnection) ID() int64 {
-	return sc.dbConn.ID()
+	return sc.dbConn.Conn.ID()
 }
 
 // Kill kills the currently executing query and connection
 func (sc *StatefulConnection) Kill(reason string, elapsed time.Duration) error {
-	return sc.dbConn.Kill(reason, elapsed)
+	return sc.dbConn.Conn.Kill(reason, elapsed)
 }
 
 // TxProperties returns the transactional properties of the connection
@@ -209,7 +227,7 @@ func (sc *StatefulConnection) ReservedID() tx.ConnID {
 }
 
 // UnderlyingDBConn returns the underlying database connection
-func (sc *StatefulConnection) UnderlyingDBConn() *connpool.DBConn {
+func (sc *StatefulConnection) UnderlyingDBConn() *connpool.PooledConn {
 	return sc.dbConn
 }
 
@@ -254,7 +272,7 @@ func (sc *StatefulConnection) IsTainted() bool {
 // LogTransaction logs transaction related stats
 func (sc *StatefulConnection) LogTransaction(reason tx.ReleaseReason) {
 	if sc.txProps == nil {
-		return //Nothing to log as no transaction exists on this connection.
+		return // Nothing to log as no transaction exists on this connection.
 	}
 	sc.txProps.Conclusion = reason.Name()
 	sc.txProps.EndTime = time.Now()
@@ -267,16 +285,18 @@ func (sc *StatefulConnection) LogTransaction(reason tx.ReleaseReason) {
 	sc.Stats().UserTransactionCount.Add([]string{username, reason.Name()}, 1)
 	sc.Stats().UserTransactionTimesNs.Add([]string{username, reason.Name()}, int64(duration))
 	sc.txProps.Stats.Add(reason.Name(), duration)
-	if sc.txProps.LogToFile {
-		log.Infof("Logged transaction: %s", sc.String(sc.env.Config().SanitizeLogMessages))
-	}
 	tabletenv.TxLogger.Send(sc)
+}
+
+func (sc *StatefulConnection) SetTimeout(timeout time.Duration) {
+	sc.timeout = timeout
+	sc.resetExpiryTime()
 }
 
 // logReservedConn logs reserved connection related stats.
 func (sc *StatefulConnection) logReservedConn() {
 	if sc.reservedProps == nil {
-		return //Nothing to log as this connection is not reserved.
+		return // Nothing to log as this connection is not reserved.
 	}
 	duration := time.Since(sc.reservedProps.StartTime)
 	username := sc.getUsername()
@@ -291,4 +311,20 @@ func (sc *StatefulConnection) getUsername() string {
 		return username
 	}
 	return callerid.GetUsername(sc.reservedProps.ImmediateCaller)
+}
+
+func (sc *StatefulConnection) ApplySetting(ctx context.Context, setting *smartconnpool.Setting) error {
+	if sc.dbConn.Conn.Setting() == setting {
+		return nil
+	}
+	return sc.dbConn.Conn.ApplySetting(ctx, setting)
+}
+
+func (sc *StatefulConnection) resetExpiryTime() {
+	sc.expiryTime = time.Now().Add(sc.timeout)
+}
+
+// IsUnixSocket returns true if the connection is using a unix socket
+func (sc *StatefulConnection) IsUnixSocket() bool {
+	return sc.dbConn.Conn.IsUnixSocket()
 }

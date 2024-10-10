@@ -23,7 +23,7 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math/rand"
+	"math/rand/v2"
 	"reflect"
 
 	"vitess.io/vitess/go/sqltypes"
@@ -109,7 +109,7 @@ func (conn *FakeVTGateConn) ExecuteBatch(ctx context.Context, session *vtgatepb.
 }
 
 // StreamExecute please see vtgateconn.Impl.StreamExecute
-func (conn *FakeVTGateConn) StreamExecute(ctx context.Context, session *vtgatepb.Session, sql string, bindVars map[string]*querypb.BindVariable) (sqltypes.ResultStream, error) {
+func (conn *FakeVTGateConn) StreamExecute(ctx context.Context, session *vtgatepb.Session, sql string, bindVars map[string]*querypb.BindVariable, _ func(response *vtgatepb.StreamExecuteResponse)) (sqltypes.ResultStream, error) {
 	response, ok := conn.execMap[sql]
 	if !ok {
 		return nil, fmt.Errorf("no match for: %s", sql)
@@ -182,11 +182,6 @@ func (conn *FakeVTGateConn) CloseSession(ctx context.Context, session *vtgatepb.
 	panic("not implemented")
 }
 
-// ResolveTransaction please see vtgateconn.Impl.ResolveTransaction
-func (conn *FakeVTGateConn) ResolveTransaction(ctx context.Context, dtid string) error {
-	return nil
-}
-
 // VStream streams binlog events.
 func (conn *FakeVTGateConn) VStream(ctx context.Context, tabletType topodatapb.TabletType, vgtid *binlogdatapb.VGtid,
 	filter *binlogdatapb.Filter, flags *vtgatepb.VStreamFlags) (vtgateconn.VStreamReader, error) {
@@ -211,7 +206,7 @@ func newSession(
 				Shard:      shard,
 				TabletType: tabletType,
 			},
-			TransactionId: rand.Int63(),
+			TransactionId: rand.Int64(),
 		})
 	}
 	return &vtgatepb.Session{

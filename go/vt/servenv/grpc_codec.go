@@ -37,30 +37,26 @@ type vtprotoMessage interface {
 	UnmarshalVT([]byte) error
 }
 
-func (vtprotoCodec) Marshal(v interface{}) ([]byte, error) {
-	vt, ok := v.(vtprotoMessage)
-	if ok {
-		return vt.MarshalVT()
+func (vtprotoCodec) Marshal(v any) ([]byte, error) {
+	switch v := v.(type) {
+	case vtprotoMessage:
+		return v.MarshalVT()
+	case proto.Message:
+		return proto.Marshal(v)
+	default:
+		return nil, fmt.Errorf("failed to marshal, message is %T, must satisfy the vtprotoMessage interface or want proto.Message", v)
 	}
-
-	vv, ok := v.(proto.Message)
-	if !ok {
-		return nil, fmt.Errorf("failed to marshal, message is %T, want proto.Message", v)
-	}
-	return proto.Marshal(vv)
 }
 
-func (vtprotoCodec) Unmarshal(data []byte, v interface{}) error {
-	vt, ok := v.(vtprotoMessage)
-	if ok {
-		return vt.UnmarshalVT(data)
+func (vtprotoCodec) Unmarshal(data []byte, v any) error {
+	switch v := v.(type) {
+	case vtprotoMessage:
+		return v.UnmarshalVT(data)
+	case proto.Message:
+		return proto.Unmarshal(data, v)
+	default:
+		return fmt.Errorf("failed to unmarshal, message is %T, must satisfy the vtprotoMessage interface or want proto.Message", v)
 	}
-
-	vv, ok := v.(proto.Message)
-	if !ok {
-		return fmt.Errorf("failed to unmarshal, message is %T, want proto.Message", v)
-	}
-	return proto.Unmarshal(data, vv)
 }
 
 func (vtprotoCodec) Name() string {

@@ -24,12 +24,14 @@ import (
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
 	"vitess.io/vitess/go/vt/vtctl"
+	"vitess.io/vitess/go/vt/vtenv"
 	"vitess.io/vitess/go/vt/vttablet/tmclient"
+	"vitess.io/vitess/go/vt/vttablet/tmclienttest"
 	"vitess.io/vitess/go/vt/wrangler"
 )
 
 func init() {
-	*tmclient.TabletManagerProtocol = "fuzzing"
+	tmclienttest.SetProtocol("go.test.fuzzing.vtctl_fuzzer", "fuzzing")
 	tmclient.RegisterTabletManagerClientFactory("fuzzing", func() tmclient.TabletManagerClient {
 		return nil
 	})
@@ -90,46 +92,40 @@ func getCommandType(index int) string {
 		45: "RemoveKeyspaceCell",
 		46: "GetKeyspace",
 		47: "GetKeyspaces",
-		48: "SetKeyspaceShardingInfo",
-		49: "SetKeyspaceServedFrom",
 		50: "RebuildKeyspaceGraph",
 		51: "ValidateKeyspace",
 		52: "Reshard",
 		53: "MoveTables",
-		54: "DropSources",
 		55: "CreateLookupVindex",
 		56: "ExternalizeVindex",
 		57: "Materialize",
-		58: "SplitClone",
-		59: "VerticalSplitClone",
 		60: "VDiff",
-		61: "MigrateServedTypes",
-		62: "MigrateServedFrom",
-		63: "SwitchReads",
-		64: "SwitchWrites",
-		65: "CancelResharding",
-		66: "ShowResharding",
+		63: "SwitchTraffic",
 		67: "FindAllShardsInKeyspace",
-		68: "WaitForDrain",
 	}
 	return m[index]
 
 }
 
 /*
-	In this fuzzer we split the input into 3 chunks:
-	1: the first byte - Is converted to an int, and
-	   that int determines the number of command-line
-	   calls the fuzzer will make.
-	2: The next n bytes where n is equal to the int from
-	   the first byte. These n bytes are converted to
-	   a corresponding command and represent which
-	   commands will be called.
-	3: The rest of the data array should have a length
-	   that is divisible by the number of calls.
-	   This part is split up into equally large chunks,
-	   and each chunk is used as parameters for the
-	   corresponding command.
+In this fuzzer we split the input into 3 chunks:
+1: the first byte - Is converted to an int, and
+
+	that int determines the number of command-line
+	calls the fuzzer will make.
+
+2: The next n bytes where n is equal to the int from
+
+	the first byte. These n bytes are converted to
+	a corresponding command and represent which
+	commands will be called.
+
+3: The rest of the data array should have a length
+
+	that is divisible by the number of calls.
+	This part is split up into equally large chunks,
+	and each chunk is used as parameters for the
+	corresponding command.
 */
 func Fuzz(data []byte) int {
 
@@ -173,8 +169,8 @@ func Fuzz(data []byte) int {
 	chunkSize := len(restOfArray) / numberOfCalls
 	command := 0
 	for i := 0; i < len(restOfArray); i = i + chunkSize {
-		from := i           //lower
-		to := i + chunkSize //upper
+		from := i           // lower
+		to := i + chunkSize // upper
 
 		// Index of command in getCommandType():
 		commandIndex := int(commandPart[command]) % 68
@@ -183,11 +179,9 @@ func Fuzz(data []byte) int {
 		args := strings.Split(string(restOfArray[from:to]), " ")
 
 		// Add params to the command
-		for i := range args {
-			commandSlice = append(commandSlice, args[i])
-		}
+		commandSlice = append(commandSlice, args...)
 
-		_ = vtctl.RunCommand(ctx, wrangler.New(logger, topo, tmc), commandSlice)
+		_ = vtctl.RunCommand(ctx, wrangler.New(vtenv.NewTestEnv(), logger, topo, tmc), commandSlice)
 		command++
 	}
 
@@ -196,6 +190,6 @@ func Fuzz(data []byte) int {
 }
 
 func createTopo(ctx context.Context) (*topo.Server, error) {
-	ts := memorytopo.NewServer("zone1", "zone2", "zone3")
+	ts := memorytopo.NewServer(ctx, "zone1", "zone2", "zone3")
 	return ts, nil
 }

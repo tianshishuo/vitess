@@ -17,10 +17,8 @@ limitations under the License.
 package topotools
 
 import (
-	"reflect"
-	"sync"
-
 	"context"
+	"sync"
 
 	"vitess.io/vitess/go/vt/topo"
 
@@ -43,7 +41,7 @@ func GetTabletMapForCell(ctx context.Context, ts *topo.Server, cell string) (map
 	if err != nil {
 		return nil, err
 	}
-	tabletMap, err := ts.GetTabletMap(ctx, aliases)
+	tabletMap, err := ts.GetTabletMap(ctx, aliases, nil)
 	if err != nil {
 		// we got another error than topo.ErrNoNode
 		return nil, err
@@ -65,7 +63,7 @@ func GetAllTabletsAcrossCells(ctx context.Context, ts *topo.Server) ([]*topo.Tab
 	wg.Add(len(cells))
 	for i, cell := range cells {
 		go func(i int, cell string) {
-			results[i], errors[i] = ts.GetTabletsByCell(ctx, cell)
+			results[i], errors[i] = ts.GetTabletsByCell(ctx, cell, nil)
 			wg.Done()
 		}(i, cell)
 	}
@@ -84,11 +82,11 @@ func GetAllTabletsAcrossCells(ctx context.Context, ts *topo.Server) ([]*topo.Tab
 }
 
 // SortedTabletMap returns two maps:
-// - The replicaMap contains all the non-primary non-scrapped hosts.
-//   This can be used as a list of replicas to fix up for reparenting
-// - The primaryMap contains all the tablets without parents
-//   (scrapped or not). This can be used to special case
-//   the old primary, and any tablet in a weird state, left over, ...
+//   - The replicaMap contains all the non-primary non-scrapped hosts.
+//     This can be used as a list of replicas to fix up for reparenting
+//   - The primaryMap contains all the tablets without parents
+//     (scrapped or not). This can be used to special case
+//     the old primary, and any tablet in a weird state, left over, ...
 func SortedTabletMap(tabletMap map[string]*topo.TabletInfo) (map[string]*topo.TabletInfo, map[string]*topo.TabletInfo) {
 	replicaMap := make(map[string]*topo.TabletInfo)
 	primaryMap := make(map[string]*topo.TabletInfo)
@@ -100,38 +98,4 @@ func SortedTabletMap(tabletMap map[string]*topo.TabletInfo) (map[string]*topo.Ta
 		}
 	}
 	return replicaMap, primaryMap
-}
-
-// CopyMapKeys copies keys from map m into a new slice with the
-// type specified by typeHint.  Reflection can't make a new slice type
-// just based on the key type AFAICT.
-func CopyMapKeys(m interface{}, typeHint interface{}) interface{} {
-	mapVal := reflect.ValueOf(m)
-	keys := reflect.MakeSlice(reflect.TypeOf(typeHint), 0, mapVal.Len())
-	for _, k := range mapVal.MapKeys() {
-		keys = reflect.Append(keys, k)
-	}
-	return keys.Interface()
-}
-
-// CopyMapValues copies values from map m into a new slice with the
-// type specified by typeHint.  Reflection can't make a new slice type
-// just based on the key type AFAICT.
-func CopyMapValues(m interface{}, typeHint interface{}) interface{} {
-	mapVal := reflect.ValueOf(m)
-	vals := reflect.MakeSlice(reflect.TypeOf(typeHint), 0, mapVal.Len())
-	for _, k := range mapVal.MapKeys() {
-		vals = reflect.Append(vals, mapVal.MapIndex(k))
-	}
-	return vals.Interface()
-}
-
-// MapKeys returns an array with th provided map keys.
-func MapKeys(m interface{}) []interface{} {
-	keys := make([]interface{}, 0, 16)
-	mapVal := reflect.ValueOf(m)
-	for _, kv := range mapVal.MapKeys() {
-		keys = append(keys, kv.Interface())
-	}
-	return keys
 }

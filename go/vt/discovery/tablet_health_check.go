@@ -21,9 +21,8 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
-
-	"vitess.io/vitess/go/sync2"
 
 	"vitess.io/vitess/go/vt/grpcclient"
 	"vitess.io/vitess/go/vt/log"
@@ -124,7 +123,7 @@ func (thc *tabletHealthCheck) setServingState(serving bool, reason string) {
 
 // stream streams healthcheck responses to callback.
 func (thc *tabletHealthCheck) stream(ctx context.Context, callback func(*query.StreamHealthResponse) error) error {
-	conn := thc.Connection()
+	conn := thc.Connection(ctx)
 	if conn == nil {
 		// This signals the caller to retry
 		return nil
@@ -137,15 +136,15 @@ func (thc *tabletHealthCheck) stream(ctx context.Context, callback func(*query.S
 	return err
 }
 
-func (thc *tabletHealthCheck) Connection() queryservice.QueryService {
+func (thc *tabletHealthCheck) Connection(ctx context.Context) queryservice.QueryService {
 	thc.connMu.Lock()
 	defer thc.connMu.Unlock()
-	return thc.connectionLocked()
+	return thc.connectionLocked(ctx)
 }
 
-func (thc *tabletHealthCheck) connectionLocked() queryservice.QueryService {
+func (thc *tabletHealthCheck) connectionLocked(ctx context.Context) queryservice.QueryService {
 	if thc.Conn == nil {
-		conn, err := tabletconn.GetDialer()(thc.Tablet, grpcclient.FailFast(true))
+		conn, err := tabletconn.GetDialer()(ctx, thc.Tablet, grpcclient.FailFast(true))
 		if err != nil {
 			thc.LastError = err
 			return nil
@@ -190,7 +189,7 @@ func (thc *tabletHealthCheck) processResponse(hc *HealthCheckImpl, shr *query.St
 		prevTarget.TabletType != topodata.TabletType_PRIMARY && prevTarget.TabletType == shr.Target.TabletType && thc.isTrivialReplagChange(shr.RealtimeStats)
 	thc.lastResponseTimestamp = time.Now()
 	thc.Target = shr.Target
-	thc.PrimaryTermStartTime = shr.TabletExternallyReparentedTimestamp
+	thc.PrimaryTermStartTime = shr.PrimaryTermStartTimestamp
 	thc.Stats = shr.RealtimeStats
 	thc.LastError = healthErr
 	reason := "healthCheck update"
@@ -213,7 +212,7 @@ func (thc *tabletHealthCheck) isTrivialReplagChange(newStats *query.RealtimeStat
 	}
 	// Skip replag filter when replag remains in the low rep lag range,
 	// which should be the case majority of the time.
-	lowRepLag := lowReplicationLag.Seconds()
+	lowRepLag := lowReplicationLag.Get().Seconds()
 	oldRepLag := float64(thc.Stats.ReplicationLagSeconds)
 	newRepLag := float64(newStats.ReplicationLagSeconds)
 	if oldRepLag <= lowRepLag && newRepLag <= lowRepLag {
@@ -255,14 +254,14 @@ func (thc *tabletHealthCheck) checkConn(hc *HealthCheckImpl) {
 		// timedout is accessed atomically because there could be a race
 		// between the goroutine that sets it and the check for its value
 		// later.
-		timedout := sync2.NewAtomicBool(false)
+		var timedout atomic.Bool
 		go func() {
 			for {
 				select {
 				case <-servingStatus:
 					continue
 				case <-time.After(hc.healthCheckTimeout):
-					timedout.Set(true)
+					timedout.Store(true)
 					streamCancel()
 					return
 				case <-streamCtx.Done():
@@ -306,7 +305,7 @@ func (thc *tabletHealthCheck) checkConn(hc *HealthCheckImpl) {
 		// If there was a timeout send an error. We do this after stream has returned.
 		// This will ensure that this update prevails over any previous message that
 		// stream could have sent.
-		if timedout.Get() {
+		if timedout.Load() {
 			thc.LastError = fmt.Errorf("healthcheck timed out (latest %v)", thc.lastResponseTimestamp)
 			thc.setServingState(false, thc.LastError.Error())
 			hcErrorCounters.Add([]string{thc.Target.Keyspace, thc.Target.Shard, topoproto.TabletTypeLString(thc.Target.TabletType)}, 1)

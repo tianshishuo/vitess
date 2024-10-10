@@ -17,11 +17,14 @@ limitations under the License.
 package srvtopo
 
 import (
-	"flag"
+	"context"
 	"time"
+
+	"github.com/spf13/pflag"
 
 	"vitess.io/vitess/go/stats"
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/servenv"
 	"vitess.io/vitess/go/vt/topo"
 )
 
@@ -38,10 +41,22 @@ var (
 	// setting the watch fails, we will use the last known value until
 	// srv_topo_cache_ttl elapses and we only try to re-establish the watch
 	// once every srv_topo_cache_refresh interval.
-	srvTopoTimeout      = flag.Duration("srv_topo_timeout", 5*time.Second, "topo server timeout")
-	srvTopoCacheTTL     = flag.Duration("srv_topo_cache_ttl", 1*time.Second, "how long to use cached entries for topology")
-	srvTopoCacheRefresh = flag.Duration("srv_topo_cache_refresh", 1*time.Second, "how frequently to refresh the topology for cached entries")
+	srvTopoTimeout      = 5 * time.Second
+	srvTopoCacheTTL     = 1 * time.Second
+	srvTopoCacheRefresh = 1 * time.Second
 )
+
+func registerFlags(fs *pflag.FlagSet) {
+	fs.DurationVar(&srvTopoTimeout, "srv_topo_timeout", srvTopoTimeout, "topo server timeout")
+	fs.DurationVar(&srvTopoCacheTTL, "srv_topo_cache_ttl", srvTopoCacheTTL, "how long to use cached entries for topology")
+	fs.DurationVar(&srvTopoCacheRefresh, "srv_topo_cache_refresh", srvTopoCacheRefresh, "how frequently to refresh the topology for cached entries")
+}
+
+func init() {
+	servenv.OnParseFor("vtgate", registerFlags)
+	servenv.OnParseFor("vttablet", registerFlags)
+	servenv.OnParseFor("vtcombo", registerFlags)
+}
 
 const (
 	queryCategory  = "query"
@@ -55,7 +70,6 @@ const (
 // - return the last known value of the data if there is an error
 type ResilientServer struct {
 	topoServer *topo.Server
-	counts     *stats.CountersWithSingleLabel
 
 	*SrvKeyspaceWatcher
 	*SrvVSchemaWatcher
@@ -64,25 +78,16 @@ type ResilientServer struct {
 
 // NewResilientServer creates a new ResilientServer
 // based on the provided topo.Server.
-func NewResilientServer(base *topo.Server, counterPrefix string) *ResilientServer {
-	if *srvTopoCacheRefresh > *srvTopoCacheTTL {
+func NewResilientServer(ctx context.Context, base *topo.Server, counts *stats.CountersWithSingleLabel) *ResilientServer {
+	if srvTopoCacheRefresh > srvTopoCacheTTL {
 		log.Fatalf("srv_topo_cache_refresh must be less than or equal to srv_topo_cache_ttl")
 	}
 
-	var metric string
-	if counterPrefix == "" {
-		metric = counterPrefix + "Counts"
-	} else {
-		metric = ""
-	}
-	counts := stats.NewCountersWithSingleLabel(metric, "Resilient srvtopo server operations", "type")
-
 	return &ResilientServer{
 		topoServer:            base,
-		counts:                counts,
-		SrvKeyspaceWatcher:    NewSrvKeyspaceWatcher(base, counts, *srvTopoCacheRefresh, *srvTopoCacheTTL),
-		SrvVSchemaWatcher:     NewSrvVSchemaWatcher(base, counts, *srvTopoCacheRefresh, *srvTopoCacheTTL),
-		SrvKeyspaceNamesQuery: NewSrvKeyspaceNamesQuery(base, counts, *srvTopoCacheRefresh, *srvTopoCacheTTL),
+		SrvKeyspaceWatcher:    NewSrvKeyspaceWatcher(ctx, base, counts, srvTopoCacheRefresh, srvTopoCacheTTL),
+		SrvVSchemaWatcher:     NewSrvVSchemaWatcher(ctx, base, counts, srvTopoCacheRefresh, srvTopoCacheTTL),
+		SrvKeyspaceNamesQuery: NewSrvKeyspaceNamesQuery(base, counts, srvTopoCacheRefresh, srvTopoCacheTTL),
 	}
 }
 

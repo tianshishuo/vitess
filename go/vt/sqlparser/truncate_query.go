@@ -16,37 +16,36 @@ limitations under the License.
 
 package sqlparser
 
-import (
-	"flag"
-)
+const TruncationText = "[TRUNCATED]"
 
-var (
-	// TruncateUILen truncate queries in debug UIs to the given length. 0 means unlimited.
-	TruncateUILen = flag.Int("sql-max-length-ui", 512, "truncate queries in debug UIs to the given length (default 512)")
+// GetTruncateErrLen is a function used to read the value of truncateErrLen
+func (p *Parser) GetTruncateErrLen() int {
+	return p.truncateErrLen
+}
 
-	// TruncateErrLen truncate queries in error logs to the given length. 0 means unlimited.
-	TruncateErrLen = flag.Int("sql-max-length-errors", 0, "truncate queries in error logs to the given length (default unlimited)")
-)
-
-func truncateQuery(query string, max int) string {
+func TruncateQuery(query string, max int) string {
 	sql, comments := SplitMarginComments(query)
 
-	if max == 0 || len(sql) <= max {
+	if max == 0 || len(sql) <= max || len(sql) < len(TruncationText) {
 		return comments.Leading + sql + comments.Trailing
 	}
 
-	return comments.Leading + sql[:max-12] + " [TRUNCATED]" + comments.Trailing
+	if max < len(TruncationText)+1 {
+		max = len(TruncationText) + 1
+	}
+
+	return comments.Leading + sql[:max-(len(TruncationText)+1)] + " " + TruncationText + comments.Trailing
 }
 
 // TruncateForUI is used when displaying queries on various Vitess status pages
 // to keep the pages small enough to load and render properly
-func TruncateForUI(query string) string {
-	return truncateQuery(query, *TruncateUILen)
+func (p *Parser) TruncateForUI(query string) string {
+	return TruncateQuery(query, p.truncateUILen)
 }
 
 // TruncateForLog is used when displaying queries as part of error logs
 // to avoid overwhelming logging systems with potentially long queries and
 // bind value data.
-func TruncateForLog(query string) string {
-	return truncateQuery(query, *TruncateErrLen)
+func (p *Parser) TruncateForLog(query string) string {
+	return TruncateQuery(query, p.truncateErrLen)
 }

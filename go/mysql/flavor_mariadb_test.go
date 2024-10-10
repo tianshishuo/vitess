@@ -17,11 +17,9 @@ limitations under the License.
 package mysql
 
 import (
-	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestMariadbSetReplicationSourceCommand(t *testing.T) {
@@ -30,7 +28,7 @@ func TestMariadbSetReplicationSourceCommand(t *testing.T) {
 		Pass:  "password",
 	}
 	host := "localhost"
-	port := 123
+	port := int32(123)
 	connectRetry := 1234
 	want := `CHANGE MASTER TO
   MASTER_HOST = 'localhost',
@@ -41,10 +39,22 @@ func TestMariadbSetReplicationSourceCommand(t *testing.T) {
   MASTER_USE_GTID = current_pos`
 
 	conn := &Conn{flavor: mariadbFlavor101{}}
-	got := conn.SetReplicationSourceCommand(params, host, port, connectRetry)
-	if got != want {
-		t.Errorf("mariadbFlavor.SetReplicationSourceCommand(%#v, %#v, %#v, %#v) = %#v, want %#v", params, host, port, connectRetry, got, want)
-	}
+	got := conn.SetReplicationSourceCommand(params, host, port, 0, connectRetry)
+	assert.Equal(t, want, got, "mariadbFlavor.SetReplicationSourceCommand(%#v, %#v, %#v, %#v) = %#v, want %#v", params, host, port, connectRetry, got, want)
+
+	var heartbeatInterval float64 = 5.4
+	want = `CHANGE MASTER TO
+  MASTER_HOST = 'localhost',
+  MASTER_PORT = 123,
+  MASTER_USER = 'username',
+  MASTER_PASSWORD = 'password',
+  MASTER_CONNECT_RETRY = 1234,
+  MASTER_HEARTBEAT_PERIOD = 5.4,
+  MASTER_USE_GTID = current_pos`
+
+	got = conn.SetReplicationSourceCommand(params, host, port, heartbeatInterval, connectRetry)
+	assert.Equal(t, want, got, "mariadbFlavor.SetReplicationSourceCommand(%#v, %#v, %#v, %#v, %#v) = %#v, want %#v", params, host, port, heartbeatInterval, connectRetry, got, want)
+
 }
 
 func TestMariadbSetReplicationSourceCommandSSL(t *testing.T) {
@@ -58,7 +68,7 @@ func TestMariadbSetReplicationSourceCommandSSL(t *testing.T) {
 	}
 	params.EnableSSL()
 	host := "localhost"
-	port := 123
+	port := int32(123)
 	connectRetry := 1234
 	want := `CHANGE MASTER TO
   MASTER_HOST = 'localhost',
@@ -74,52 +84,7 @@ func TestMariadbSetReplicationSourceCommandSSL(t *testing.T) {
   MASTER_USE_GTID = current_pos`
 
 	conn := &Conn{flavor: mariadbFlavor101{}}
-	got := conn.SetReplicationSourceCommand(params, host, port, connectRetry)
-	if got != want {
-		t.Errorf("mariadbFlavor.SetReplicationSourceCommand(%#v, %#v, %#v, %#v) = %#v, want %#v", params, host, port, connectRetry, got, want)
-	}
-}
+	got := conn.SetReplicationSourceCommand(params, host, port, 0, connectRetry)
+	assert.Equal(t, want, got, "mariadbFlavor.SetReplicationSourceCommand(%#v, %#v, %#v, %#v) = %#v, want %#v", params, host, port, connectRetry, got, want)
 
-func TestMariadbRetrieveSourceServerId(t *testing.T) {
-	resultMap := map[string]string{
-		"Master_Server_Id": "1",
-		"Gtid_Slave_Pos":   "0-101-2320",
-	}
-
-	want := ReplicationStatus{SourceServerID: 1}
-	got, err := parseMariadbReplicationStatus(resultMap)
-	require.NoError(t, err)
-	assert.Equal(t, got.SourceServerID, want.SourceServerID, fmt.Sprintf("got SourceServerID: %v; want SourceServerID: %v", got.SourceServerID, want.SourceServerID))
-}
-
-func TestMariadbRetrieveFileBasedPositions(t *testing.T) {
-	resultMap := map[string]string{
-		"Exec_Master_Log_Pos":   "1307",
-		"Relay_Master_Log_File": "master-bin.000002",
-		"Read_Master_Log_Pos":   "1308",
-		"Master_Log_File":       "master-bin.000003",
-		"Gtid_Slave_Pos":        "0-101-2320",
-	}
-
-	want := ReplicationStatus{
-		FilePosition:         Position{GTIDSet: filePosGTID{file: "master-bin.000002", pos: 1307}},
-		FileRelayLogPosition: Position{GTIDSet: filePosGTID{file: "master-bin.000003", pos: 1308}},
-	}
-	got, err := parseMariadbReplicationStatus(resultMap)
-	require.NoError(t, err)
-	assert.Equal(t, got.FilePosition.GTIDSet, want.FilePosition.GTIDSet, fmt.Sprintf("got FilePosition: %v; want FilePosition: %v", got.FilePosition.GTIDSet, want.FilePosition.GTIDSet))
-	assert.Equal(t, got.FileRelayLogPosition.GTIDSet, want.FileRelayLogPosition.GTIDSet, fmt.Sprintf("got FileRelayLogPosition: %v; want FileRelayLogPosition: %v", got.FileRelayLogPosition.GTIDSet, want.FileRelayLogPosition.GTIDSet))
-}
-
-func TestMariadbShouldGetNilRelayLogPosition(t *testing.T) {
-	resultMap := map[string]string{
-		"Exec_Master_Log_Pos":   "1307",
-		"Relay_Master_Log_File": "master-bin.000002",
-		"Read_Master_Log_Pos":   "1308",
-		"Master_Log_File":       "master-bin.000003",
-		"Gtid_Slave_Pos":        "0-101-2320",
-	}
-	got, err := parseMariadbReplicationStatus(resultMap)
-	require.NoError(t, err)
-	assert.Truef(t, got.RelayLogPosition.IsZero(), "Got a filled in RelayLogPosition. For MariaDB we should get back nil, because MariaDB does not return the retrieved GTIDSet. got: %#v", got.RelayLogPosition)
 }
